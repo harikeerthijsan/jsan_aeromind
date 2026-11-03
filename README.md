@@ -83,7 +83,9 @@ cd backend
 copy worker.env.example worker.env   # AEROMIND_SERVER, WORKER_TOKEN (same as on Railway), S3_* bucket keys
 .\run-worker.ps1                      # restarts itself after a crash; Ctrl+C to stop
 ```
-Railway variables of the `aeromind` service: `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `GPU_WORKER=remote`, `WORKER_TOKEN`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `APP_USERNAME`, `APP_PASSWORD`, `PORT=8000`.
+Railway variables of the `aeromind` service (references, so the canvas shows the links and rotated credentials follow automatically):
+`DATABASE_URL=${{Postgres.DATABASE_URL}}`, `S3_BUCKET=${{aeromind-data.BUCKET}}`, `S3_ENDPOINT=${{aeromind-data.ENDPOINT}}`, `S3_REGION=${{aeromind-data.REGION}}`,
+`S3_ACCESS_KEY_ID=${{aeromind-data.ACCESS_KEY_ID}}`, `S3_SECRET_ACCESS_KEY=${{aeromind-data.SECRET_ACCESS_KEY}}`, plus `GPU_WORKER=remote`, `WORKER_TOKEN`, `APP_USERNAME`, `APP_PASSWORD`, `PORT=8000`.
 Deploy: `railway up --service aeromind` from the repository root (or connect the GitHub repo in the Railway dashboard).
 
 Moving a local installation (run in `backend/` with `worker.env` loaded, e.g. `python load_worker_env.py -m app.migrate files`):
