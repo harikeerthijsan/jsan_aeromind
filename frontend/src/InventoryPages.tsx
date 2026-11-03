@@ -83,17 +83,17 @@ export function AssetInventory({site,legacy}:{site?:Site;legacy:React.ReactNode}
 }
 
 export function ConditionFindings({site,legacy}:{site?:Site;legacy:React.ReactNode}){
- const nav=useNavigate();const [inspectionId,setInspectionId]=useState<number|null>(null),[grade,setGrade]=useState('issues'),[cls,setCls]=useState(''),[check,setCheck]=useState('');
+ const nav=useNavigate();const [inspectionId,setInspectionId]=useState<number|null>(null),[grade,setGrade]=useState('assessed'),[cls,setCls]=useState(''),[check,setCheck]=useState('');
  const {data,error,reload}=useInventory(site?.id,inspectionId);const s=data?.summary;
  const rows=useMemo(()=>(data?.images||[]).filter(i=>i.status==='approved').flatMap(img=>img.items.map(item=>({img,item}))),[data]);
- const shown=rows.filter(({item})=>{const g=gradeOf(item);return (grade==='issues'?ISSUES.includes(g):grade==='all'||g===grade)&&(!cls||item.class_name===cls)&&(!check||(check==='reviewer'?item.condition_source==='reviewer':item.condition_verified===check))})
+ const shown=rows.filter(({item})=>{const g=gradeOf(item);return (grade==='assessed'?g!=='Not assessed':grade==='issues'?ISSUES.includes(g):grade==='all'||g===grade)&&(!cls||item.class_name===cls)&&(!check||(check==='reviewer'?item.condition_source==='reviewer':item.condition_verified===check))})
   .sort((a,b)=>GRADES.indexOf(gradeOf(a.item))-GRADES.indexOf(gradeOf(b.item))||(a.item.condition_score??101)-(b.item.condition_score??101));
  const classes=[...new Set(rows.map(r=>r.item.class_name))].sort();
  return <>
-  <div className="stats inv-stats">{['Critical','Poor','Fair','Good','Not assessed'].map(g=><button key={g} className={'stat-card inv-gradecard'+(grade===g?' on':'')} style={{'--g':GRADE_COLOR[g]} as React.CSSProperties} onClick={()=>setGrade(grade===g?'issues':g)}><div><small>{g}</small><strong>{s?.grades[g]||0}</strong></div></button>)}</div>
+  <div className="stats inv-stats">{['Critical','Poor','Fair','Good','Not assessed'].map(g=><button key={g} className={'stat-card inv-gradecard'+(grade===g?' on':'')} style={{'--g':GRADE_COLOR[g]} as React.CSSProperties} onClick={()=>setGrade(grade===g?'assessed':g)}><div><small>{g}</small><strong>{s?.grades[g]||0}</strong></div></button>)}</div>
   <section className="panel"><div className="panel-head"><h2>Condition findings · {site?.code}</h2><span className="muted">From QC-approved images · {s?.verified.confirmed||0} confirmed · {s?.verified.disputed||0} disputed by 2nd model</span></div>
    <Toolbar data={data} inspectionId={inspectionId} setInspectionId={setInspectionId} reload={reload} extra={<>
-    <select aria-label="Condition" value={grade} onChange={e=>setGrade(e.target.value)}><option value="issues">Fair, Poor & Critical</option><option value="all">All graded items</option>{GRADES.map(g=><option key={g} value={g}>{g}</option>)}</select>
+    <select aria-label="Condition" value={grade} onChange={e=>setGrade(e.target.value)}><option value="assessed">All assessed (Good to Critical)</option><option value="issues">Fair, Poor & Critical</option><option value="all">All items incl. not assessed</option>{GRADES.map(g=><option key={g} value={g}>{g}</option>)}</select>
     <select aria-label="Equipment class" value={cls} onChange={e=>setCls(e.target.value)}><option value="">All classes</option>{classes.map(c=><option key={c} value={c}>{pretty(c)}</option>)}</select>
     <select aria-label="Verification" value={check} onChange={e=>setCheck(e.target.value)}><option value="">Any source</option><option value="confirmed">AI · confirmed</option><option value="disputed">AI · disputed</option><option value="reviewer">Set by reviewer</option></select></>}/>
    {s&&Object.keys(s.defect_types).length>0&&<div className="inv-chips inv-defect-types">{Object.entries(s.defect_types).map(([t,n])=><span key={t} className="inv-chip">{pretty(t)} <small>{n}</small></span>)}</div>}
