@@ -1,6 +1,7 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
-import {AlertTriangle,Archive,ArchiveRestore,ArrowRight,Box,Calendar,ClipboardCheck,Edit3,ExternalLink,Image as ImageIcon,Layers,MapPin,Plus,RadioTower,ScanEye,Search,ShieldAlert,Trash2,UploadCloud,Video,X} from 'lucide-react';
+import {AlertTriangle,Archive,ArchiveRestore,ArrowRight,Box,Calendar,ClipboardCheck,Edit3,ExternalLink,Image as ImageIcon,Layers,List,Map as MapIcon,MapPin,Plus,RadioTower,ScanEye,Search,ShieldAlert,Trash2,UploadCloud,Video,X} from 'lucide-react';
 import {Site,request,json} from './api';
+import {LocationPicker,SitesMap} from './SiteMap';
 import './sites.css';
 
 type Stats={inspections:number;last_inspection_at:string|null;photos:number;videos:number;images:number;approved_images:number;items:number;items_with_defects:number;poor_or_critical:number;models:number;dense_models:number;boxes_3d:number;jobs_running:number};
@@ -34,7 +35,8 @@ const payload=(f:Form,edit:boolean)=>{const n=(v:string)=>v.trim()===''?null:Num
  return {code:f.code.trim(),name:f.name.trim(),region:f.region.trim()||'Unknown',operator:f.operator.trim()||null,tower_type:f.tower_type,height_m:n(f.height_m),
   latitude:n(f.latitude),longitude:n(f.longitude),address:f.address.trim()||null,notes:f.notes.trim()||null,...(edit?{status:f.status}:{})}};
 
-function TowerForm({site,onClose,onSaved}:{site:Site|null;onClose:()=>void;onSaved:(s:Site)=>void}){
+function TowerForm({site,others,onClose,onSaved}:{site:Site|null;others:Site[];onClose:()=>void;onSaved:(s:Site)=>void}){
+ const [picking,setPicking]=useState(false);
  const [f,setF]=useState<Form>(site?toForm(site):emptyForm),[touched,setTouched]=useState(false),[saving,setSaving]=useState(false),[error,setError]=useState('');
  const errors=validate(f),bad=Object.keys(errors).length>0;
  const set=(k:keyof Form)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setF({...f,[k]:e.target.value});
@@ -47,14 +49,16 @@ function TowerForm({site,onClose,onSaved}:{site:Site|null;onClose:()=>void;onSav
   <div className="st-modal-head"><div className="st-modal-icon"><RadioTower size={18}/></div><div><h2>{site?`Edit ${site.code}`:'Add tower'}</h2><small>{site?'Update the site record. Inspections and their data are not affected.':'Register a tower site; inspections, uploads and 3D models are added to it afterwards.'}</small></div><button type="button" className="st-icon-btn" onClick={onClose} aria-label="Close"><X size={18}/></button></div>
   <div className="st-modal-body">
    <div className="st-section-title">Identification</div>
-   <div className="st-grid">{field('code','Tower ID *',{placeholder:'TWR-004',autoFocus:!site,style:{textTransform:'uppercase'}})}{field('name','Site name *',{placeholder:'North Ridge'})}
-    {field('region','Region / city',{placeholder:'Hyderabad'})}{field('operator','Operator / owner',{placeholder:'e.g. Indus Towers'})}</div>
+   <div className="st-grid">{field('code','Tower ID *',{placeholder:'e.g. TWR-010',autoFocus:!site,style:{textTransform:'uppercase'}})}{field('name','Site name *',{placeholder:'e.g. Hill Top Road'})}
+    {field('region','Region / city',{placeholder:'e.g. Hyderabad'})}{field('operator','Operator / owner',{placeholder:'e.g. Indus Towers'})}</div>
    <div className="st-section-title">Structure</div>
    <div className="st-grid"><label className="st-field"><span>Structure type</span><select value={f.tower_type} onChange={set('tower_type')}>{[...new Set([...STRUCTURES,f.tower_type])].map(s=><option key={s}>{s}</option>)}</select></label>
-    {field('height_m','Height (m)',{inputMode:'decimal',placeholder:'45'})}
+    {field('height_m','Height (m)',{inputMode:'decimal',placeholder:'e.g. 45'})}
     {site&&<label className="st-field"><span>Status</span><select value={f.status} onChange={set('status')}>{STATUSES.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}</select></label>}</div>
-   <div className="st-section-title">Location</div>
+   <div className="st-section-title st-section-row">Location<button type="button" className={'btn outline st-map-toggle'+(picking?' on':'')} onClick={()=>setPicking(!picking)}><MapPin size={13}/>{picking?'Hide map':'Select on map'}</button></div>
    <div className="st-grid">{field('latitude','Latitude',{inputMode:'decimal',placeholder:'17.3850'})}{field('longitude','Longitude',{inputMode:'decimal',placeholder:'78.4867'})}
+    {picking&&<div className="st-span"><LocationPicker lat={f.latitude.trim()===''?null:Number(f.latitude)} lon={f.longitude.trim()===''?null:Number(f.longitude)}
+      others={others.filter(o=>o.id!==site?.id)} onPick={(a,b)=>setF(v=>({...v,latitude:String(a),longitude:String(b)}))}/></div>}
     <label className="st-field st-span"><span>Address</span><input value={f.address} onChange={set('address')} placeholder="Street, area, PIN"/></label>
     <label className="st-field st-span"><span>Notes</span><textarea rows={3} value={f.notes} onChange={set('notes')} placeholder="Access, permits, landlord contact…"/></label></div>
    {error&&<div className="error st-form-error"><AlertTriangle size={16}/>{error}</div>}
@@ -125,7 +129,8 @@ function SiteDrawer({site,onClose,onEdit,onArchive,onDelete,go,select,reload}:{s
 
 type Props={go:(page:string)=>void;selectSite:(id:number)=>void;onChanged:()=>void;addSignal:number};
 export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
- const [rows,setRows]=useState<SiteRow[]|null>(null),[error,setError]=useState('');
+ const [rows,setRows]=useState<SiteRow[]|null>(null),[error,setError]=useState(''),[view,setView]=useState<'table'|'map'>(()=>{try{return localStorage.getItem('aeromind.sites.view')==='map'?'map':'table'}catch{return 'table'}});
+ const switchView=(v:'table'|'map')=>{setView(v);try{localStorage.setItem('aeromind.sites.view',v)}catch{}};
  const [query,setQuery]=useState(''),[status,setStatus]=useState('current'),[region,setRegion]=useState(''),[structure,setStructure]=useState(''),[sort,setSort]=useState('code');
  const [form,setForm]=useState<{site:Site|null}|null>(null),[openId,setOpenId]=useState<number|null>(null),[confirm,setConfirm]=useState<null|{kind:'archive'|'delete';site:SiteRow}>(null);
  const load=()=>request<SiteRow[]>('/api/v1/sites-overview').then(r=>{setRows(r);setError('')}).catch(e=>setError(errText(e)));
@@ -150,7 +155,8 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
  return <>
   <div className="st-cards">{cards.map(c=><div key={c.label} className={'stat-card st-card'+(c.warn?' warn':'')}><div className="st-card-icon"><c.icon size={18}/></div><div><small>{c.label}</small><strong>{rows?c.value:'—'}</strong><span>{rows?c.sub:''}</span></div></div>)}</div>
   <section className="panel">
-   <div className="panel-head"><h2>Tower sites</h2><span className="muted">{shown.length} of {all.length} sites</span></div>
+   <div className="panel-head"><h2>Tower sites</h2><div className="st-head-right"><span className="muted">{shown.length} of {all.length} sites</span>
+    <div className="st-seg st-view" role="tablist"><button className={view==='table'?'on':''} onClick={()=>switchView('table')}><List size={13}/>Table</button><button className={view==='map'?'on':''} onClick={()=>switchView('map')}><MapIcon size={13}/>Map</button></div></div></div>
    <div className="st-toolbar">
     <div className="search"><Search size={16}/><input placeholder="Search ID, name, region, operator, address" value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button className="st-icon-btn" onClick={()=>setQuery('')} aria-label="Clear search"><X size={14}/></button>}</div>
     <div className="st-seg">{[{id:'current',label:'Current'},...STATUSES,{id:'all',label:'All'}].map(s=><button key={s.id} className={status===s.id?'on':''} onClick={()=>setStatus(s.id)}>{s.label}{s.id in counts?<b>{counts[s.id]}</b>:null}</button>)}</div>
@@ -161,6 +167,8 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
    </div>
    {error&&<div className="error"><AlertTriangle size={16}/>{error}<button onClick={load}>Retry</button></div>}
    {!rows&&!error?<p className="muted">Loading sites…</p>:!shown.length?<div className="st-empty"><RadioTower size={34}/><p>{all.length?'No sites match these filters.':'No tower sites yet. Add the first tower to start uploading inspections.'}</p>{all.length?<button className="btn outline" onClick={()=>{setQuery('');setRegion('');setStructure('');setStatus('current')}}>Clear filters</button>:<button className="btn primary" onClick={()=>setForm({site:null})}><Plus size={15}/>Add tower</button>}</div>
+   :view==='map'?<div className="st-mapview"><SitesMap sites={shown} selectedId={openId} onSelect={setOpenId}/>
+     {shown.some(s=>s.latitude==null||s.longitude==null)&&<div className="st-unlocated"><MapPin size={14}/><span>No location yet:</span>{shown.filter(s=>s.latitude==null||s.longitude==null).map(s=><button key={s.id} className="text-btn" onClick={()=>setForm({site:s})} title="Edit to add coordinates">{s.code}</button>)}</div>}</div>
    :<div className="st-table-wrap"><table className="st-table"><thead><tr><th>Tower</th><th>Region · operator</th><th>Structure</th><th>Location</th><th>Inspections</th><th>QC progress</th><th>3D</th><th>Condition</th><th>Status</th><th></th></tr></thead>
     <tbody>{shown.map(s=><tr key={s.id} className={openId===s.id?'on':''} onClick={()=>setOpenId(s.id)}>
      <td><b>{s.code}</b><small>{s.name}</small></td>
@@ -178,7 +186,7 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
   {current&&<SiteDrawer site={current} onClose={()=>setOpenId(null)} go={go} select={selectSite} reload={changed} onEdit={()=>setForm({site:current})}
     onArchive={()=>current.status==='archived'?request(`/api/v1/sites/${current.id}`,json('PATCH',{status:'active'})).then(changed).catch(e=>setError(errText(e))):setConfirm({kind:'archive',site:current})}
     onDelete={()=>setConfirm({kind:'delete',site:current})}/>}
-  {form&&<TowerForm site={form.site} onClose={()=>setForm(null)} onSaved={async s=>{setForm(null);await changed();setOpenId(s.id)}}/>}
+  {form&&<TowerForm site={form.site} others={all} onClose={()=>setForm(null)} onSaved={async s=>{setForm(null);await changed();setOpenId(s.id)}}/>}
   {confirm?.kind==='archive'&&<Confirm title={`Archive ${confirm.site.code}?`} action="Archive" onCancel={()=>setConfirm(null)}
     body={<>The tower is hidden from the current list and its inspections, photos, 3D models and findings are kept. You can restore it at any time from <b>Archived</b>.</>}
     onConfirm={async()=>{await request(`/api/v1/sites/${confirm.site.id}`,json('PATCH',{status:'archived'}));setConfirm(null);await changed()}}/>}
