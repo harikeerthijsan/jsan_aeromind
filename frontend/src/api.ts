@@ -1,5 +1,5 @@
 export const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://localhost:8000' : '');  // production build: same origin as the page
-export type Site={id:number;code:string;name:string;region:string;tower_type:string;height_m:number|null;status:string};
+export type Site={id:number;code:string;name:string;region:string;tower_type:string;height_m:number|null;status:string;latitude?:number|null;longitude?:number|null;operator?:string|null;address?:string|null;notes?:string|null;created_at?:string|null};
 export type Inspection={id:number;site_id:number;label:string;status:string;created_at:string};
 export type Asset={id:number;site_id:number;code:string;category:string;condition:string;identity_status:string;localization_status:string;x:number|null;y:number|null;z:number|null;description:string};
 export type Defect={id:number;asset_id:number;defect_type:string;proposed_grade:string;review_status:string;notes:string};
@@ -18,5 +18,5 @@ export type VendorCandidate={manufacturer:string;similarity:number;brands:string
 export type VendorSuggestion={candidates:VendorCandidate[];ambiguous:boolean;manufacturer:string;product_model:string|null;confidence:number;basis:string;evidence:string;features:Record<string,string>;reference_vendors:string[];visible_text:string;model:string;seconds:number};
 export type DetectorInfo={status:string;model:string|null;imgsz:number;conf:number;device:string;vid_stride:number;loaded:boolean;classes?:Record<string,string>};
 export type RegistrationCandidate={id:number;model_id:number;inspection_id:number;site_id:number;class_name:string;x:number;y:number;z:number;confidence:number;status:string;evidence_count:number;media_count:number;point_count:number;spread:number;detection_ids:number[];created_at:string;size_w?:number|null;size_h?:number|null;size_d?:number|null;yaw?:number|null;box_method?:string|null;box_points?:number|null;fit_iou?:number|null};
-export async function request<T>(path:string, options:RequestInit={}):Promise<T>{const r=await fetch(API+path,options); if(!r.ok)throw Error((await r.text()).slice(0,250));return r.json();}
+export async function request<T>(path:string, options:RequestInit={}):Promise<T>{const r=await fetch(API+path,options); if(!r.ok)throw Error((await r.text()).slice(0,250));return r.status===204?undefined as T:r.json();}
 export const json=(method:string,body:unknown):RequestInit=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

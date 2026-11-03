@@ -14,7 +14,11 @@ class Site(Base):
     height_m: Mapped[float | None] = mapped_column(Float, nullable=True)
     latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String(32), default='active')
+    status: Mapped[str] = mapped_column(String(32), default='active')  # active | maintenance | decommissioned | archived
+    operator: Mapped[str | None] = mapped_column(String(120), nullable=True)  # tower company / mobile operator
+    address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=now)
 class Inspection(Base):
     __tablename__ = 'inspections'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

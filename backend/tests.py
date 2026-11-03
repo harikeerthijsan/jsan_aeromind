@@ -797,3 +797,27 @@ def test_small_parts_may_use_photo_boxes_when_consistent():
     assert not candidate_is_valid({**base, 'class_name': 'bolts', 'fit_iou': .2})   # detections of different bolts grouped together
     assert not candidate_is_valid({**base, 'class_name': 'bolts', 'media_count': 3})
     assert not candidate_is_valid({**base, 'class_name': 'rru', 'size_w': .04, 'size_h': .04})  # big parts still need the dense fit
+
+def test_site_management():
+    with TestClient(app) as client:
+        r = client.post('/api/v1/sites', json={'code': ' twr-900 ', 'name': 'Hill Top', 'region': 'Pune', 'tower_type': 'Monopole',
+                                               'height_m': 30, 'latitude': 18.5, 'longitude': 73.8, 'operator': 'Indus', 'address': '', 'notes': ' '})
+        assert r.status_code == 201, r.text
+        s = r.json(); assert s['code'] == 'TWR-900' and s['address'] is None and s['notes'] is None and s['status'] == 'active'
+        assert client.post('/api/v1/sites', json={'code': 'TWR-900', 'name': 'Dup'}).status_code == 409   # IDs are unique, any case
+        assert client.post('/api/v1/sites', json={'code': 'TWR-901', 'name': 'Bad', 'latitude': 123}).status_code == 422
+        r = client.patch(f"/api/v1/sites/{s['id']}", json={'name': 'Hill Top North', 'status': 'maintenance', 'height_m': 32.5})
+        assert r.status_code == 200 and r.json()['name'] == 'Hill Top North' and r.json()['status'] == 'maintenance'
+        assert client.patch(f"/api/v1/sites/{s['id']}", json={'status': 'gone'}).status_code == 422
+        assert client.patch(f"/api/v1/sites/{s['id']}", json={'code': 'TWR-001'}).status_code == 409   # demo site's ID
+        ov = {x['id']: x for x in client.get('/api/v1/sites-overview').json()}
+        assert ov[s['id']]['stats']['inspections'] == 0 and 'boxes_3d' in ov[s['id']]['stats']
+        ins = client.post('/api/v1/inspections', json={'site_id': s['id'], 'label': 'Survey A'}).json()
+        client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('a.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')})
+        ov = {x['id']: x for x in client.get('/api/v1/sites-overview').json()}
+        assert ov[s['id']]['stats']['inspections'] == 1 and ov[s['id']]['stats']['photos'] == 1
+        summary = client.get(f"/api/v1/sites/{s['id']}/inspections-summary").json()
+        assert summary[0]['label'] == 'Survey A' and summary[0]['photos'] == 1 and summary[0]['models'] == []
+        assert client.delete(f"/api/v1/sites/{s['id']}").status_code == 409   # has an inspection: archive instead
+        empty = client.post('/api/v1/sites', json={'code': 'TWR-902', 'name': 'Empty'}).json()
+        assert client.delete(f"/api/v1/sites/{empty['id']}").status_code == 204 and client.get(f"/api/v1/sites/{empty['id']}").status_code == 404

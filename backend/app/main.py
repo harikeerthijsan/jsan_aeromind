@@ -103,14 +103,30 @@ def get_db():
     with SessionLocal() as db: yield db
 
 def to_dict(x): return {c.name:getattr(x,c.name) for c in x.__table__.columns}
+SITE_STATUSES={'active','maintenance','decommissioned','archived'}
 class SiteIn(BaseModel):
     code:str=Field(min_length=2,max_length=80)
     name:str=Field(min_length=2,max_length=200)
-    region:str='Unknown'
-    tower_type:str='Lattice'
-    height_m:float|None=None
-    latitude:float|None=None
-    longitude:float|None=None
+    region:str=Field('Unknown',max_length=120)
+    tower_type:str=Field('Lattice',max_length=60)
+    height_m:float|None=Field(None,gt=0,le=1000)
+    latitude:float|None=Field(None,ge=-90,le=90)
+    longitude:float|None=Field(None,ge=-180,le=180)
+    operator:str|None=Field(None,max_length=120)
+    address:str|None=Field(None,max_length=2000)
+    notes:str|None=Field(None,max_length=5000)
+class SiteUpdate(BaseModel):
+    code:str|None=Field(None,min_length=2,max_length=80)
+    name:str|None=Field(None,min_length=2,max_length=200)
+    region:str|None=Field(None,max_length=120)
+    tower_type:str|None=Field(None,max_length=60)
+    height_m:float|None=Field(None,gt=0,le=1000)
+    latitude:float|None=Field(None,ge=-90,le=90)
+    longitude:float|None=Field(None,ge=-180,le=180)
+    operator:str|None=Field(None,max_length=120)
+    address:str|None=Field(None,max_length=2000)
+    notes:str|None=Field(None,max_length=5000)
+    status:str|None=None
 class InspectionIn(BaseModel):
     site_id:int
     label:str=Field(min_length=2,max_length=200)
@@ -193,8 +209,81 @@ def dashboard(db:Session=Depends(get_db)):
 def sites(db:Session=Depends(get_db)): return [to_dict(x) for x in db.scalars(select(Site).order_by(Site.id)).all()]
 @app.post('/api/v1/sites',status_code=201)
 def create_site(data:SiteIn,db:Session=Depends(get_db)):
-    if db.scalar(select(Site).where(Site.code==data.code)): raise HTTPException(409,'Site code already exists')
-    x=Site(**data.model_dump());db.add(x);db.commit();db.refresh(x);return to_dict(x)
+    d=_clean_site(data.model_dump())
+    if db.scalar(select(Site).where(func.lower(Site.code)==d['code'].lower())): raise HTTPException(409,f"Tower ID {d['code']} already exists")
+    x=Site(**d);db.add(x);db.commit();db.refresh(x);return to_dict(x)
+def _clean_site(d):
+    """Trimmed text; empty optional text becomes NULL; tower IDs are stored upper-case (TWR-004)."""
+    for k in ('code','name','region','tower_type','operator','address','notes'):
+        if isinstance(d.get(k),str):d[k]=d[k].strip() or (None if k in ('operator','address','notes') else d[k].strip())
+    if d.get('code'):d['code']=d['code'].upper()
+    for k in ('code','name'):
+        if k in d and d[k] is not None and len(d[k])<2:raise HTTPException(422,f'{k} needs at least 2 characters')
+    return d
+@app.patch('/api/v1/sites/{site_id}')
+def update_site(site_id:int,data:SiteUpdate,db:Session=Depends(get_db)):
+    x=db.get(Site,site_id)
+    if not x:raise HTTPException(404,'Site not found')
+    d=_clean_site(data.model_dump(exclude_unset=True))
+    if 'status' in d and d['status'] not in SITE_STATUSES:raise HTTPException(422,f"status must be one of {', '.join(sorted(SITE_STATUSES))}")
+    for k in ('code','name','region','tower_type','status'):
+        if k in d and d[k] is None:raise HTTPException(422,f'{k} cannot be empty')
+    if d.get('code') and db.scalar(select(Site).where(func.lower(Site.code)==d['code'].lower(),Site.id!=site_id)):raise HTTPException(409,f"Tower ID {d['code']} already exists")
+    for k,v in d.items():setattr(x,k,v)
+    db.commit();db.refresh(x);return to_dict(x)
+@app.delete('/api/v1/sites/{site_id}',status_code=204)
+def delete_site(site_id:int,db:Session=Depends(get_db)):
+    """Only an empty tower can be deleted; one with inspections or assets is archived instead (its data stays)."""
+    x=db.get(Site,site_id)
+    if not x:raise HTTPException(404,'Site not found')
+    n=db.scalar(select(func.count()).select_from(Inspection).where(Inspection.site_id==site_id))
+    a=db.scalar(select(func.count()).select_from(Asset).where(Asset.site_id==site_id))
+    if n or a:raise HTTPException(409,f'{x.code} has {n} inspection(s) and {a} asset(s); archive it instead of deleting')
+    db.delete(x);db.commit();return Response(status_code=204)
+@app.get('/api/v1/sites-overview')
+def sites_overview(db:Session=Depends(get_db)):
+    """Every tower with the numbers the Projects & Sites page shows: inspections, files, QC progress, 3D models, defects."""
+    by=lambda q:{k:v for k,v in db.execute(q)}
+    ins=Inspection.site_id
+    inspections=by(select(ins,func.count()).group_by(ins))
+    last=by(select(ins,func.max(Inspection.created_at)).group_by(ins))
+    top=Media.parent_media_id.is_(None)
+    photos=by(select(ins,func.count()).select_from(Media).join(Inspection,Inspection.id==Media.inspection_id).where(top,Media.content_type.like('image/%')).group_by(ins))
+    videos=by(select(ins,func.count()).select_from(Media).join(Inspection,Inspection.id==Media.inspection_id).where(top,Media.content_type.like('video/%')).group_by(ins))
+    images=by(select(ins,func.count()).select_from(Media).join(Inspection,Inspection.id==Media.inspection_id).where(Media.content_type.like('image/%')).group_by(ins))  # incl. video frames
+    approved=by(select(ins,func.count()).select_from(ImageReview).join(Inspection,Inspection.id==ImageReview.inspection_id).where(ImageReview.status=='approved').group_by(ins))
+    items=by(select(ins,func.count()).select_from(Annotation).join(Inspection,Inspection.id==Annotation.inspection_id).group_by(ins))
+    defective=by(select(ins,func.count()).select_from(Annotation).join(Inspection,Inspection.id==Annotation.inspection_id).where(Annotation.condition_grade.in_(['Fair','Poor','Critical'])).group_by(ins))
+    critical=by(select(ins,func.count()).select_from(Annotation).join(Inspection,Inspection.id==Annotation.inspection_id).where(Annotation.condition_grade.in_(['Poor','Critical'])).group_by(ins))
+    models=by(select(ins,func.count()).select_from(Model3D).join(Inspection,Inspection.id==Model3D.inspection_id).where(Model3D.status=='completed').group_by(ins))
+    dense=by(select(ins,func.count()).select_from(Model3D).join(Inspection,Inspection.id==Model3D.inspection_id).where(Model3D.status=='completed',Model3D.dense.is_(True)).group_by(ins))
+    boxes=by(select(RegistrationCandidate.site_id,func.count()).where(RegistrationCandidate.status!='rejected').group_by(RegistrationCandidate.site_id))
+    running=by(select(ins,func.count()).select_from(Job).join(Inspection,Inspection.id==Job.inspection_id).where(Job.status.in_(['queued','running'])).group_by(ins))
+    out=[]
+    for s in db.scalars(select(Site).order_by(Site.code)).all():
+        i=s.id
+        out.append(to_dict(s)|{'stats':{'inspections':inspections.get(i,0),'last_inspection_at':last.get(i),'photos':photos.get(i,0),'videos':videos.get(i,0),
+            'images':images.get(i,0),'approved_images':approved.get(i,0),'items':items.get(i,0),'items_with_defects':defective.get(i,0),'poor_or_critical':critical.get(i,0),
+            'models':models.get(i,0),'dense_models':dense.get(i,0),'boxes_3d':boxes.get(i,0),'jobs_running':running.get(i,0)}})
+    return out
+@app.get('/api/v1/sites/{site_id}/inspections-summary')
+def site_inspections_summary(site_id:int,db:Session=Depends(get_db)):
+    """The tower's inspections, newest first, each with its files, QC progress, detection runs and 3D models."""
+    if not db.get(Site,site_id):raise HTTPException(404,'Site not found')
+    out=[]
+    for x in db.scalars(select(Inspection).where(Inspection.site_id==site_id).order_by(Inspection.created_at.desc(),Inspection.id.desc())).all():
+        cnt=lambda q:db.scalar(q) or 0
+        m=select(func.count()).select_from(Media).where(Media.inspection_id==x.id)
+        latest_job=db.scalar(select(Job).where(Job.inspection_id==x.id).order_by(Job.id.desc()))
+        out.append(to_dict(x)|{'photos':cnt(m.where(Media.parent_media_id.is_(None),Media.content_type.like('image/%'))),
+            'videos':cnt(m.where(Media.parent_media_id.is_(None),Media.content_type.like('video/%'))),
+            'images':cnt(m.where(Media.content_type.like('image/%'))),
+            'approved_images':cnt(select(func.count()).select_from(ImageReview).where(ImageReview.inspection_id==x.id,ImageReview.status=='approved')),
+            'detections':cnt(select(func.count()).select_from(Detection).where(Detection.inspection_id==x.id)),
+            'items_with_defects':cnt(select(func.count()).select_from(Annotation).where(Annotation.inspection_id==x.id,Annotation.condition_grade.in_(['Fair','Poor','Critical']))),
+            'models':[{'id':md.id,'dense':md.dense,'status':md.status} for md in db.scalars(select(Model3D).where(Model3D.inspection_id==x.id).order_by(Model3D.id.desc()))],
+            'latest_job':{'id':latest_job.id,'kind':latest_job.kind,'status':latest_job.status,'progress':latest_job.progress,'detail':latest_job.detail} if latest_job else None})
+    return out
 @app.get('/api/v1/sites/{site_id}')
 def site_detail(site_id:int,db:Session=Depends(get_db)):
     x=db.get(Site,site_id)
