@@ -717,6 +717,21 @@ def test_registration_dense_boxes_separate_neighbours(monkeypatch,tmp_path):
     # a group whose boxes don't line up with each other in 3D is not one object: dropped, not drawn
     assert reg.fit_box(np.zeros((2,3)),np.zeros(2)) is None and reg.fit_box(np.full((10,3),np.nan),np.zeros(2)) is None
 
+def test_mounting_bracket_refinement_can_keep_dense_surface_anchor():
+    np=pytest.importorskip('numpy')
+    from types import SimpleNamespace as NS
+    from app import registration as reg
+    cam=('PINHOLE',[1000.,1000.,1000.,750.],2000,1500)
+    pose=(None,None,None,1,np.eye(3),np.zeros(3))
+    poses={'a':pose,'b':pose};cameras={1:cam}
+    # The photo boxes are deliberately offset from the dense box centre. Structural brackets must stay on
+    # the reconstructed surface instead of being pulled toward the triangulated centres of irregular 2D boxes.
+    det=lambda: NS(x1=1080.,x2=1320.,y1=650.,y2=850.,image_width=2000,image_height=1500)
+    candidate={'class_name':'mounting_brackets','position':np.array([0.,0.,5.]),'size_w':1.,'size_h':1.,'size_d':.25,'yaw':0.}
+    reg.fit_to_detections(candidate,[('a',det()),('b',det())],poses,cameras,np.eye(4),rounds=0,move_centre=False)
+    assert np.allclose(candidate['position'],[0.,0.,5.])
+    assert 'mounting_brackets' in reg.SURFACE_ANCHORED_CLASSES
+
 def test_remote_gpu_worker_runs_queued_work(monkeypatch):
     """GPU_WORKER=remote (Railway): GPU work is queued; the worker claims it over HTTPS with its token, computes it
     without database access and posts the result, which the server applies. Errors come back to the waiting request."""
@@ -774,3 +789,11 @@ def test_password_gate_and_web_app(monkeypatch, tmp_path):
             assert r.status_code == 200 and '<div id="root"' in r.text
             assert client.get('/api/v1/nope', auth=('aeromind', 'secret')).status_code == 404
             assert client.get('/../backend/.env', auth=('aeromind', 'secret')).status_code in (200, 404) and 'VLM' not in client.get('/..%2fbackend%2f.env', auth=('aeromind', 'secret')).text
+
+def test_small_parts_may_use_photo_boxes_when_consistent():
+    from app.registration import candidate_is_valid
+    base = {'size_w': .002, 'size_h': .002, 'size_d': .002, 'confidence': .6, 'media_count': 6, 'fit_iou': .6, 'box_method': 'estimate'}
+    assert candidate_is_valid({**base, 'class_name': 'bolts'})                      # too small for the dense cloud, but lines up in 6 photos
+    assert not candidate_is_valid({**base, 'class_name': 'bolts', 'fit_iou': .2})   # detections of different bolts grouped together
+    assert not candidate_is_valid({**base, 'class_name': 'bolts', 'media_count': 3})
+    assert not candidate_is_valid({**base, 'class_name': 'rru', 'size_w': .04, 'size_h': .04})  # big parts still need the dense fit

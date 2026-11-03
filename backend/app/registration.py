@@ -25,15 +25,18 @@ CLASS_RULES = {  # detection floor, grouping radius, depth ratio, and final mult
     'rru': {'confidence': .75, 'radius': .14, 'depth': .60, 'candidate': .68, 'views': 4, 'fit': .42},
     'cabinets': {'confidence': .70, 'radius': .18, 'depth': .80, 'candidate': .62, 'views': 3, 'fit': .40},
     'mounting_brackets': {'confidence': .50, 'radius': .15, 'depth': .50, 'candidate': .50, 'views': 5, 'fit': .42},
-    'bolts': {'confidence': .45, 'radius': .06, 'depth': 1.00, 'candidate': .38, 'views': 8, 'fit': .50},
+    'bolts': {'confidence': .45, 'radius': .06, 'depth': 1.00, 'candidate': .38, 'views': 5, 'fit': .50, 'photo_boxes': True},
     'Jumper Cables / RF Cables': {'confidence': .45, 'radius': .25, 'depth': .30, 'candidate': .46, 'views': 5, 'fit': .40},
     'Cable Management System': {'confidence': .50, 'radius': .18, 'depth': .35, 'candidate': .48, 'views': 4, 'fit': .40},
-    'Cable Clamps': {'confidence': .45, 'radius': .08, 'depth': .80, 'candidate': .40, 'views': 6, 'fit': .48},
+    'Cable Clamps': {'confidence': .45, 'radius': .08, 'depth': .80, 'candidate': .40, 'views': 5, 'fit': .48, 'photo_boxes': True},
     'Foundation': {'confidence': .50, 'radius': .30, 'depth': .70, 'candidate': .45, 'views': 3, 'fit': .40},
     'ladder': {'confidence': .20, 'radius': .22, 'depth': .25, 'candidate': .38, 'views': 3, 'fit': .28},
 }
 DEFAULT_RULE = {'confidence': .55, 'radius': .15, 'depth': .50, 'candidate': .50, 'views': 4, 'fit': .42}
 FACING_CLASSES = {'sector_antenna', 'microwave_dish', 'rru'}  # mounted around the tower, so they define its axis
+# photo_boxes: parts smaller than the dense cloud resolves (a bolt covers a few dense points) may keep the box
+# triangulated from the photos; the views/fit gates above then decide alone whether it is one real object.
+SURFACE_ANCHORED_CLASSES = {'mounting_brackets'}  # irregular steelwork: dense geometry is safer than triangulated 2D box centres
 def rule_for(class_name): return CLASS_RULES.get(class_name, DEFAULT_RULE)
 
 def _confidence(d):
@@ -366,7 +369,7 @@ def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, c
     for c in out:
         obj = c.pop('_obj'); box = fit_box(obj, axis) if obj is not None else None
         if box: c.update(box, box_method='dense', box_points=int(len(obj)))
-        fit_to_detections(c, c['_views'], poses, cameras, M)
+        fit_to_detections(c, c['_views'], poses, cameras, M, move_centre=c['class_name'] not in SURFACE_ANCHORED_CLASSES)
     out = merge_duplicate_candidates(out, poses, cameras, M)
     clean = []
     for c in out:
@@ -433,7 +436,7 @@ def merge_duplicate_candidates(candidates, poses, cameras, M):
         base['box_points'] = sum(int(candidates[i].get('box_points') or 0) for i in members)
         base['confidence'] = max(float(candidates[i].get('confidence') or 0) for i in members)
         base['spread'] = min(float(candidates[i].get('spread') or 0) for i in members)
-        fit_to_detections(base, views, poses, cameras, M)
+        fit_to_detections(base, views, poses, cameras, M, move_centre=base['class_name'] not in SURFACE_ANCHORED_CLASSES)
         merged.append(base)
     return merged
 
@@ -442,7 +445,8 @@ def candidate_is_valid(c):
     rule = rule_for(c['class_name'])
     dims = [float(c.get(k) or 0) for k in ('size_w', 'size_h', 'size_d')]
     fit = float(c.get('fit_iou') or 0)
-    if c.get('box_method') != 'dense' or not all(math.isfinite(v) and v > 0 for v in dims): return False
+    if not all(math.isfinite(v) and v > 0 for v in dims): return False
+    if c.get('box_method') != 'dense' and not (rule.get('photo_boxes') and c.get('box_method') == 'estimate'): return False
     if int(c.get('media_count') or 0) < rule['views']: return False
     if float(c.get('confidence') or 0) < rule['candidate'] or not math.isfinite(fit) or fit < max(MIN_FIT_IOU, rule['fit']): return False
     w, h, _ = dims
@@ -460,10 +464,10 @@ def box_corners(c):
     x, y, z = c['position']
     return np.stack([x + a * cy + e * sy, y + b, z - a * sy + e * cy], 1)
 
-def fit_to_detections(c, views, poses, cameras, M, rounds=4):
-    """Final adjustment against the photos: move the centre to where the detection-box centres triangulate, then
-    scale the box until its outline, projected into each photo, spans the detection box (median over the photos).
-    The dense fit gives orientation and proportions; the YOLO boxes are the better evidence for position and extent."""
+def fit_to_detections(c, views, poses, cameras, M, rounds=4, move_centre=True):
+    """Final adjustment against the photos: optionally move the centre to where the detection-box centres
+    triangulate, then scale the projected outline to the detection boxes. Irregular structural classes can keep
+    the dense surface centre while still using the photos for their extent."""
     import numpy as np
     M = np.asarray(M, float); s = float(np.linalg.norm(M[:3, 0])); Rm, T = M[:3, :3] / s, M[:3, 3]
     to_model = lambda V: ((np.atleast_2d(V) - T) @ Rm) / s; to_view = lambda X: s * (np.atleast_2d(X) @ Rm.T) + T
@@ -480,16 +484,17 @@ def fit_to_detections(c, views, poses, cameras, M, rounds=4):
             uv, z = project(np.atleast_2d(X), pose[4], pose[5], cam)
             out.append((uv[0] - ctr) / np.array([bw, bh]) if z[0] > 0 else np.array([1.0, 1.0]))
         return np.concatenate(out)
-    X = to_model(c['position'])[0]; start = X.copy(); eps = 1e-3 * max(c['size_w'], c['size_h']) / s
-    for _ in range(10):  # Gauss-Newton, numeric Jacobian (3 unknowns)
-        r = residuals(X); J = np.stack([(residuals(X + eps * e) - r) / eps for e in np.eye(3)], 1)
-        try: step = np.linalg.lstsq(J, -r, rcond=None)[0]
-        except np.linalg.LinAlgError: break
-        X = X + step
-        if np.linalg.norm(step) < eps: break
-    moved = float(np.linalg.norm(X - start)) * s
-    if np.isfinite(X).all() and moved <= max(c['size_w'], c['size_h'], c['size_d']):  # a big jump means bad triangulation: keep the fit
-        c['position'] = to_view(X)[0]
+    if move_centre:
+        X = to_model(c['position'])[0]; start = X.copy(); eps = 1e-3 * max(c['size_w'], c['size_h']) / s
+        for _ in range(10):  # Gauss-Newton, numeric Jacobian (3 unknowns)
+            r = residuals(X); J = np.stack([(residuals(X + eps * e) - r) / eps for e in np.eye(3)], 1)
+            try: step = np.linalg.lstsq(J, -r, rcond=None)[0]
+            except np.linalg.LinAlgError: break
+            X = X + step
+            if np.linalg.norm(step) < eps: break
+        moved = float(np.linalg.norm(X - start)) * s
+        if np.isfinite(X).all() and moved <= max(c['size_w'], c['size_h'], c['size_d']):  # a big jump means bad triangulation: keep the fit
+            c['position'] = to_view(X)[0]
     def outlines():  # projected box outline per photo
         corners = to_model(box_corners(c))
         for pose, cam, ctr, bw, bh in obs:

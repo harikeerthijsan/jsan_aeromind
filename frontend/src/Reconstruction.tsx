@@ -34,8 +34,10 @@ function Cameras({url}:{url?:string}){
 // stable colour per equipment class (same palette as the 2D box editor)
 const CLASS_PALETTE=['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4','#469990','#dcbeff','#9a6324','#fffac8','#800000','#aaffc3'];
 export const classColor=(name:string)=>CLASS_PALETTE[[...name].reduce((h,ch)=>(h*31+ch.charCodeAt(0))>>>0,7)%CLASS_PALETTE.length];
+const MIN_DRAWN=.012;  // bolts and clamps are a few millimetres in model units: draw them at least this big (the panel shows the true size)
 function EquipmentBox({m,on}:{m:RegistrationCandidate;on:boolean}){
- const c=classColor(m.class_name),geo=useMemo(()=>new THREE.BoxGeometry(m.size_w!,m.size_h!,m.size_d!),[m.size_w,m.size_h,m.size_d]),edges=useMemo(()=>new THREE.EdgesGeometry(geo),[geo]);
+ const s=(v:number|null|undefined)=>Math.max(v||0,MIN_DRAWN);
+ const c=classColor(m.class_name),geo=useMemo(()=>new THREE.BoxGeometry(s(m.size_w),s(m.size_h),s(m.size_d)),[m.size_w,m.size_h,m.size_d]),edges=useMemo(()=>new THREE.EdgesGeometry(geo),[geo]);
  return <><mesh geometry={geo} renderOrder={20}><meshBasicMaterial color={c} transparent opacity={on?.42:.16} depthTest={false} depthWrite={false}/></mesh>
   <lineSegments geometry={edges} renderOrder={21} raycast={()=>{}}><lineBasicMaterial color={on?'#ffffff':c} depthTest={false}/></lineSegments></>;
 }
