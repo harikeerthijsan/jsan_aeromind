@@ -1,5 +1,5 @@
-import {useEffect,useMemo,useState} from 'react';
-import {AlertTriangle,Box,Camera,CheckCircle2,Layers,Move3d,RadioTower,RotateCw,Wrench,XCircle} from 'lucide-react';
+import {useEffect,useMemo,useRef,useState} from 'react';
+import {AlertTriangle,Box,Camera,CheckCircle2,Layers,Move3d,RadioTower,RotateCw,Wrench,XCircle,Maximize,Minimize} from 'lucide-react';
 import {Asset,Inspection,RegistrationCandidate,request,Site} from './api';
 import Tower3D from './Tower3D';
 import {Model3D,ModelView,classColor} from './Reconstruction';
@@ -49,7 +49,12 @@ export default function DigitalTwin({site,inspections,assets,selected,onPick,onO
  function cancelAdjustment(){if(editingRegistration!=null&&editOriginal)updateDraft(editingRegistration,editOriginal);setEditingRegistration(null);setEditOriginal(null)}
  async function saveAdjustment(){if(!candidate||candidate.id!==editingRegistration)return;setReviewing(true);setError('');try{const saved=await request<RegistrationCandidate>(`/api/v1/registrations/${candidate.id}/geometry`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:candidate.x,y:candidate.y,z:candidate.z,yaw:candidate.yaw??0})});setRegistrations(rows=>rows.map(row=>row.id===saved.id?saved:row));setEditingRegistration(null);setEditOriginal(null)}catch(e){setError(String(e))}finally{setReviewing(false)}}
 
- return <div className="viewer-shell recon-shell twin-shell">
+ // full screen covers the whole workspace (explorer, 3D view, inspector); Esc or the button leaves it
+ const shell=useRef<HTMLDivElement>(null),[full,setFull]=useState(false);
+ useEffect(()=>{const h=()=>setFull(document.fullscreenElement===shell.current);h();document.addEventListener('fullscreenchange',h);return()=>document.removeEventListener('fullscreenchange',h)},[]);
+ const toggleFull=()=>{if(document.fullscreenElement)document.exitFullscreen();else shell.current?.requestFullscreen().catch(()=>setError('Full screen is not available in this browser.'))};
+
+ return <div ref={shell} className="viewer-shell recon-shell twin-shell">
   <div className="viewer-left"><h3>Scene Explorer</h3><div className="scene-sub">{site?.code||'Select a site'} · {site?.name}</div>
    <div className="layer"><Layers size={15}/>{realModel?'Reconstructed geometry':'Tower structure'}<span>Visible</span></div>
    <div className="layer"><Box size={15}/>{realModel?(model.dense?'Dense mesh':'Sparse points'):'Demonstration model'}<span>On</span></div>
@@ -70,7 +75,7 @@ export default function DigitalTwin({site,inspections,assets,selected,onPick,onO
   </div>
 
   <div className="viewer-middle"><div className="viewer-toolbar ann-toolbar"><div className="ann-tools ann-title"><span className="live-dot"/><b>{realModel?`${site?.code} · Model #${model.id}`:'3D tower workspace'}</b></div>
-   {realModel?<div className="ann-tools"><button className={mode==='points'?'on':''} onClick={()=>setMode('points')}><Layers size={15}/>Points</button><button className={mode==='mesh'?'on':''} onClick={()=>setMode('mesh')} disabled={!model.urls.web_mesh}><Box size={15}/>Mesh</button><i className="ann-sep"/><label className="recon-size">size<input type="range" min={.005} max={.12} step={.005} value={pointSize} onChange={e=>setPointSize(+e.target.value)}/></label><button className={showCams?'on':''} onClick={()=>setShowCams(!showCams)} title="Drone camera positions"><Camera size={15}/></button></div>:<span>Orbit · Pan · Zoom</span>}
+   {realModel?<div className="ann-tools"><button className={mode==='points'?'on':''} onClick={()=>setMode('points')}><Layers size={15}/>Points</button><button className={mode==='mesh'?'on':''} onClick={()=>setMode('mesh')} disabled={!model.urls.web_mesh}><Box size={15}/>Mesh</button><i className="ann-sep"/><label className="recon-size">size<input type="range" min={.005} max={.12} step={.005} value={pointSize} onChange={e=>setPointSize(+e.target.value)}/></label><button className={showCams?'on':''} onClick={()=>setShowCams(!showCams)} title="Drone camera positions"><Camera size={15}/></button></div>:<span>Orbit · Pan · Zoom</span>}<div className="ann-tools"><button className={full?'on':''} title={full?'Exit full screen (Esc)':'Full screen'} onClick={toggleFull}>{full?<Minimize size={15}/>:<Maximize size={15}/>}</button></div>
   </div>
    {realModel?<div className="recon-stage"><ModelView key={model.id} model={model} mode={mode} pointSize={pointSize} showCams={showCams} markers={visibleMarkers} selectedMarker={selectedRegistration} editingMarker={editingRegistration} markerEditMode={editMode} focusRequest={focusRequest} onMarkerPick={focusRegistration} onMarkerTransform={transformDraft}/><div className="ann-hint">{editingRegistration!=null?(editMode==='translate'?'Drag an axis to move the selected box · switch to Rotate to change its facing':'Drag a yellow outside corner handle to rotate the box · switch to Move to reposition it'):'Click a list item or coloured box to focus · drag to orbit · right-drag to pan · wheel to zoom'}{showCams?' · orange arrows = source cameras':''}</div></div>:<Tower3D assets={assets} selected={selected?.id||null} onPick={onPick}/>}</div>
 
