@@ -49,7 +49,7 @@ function TowerForm({site,others,onClose,onSaved}:{site:Site|null;others:Site[];o
   <div className="st-modal-head"><div className="st-modal-icon"><RadioTower size={18}/></div><div><h2>{site?`Edit ${site.code}`:'Add tower'}</h2><small>{site?'Update the site record. Inspections and their data are not affected.':'Register a tower site; inspections, uploads and 3D models are added to it afterwards.'}</small></div><button type="button" className="st-icon-btn" onClick={onClose} aria-label="Close"><X size={18}/></button></div>
   <div className="st-modal-body">
    <div className="st-section-title">Identification</div>
-   <div className="st-grid">{field('code','Tower ID *',{placeholder:'e.g. TWR-010',autoFocus:!site,style:{textTransform:'uppercase'}})}{field('name','Site name *',{placeholder:'e.g. Hill Top Road'})}
+   <div className="st-grid">{field('code','Tower ID *',{placeholder:'e.g. TWR-010',autoFocus:!site,className:'st-upper'})}{field('name','Site name *',{placeholder:'e.g. Hill Top Road'})}
     {field('region','Region / city',{placeholder:'e.g. Hyderabad'})}{field('operator','Operator / owner',{placeholder:'e.g. Indus Towers'})}</div>
    <div className="st-section-title">Structure</div>
    <div className="st-grid"><label className="st-field"><span>Structure type</span><select value={f.tower_type} onChange={set('tower_type')}>{[...new Set([...STRUCTURES,f.tower_type])].map(s=><option key={s}>{s}</option>)}</select></label>

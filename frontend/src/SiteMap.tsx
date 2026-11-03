@@ -1,7 +1,7 @@
 import {useEffect,useRef,useState} from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import {Crosshair,Maximize2} from 'lucide-react';
+import {Crosshair,Loader2,MapPin,Maximize2,Search,X} from 'lucide-react';
 
 /** Leaflet maps for Projects & Sites: OpenStreetMap tiles (no key; attribution required), div-based markers styled in sites.css. */
 export type MapSite={id:number;code:string;name:string;status:string;latitude?:number|null;longitude?:number|null};
@@ -53,9 +53,27 @@ export function SitesMap({sites,selectedId,onSelect}:{sites:MapSite[];selectedId
  </div>;
 }
 
+/** Place search with OpenStreetMap's Nominatim. Its public-server policy allows at most 1 request per second and no
+ * search-as-you-type, so this searches on Enter / the button only, spaces requests out and caches answers.
+ * https://operations.osmfoundation.org/policies/nominatim/ */
+type Place={display_name:string;lat:string;lon:string;type?:string;category?:string;boundingbox?:[string,string,string,string]};
+const placeCache=new Map<string,Place[]>();let lastSearch=0;
+async function searchPlaces(q:string,near?:L.LatLngBounds):Promise<Place[]>{
+ const key=q.trim().toLowerCase();if(placeCache.has(key))return placeCache.get(key)!;
+ const wait=lastSearch+1100-Date.now();if(wait>0)await new Promise(r=>setTimeout(r,wait));lastSearch=Date.now();
+ const u=new URLSearchParams({q:q.trim(),format:'jsonv2',limit:'6','accept-language':navigator.language||'en'});
+ if(near)u.set('viewbox',near.toBBoxString());  // prefer places near the current map view (a boost, not a filter)
+ const r=await fetch('https://nominatim.openstreetmap.org/search?'+u.toString());
+ if(!r.ok)throw Error(`place search failed (${r.status})`);
+ const out=await r.json() as Place[];placeCache.set(key,out);return out}
+/** "17.385, 78.4867" / "17.385 78.4867" -> [lat, lon] */
+function parseCoords(q:string):[number,number]|null{const m=q.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,;\s]\s*(-?\d+(?:\.\d+)?)$/);if(!m)return null;
+ const a=+m[1],b=+m[2];return Math.abs(a)<=90&&Math.abs(b)<=180?[a,b]:null}
+
 /** Click (or drag the pin) to set a tower's coordinates. Other towers are shown faintly for orientation. */
 export function LocationPicker({lat,lon,onPick,others=[]}:{lat:number|null;lon:number|null;onPick:(lat:number,lon:number)=>void;others?:MapSite[]}){
  const {el,map,ready}=useMap(),pin=useRef<L.Marker|null>(null),pick=useRef(onPick),[locating,setLocating]=useState(''),centred=useRef(false);
+ const [query,setQuery]=useState(''),[results,setResults]=useState<Place[]|null>(null),[searching,setSearching]=useState(false),[found,setFound]=useState(''),spot=useRef<L.CircleMarker|null>(null);
  pick.current=onPick;
  const pinTo=(p:L.LatLngExpression)=>{const m=map.current!;
   if(!pin.current){pin.current=L.marker(p,{draggable:true,autoPan:true,icon:L.divIcon({className:'st-pick',html:'<span></span>',iconSize:[26,32],iconAnchor:[13,30]})}).addTo(m);
@@ -75,9 +93,27 @@ export function LocationPicker({lat,lon,onPick,others=[]}:{lat:number|null;lon:n
  function here(){if(!navigator.geolocation){setLocating('Location is not available in this browser');return}setLocating('Locating…');
   navigator.geolocation.getCurrentPosition(p=>{setLocating('');const a=round6(p.coords.latitude),b=round6(p.coords.longitude);centred.current=true;map.current?.setView([a,b],17);pick.current(a,b)},
    e=>setLocating(e.code===1?'Location permission denied':'Could not get your location'),{enableHighAccuracy:true,timeout:15000})}
+ async function runSearch(){const q=query.trim();if(q.length<2||searching)return;setFound('');
+  const c=parseCoords(q);if(c){setResults(null);centred.current=true;map.current?.setView(c,17);pinTo(c);pick.current(round6(c[0]),round6(c[1]));setFound('Placed at the pasted coordinates');return}
+  setSearching(true);try{setResults(await searchPlaces(q,map.current?.getBounds()))}catch{setResults(null);setFound('Place search is unavailable right now. Pan and zoom the map instead.')}finally{setSearching(false)}}
+ function goTo(p:Place){const m=map.current;if(!m)return;setResults(null);centred.current=true;
+  const lat=+p.lat,lon=+p.lon,bb=p.boundingbox?.map(Number);
+  if(bb&&bb.every(isFinite)&&(bb[1]-bb[0]>.0005||bb[3]-bb[2]>.0005))m.fitBounds([[bb[0],bb[2]],[bb[1],bb[3]]],{maxZoom:17});else m.setView([lat,lon],17);
+  spot.current?.remove();spot.current=L.circleMarker([lat,lon],{radius:8,color:'#1769aa',weight:2,fillColor:'#1769aa',fillOpacity:.15,interactive:false}).addTo(m);  // where the place is, not yet the tower
+  setFound(`Showing ${p.display_name.split(',').slice(0,3).join(',')}. Now click the tower's exact position.`)}
  return <div className="st-picker">
+  <div className="st-place-search">
+   <div className="search"><Search size={15}/><input value={query} onChange={e=>{setQuery(e.target.value);if(!e.target.value)setResults(null)}} placeholder="Search a place or paste coordinates (17.385, 78.4867)"
+     onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();runSearch()}if(e.key==='Escape'&&results){e.preventDefault();e.stopPropagation();setResults(null)}}} aria-label="Search a place"/>
+    {query&&<button type="button" className="st-icon-btn" onClick={()=>{setQuery('');setResults(null)}} aria-label="Clear"><X size={13}/></button>}</div>
+   <button type="button" className="btn outline" onClick={runSearch} disabled={searching||query.trim().length<2}>{searching?<Loader2 size={14} className="st-spin"/>:<Search size={14}/>}Search</button>
+   {results&&<div className="st-place-results" role="listbox">{results.length?results.map((p,i)=><button type="button" key={i} role="option" onClick={()=>goTo(p)}><MapPin size={13}/>
+     <span><b>{p.display_name.split(',')[0]}</b><small>{p.display_name.split(',').slice(1).join(',').trim()}</small></span>{p.type&&<em>{p.type.replaceAll('_',' ')}</em>}</button>)
+     :<div className="st-place-empty">No places found. Try a town, area or landmark name.</div>}</div>}
+  </div>
   <div className="st-map-wrap"><div ref={el} className="st-map st-map-small"/>
    <button type="button" className="st-map-btn" title="Use my current location" onClick={here}><Crosshair size={15}/></button></div>
-  <small className="muted">{locating||'Click the map to place the tower (it zooms in on that spot), then drag the pin to the exact position.'}</small>
+  <small className="muted">{locating||found||'Click the map to place the tower (it zooms in on that spot), then drag the pin to the exact position.'}</small>
+  <small className="st-osm-note">Search by OpenStreetMap Nominatim</small>
  </div>;
 }
