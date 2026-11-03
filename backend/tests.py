@@ -1,0 +1,776 @@
+import pytest, time
+from fastapi.testclient import TestClient
+from app.main import app
+
+def test_health():
+    with TestClient(app) as client:
+        r=client.get('/health')
+        assert r.status_code==200 and r.json()['ai_inference']=='not_configured'
+
+def test_registration_clusters_need_multiple_images():
+    import numpy as np
+    from app.registration import _clusters
+    rows=[{'position':np.array([0.,0.,0.]),'weight':.9,'confidence':.8,'media_id':1,'detection_id':10,'point_count':5},
+          {'position':np.array([.03,0.,0.]),'weight':.8,'confidence':.82,'media_id':2,'detection_id':11,'point_count':7},
+          {'position':np.array([2.,0.,0.]),'weight':.95,'confidence':.9,'media_id':3,'detection_id':12,'point_count':8}]
+    result=_clusters(rows,.1)
+    assert len(result)==1 and result[0]['media_count']==2 and set(result[0]['detection_ids'])=={10,11}
+
+def test_registration_suppresses_duplicate_2d_boxes_only_within_class():
+    from types import SimpleNamespace as NS
+    from app.registration import _nms
+    box=lambda i,name,confidence,x1,x2:NS(id=i,class_name=name,confidence=confidence,x1=x1,y1=10,x2=x2,y2=90)
+    boxes=[box(1,'rru',.92,10,90),box(2,'rru',.80,12,88),box(3,'rru',.85,110,170),box(4,'sector_antenna',.75,12,88)]
+    kept=_nms(boxes)
+    assert {b.id for b in kept}=={1,3,4}  # duplicate RRU removed; neighbour and other class retained
+
+def test_registration_merges_multiview_fragments_not_neighbours(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace as NS
+    from app import registration as reg
+    det=lambda i,x1,x2:NS(id=i,confidence=.9,x1=x1,y1=10,x2=x2,y2=110)
+    def candidate(position,views):
+        return {'class_name':'sector_antenna','position':np.array(position,float),'confidence':.9,'media_count':2,
+                'evidence_count':2,'point_count':100,'spread':.02,'detection_ids':[d.id for _,d in views],
+                'size_w':.3,'size_h':1.2,'size_d':.15,'yaw':0.,'box_method':'dense','box_points':80,
+                'fit_iou':.8,'_views':views}
+    first=candidate([1,3,0],[('a',det(1,10,50)),('b',det(2,12,52))])
+    fragment=candidate([1.02,3,.01],[('a',det(3,11,51)),('b',det(4,13,53))])
+    neighbour=candidate([1,3,.4],[('a',det(5,70,110)),('b',det(6,72,112))])
+    monkeypatch.setattr(reg,'fit_to_detections',lambda c,*args,**kwargs:c)
+    out=reg.merge_duplicate_candidates([first,fragment,neighbour],{}, {},np.eye(4))
+    assert len(out)==2
+    assert sorted(c['media_count'] for c in out)==[2,2]
+    assert sorted(len(c['detection_ids']) for c in out)==[2,2]
+
+def test_registration_uses_shape_aware_ladder_validation():
+    from app.registration import candidate_is_valid
+    base={'class_name':'ladder','box_method':'dense','media_count':4,'confidence':.423,'fit_iou':.303,
+          'size_w':.077,'size_h':.667,'size_d':.029}
+    assert candidate_is_valid(base)
+    assert not candidate_is_valid(base|{'size_h':.12})  # compact false positive, not a ladder
+
+def _registration_fixture():
+    import uuid
+    from app.database import SessionLocal
+    from app.models import Inspection, Model3D, RegistrationCandidate, Site
+    with SessionLocal() as db:
+        site=Site(code='REG-'+uuid.uuid4().hex[:10],name='Registration review test');db.add(site);db.flush()
+        inspection=Inspection(site_id=site.id,label='3D review');db.add(inspection);db.flush()
+        model=Model3D(inspection_id=inspection.id,status='completed',quality={});db.add(model);db.flush()
+        rows=[RegistrationCandidate(model_id=model.id,inspection_id=inspection.id,site_id=site.id,class_name='rru',x=i*.2,y=0,z=1,
+               confidence=.9,status='needs_review',evidence_count=5,media_count=5,point_count=100,spread=.01,detection_ids=[10+i],
+               size_w=.05,size_h=.1,size_d=.03,yaw=0,box_method='dense',box_points=80,fit_iou=.8) for i in range(2)]
+        db.add_all(rows);db.commit();return model.id,inspection.id,[row.id for row in rows]
+
+def test_registration_review_api_supports_single_and_bulk_decisions():
+    model_id,_,ids=_registration_fixture()
+    with TestClient(app) as client:
+        r=client.patch(f'/api/v1/registrations/{ids[0]}',json={'status':'approved'})
+        assert r.status_code==200 and r.json()['status']=='approved'
+        r=client.post(f'/api/v1/models/{model_id}/registrations/review',json={'candidate_ids':ids,'status':'needs_adjustment'})
+        assert r.status_code==200 and r.json()['updated_count']==2
+        assert {row['status'] for row in r.json()['candidates']}=={'needs_adjustment'}
+        r=client.patch(f'/api/v1/registrations/{ids[0]}/geometry',json={'x':.3,'y':-.2,'z':1.4,'yaw':7.0})
+        assert r.status_code==200 and (r.json()['x'],r.json()['y'],r.json()['z'])==(.3,-.2,1.4)
+        assert -3.1416<=r.json()['yaw']<=3.1416
+        assert client.patch(f'/api/v1/registrations/{ids[0]}',json={'status':'approved'}).status_code==200
+        assert client.patch(f'/api/v1/registrations/{ids[0]}/geometry',json={'x':0,'y':0,'z':0}).status_code==409
+        assert client.patch(f'/api/v1/registrations/{ids[0]}',json={'status':'invalid'}).status_code==422
+
+def test_registration_rebuild_preserves_approved_id_and_updates_unreviewed_in_place():
+    import numpy as np
+    from sqlalchemy import select
+    from app.database import SessionLocal
+    from app.main import reconcile_registrations
+    from app.models import Inspection, Model3D, RegistrationCandidate
+    model_id,inspection_id,ids=_registration_fixture()
+    with SessionLocal() as db:
+        model,inspection=db.get(Model3D,model_id),db.get(Inspection,inspection_id)
+        approved,mutable=db.get(RegistrationCandidate,ids[0]),db.get(RegistrationCandidate,ids[1]);approved.status='approved';db.commit()
+        def generated(position,detection_id):return {'class_name':'rru','position':np.array(position,float),'confidence':.92,'spread':.01,
+            'media_count':6,'evidence_count':6,'point_count':120,'detection_ids':[detection_id],'size_w':.05,'size_h':.1,'size_d':.03,
+            'yaw':0.,'box_method':'dense','box_points':90,'fit_iou':.82}
+        stats=reconcile_registrations(db,model,inspection,[generated([.01,1.01,0],10),generated([.22,1.02,0],11),generated([.5,1,0],12)]);db.commit()
+        rows=list(db.scalars(select(RegistrationCandidate).where(RegistrationCandidate.model_id==model_id)))
+        assert stats=={'created':1,'updated':1,'preserved':1,'removed':0}
+        assert len(rows)==3 and db.get(RegistrationCandidate,approved.id).status=='approved'
+        assert db.get(RegistrationCandidate,mutable.id).x==pytest.approx(.22) and db.get(RegistrationCandidate,mutable.id).status=='needs_review'
+
+def test_registration_rebuild_preserves_needs_adjustment_geometry():
+    import numpy as np
+    from app.database import SessionLocal
+    from app.main import reconcile_registrations
+    from app.models import Inspection, Model3D, RegistrationCandidate
+    model_id,inspection_id,ids=_registration_fixture()
+    with SessionLocal() as db:
+        model,inspection=db.get(Model3D,model_id),db.get(Inspection,inspection_id);row=db.get(RegistrationCandidate,ids[0])
+        row.status='needs_adjustment';row.x=.35;db.commit()
+        generated={'class_name':'rru','position':np.array([.02,1,0],float),'confidence':.92,'spread':.01,'media_count':6,
+                   'evidence_count':6,'point_count':120,'detection_ids':[10],'size_w':.05,'size_h':.1,'size_d':.03,
+                   'yaw':0,'box_method':'dense','box_points':80,'fit_iou':.8}
+        result=reconcile_registrations(db,model,inspection,[generated]);db.commit()
+        kept=db.get(RegistrationCandidate,ids[0])
+        assert result['preserved']==1 and kept.status=='needs_adjustment' and kept.x==pytest.approx(.35)
+
+def test_sites_and_dashboard():
+    with TestClient(app) as client:
+        assert client.get('/api/v1/sites').status_code==200
+        assert 'assets' in client.get('/api/v1/dashboard').json()
+
+def test_process_without_detector():
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Test run'}).json()
+        r=client.post(f"/api/v1/inspections/{i['id']}/process")
+        assert r.status_code==202 and r.json()['status']=='awaiting_worker'
+        assert client.get(f"/api/v1/inspections/{i['id']}/detections").json()==[]
+
+def test_approve_image_annotations():
+    from app.database import SessionLocal
+    from app.models import Detection, Job
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'QC run'}).json()
+        m=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('t.png',b'\x89PNG\r\n\x1a\n','image/png')}).json()
+        with SessionLocal() as db:  # stand-in for a detector run
+            job=Job(inspection_id=i['id'],kind='detection',status='completed',stage='detection');db.add(job);db.flush()
+            dets=[Detection(job_id=job.id,inspection_id=i['id'],media_id=m['id'],class_id=k,class_name=n,confidence=.9,x1=10,y1=10,x2=50,y2=50,image_width=100,image_height=80,model_name='test') for k,n in [(0,'qc_antenna'),(1,'qc_rru'),(1,'qc_rru')]]
+            db.add_all(dets);db.commit();keep,edit,drop,job_id=dets[0].id,dets[1].id,dets[2].id,job.id
+        assert client.get(f"/api/v1/media/{m['id']}/annotations").json()=={'review':None,'annotations':[]}
+        boxes=[{'detection_id':keep,'class_name':'qc_antenna','x1':10,'y1':10,'x2':50,'y2':50},
+               {'detection_id':edit,'class_name':'qc_antenna','x1':12,'y1':10,'x2':50,'y2':50},
+               {'class_name':'qc_new_part','x1':95,'y1':70,'x2':60,'y2':200}]  # reversed + out of bounds: normalised and clamped
+        r=client.put(f"/api/v1/media/{m['id']}/annotations",json={'workflow':'ai_detection','job_id':job_id,'image_width':100,'image_height':80,'boxes':boxes})
+        assert r.status_code==200,r.text
+        body=r.json();a=body['annotations']
+        assert body['review']['status']=='approved' and body['review']['box_count']==3
+        assert [x['source'] for x in a]==['model','model_edited','manual']
+        assert (a[2]['x1'],a[2]['y1'],a[2]['x2'],a[2]['y2'])==(60,70,95,80)
+        assert a[2]['class_id'] not in (a[0]['class_id'],) and a[2]['confidence'] is None
+        status={d['id']:d['review_status'] for d in client.get(f"/api/v1/inspections/{i['id']}/detections").json()}
+        assert status=={keep:'accepted',edit:'corrected',drop:'rejected'}
+        assert 'qc_new_part' in [c['name'] for c in client.get('/api/v1/classes').json()]
+        # re-approving replaces the set; QC can approve an image as having no objects
+        r=client.put(f"/api/v1/media/{m['id']}/annotations",json={'workflow':'manual_qc','image_width':100,'image_height':80,'boxes':[]})
+        assert r.json()['annotations']==[] and r.json()['review']['workflow']=='manual_qc'
+        assert len(client.get(f"/api/v1/inspections/{i['id']}/reviews").json())==1
+        bad=client.put(f"/api/v1/media/{m['id']}/annotations",json={'image_width':100,'image_height':80,'boxes':[{'class_name':'x','x1':5,'y1':5,'x2':5.5,'y2':40}]})
+        assert bad.status_code==422 and len(client.get(f"/api/v1/media/{m['id']}/annotations").json()['annotations'])==0
+
+def _drone_jpeg(orientation=6):
+    """64x48 JPEG carrying the metadata a DJI camera writes: EXIF+GPS+MakerNote, XMP, ICC, IPTC, MPF index, comment."""
+    import io
+    from PIL import Image, ImageCms
+    ex=Image.Exif();ex[0x010F]='DJI';ex[0x0110]='FC6310';ex[0x0112]=orientation
+    ex[0x8769]={0x927C:b'DJI makernote \x01\x02'};ex[0x8825]={1:'N',2:(17.0,23.0,1.5),3:'E',4:(78.0,28.0,2.25)}
+    icc=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+    b=io.BytesIO();Image.new('RGB',(64,48),(128,128,128)).save(b,'JPEG',exif=ex,icc_profile=icc,quality=90);j=b.getvalue()
+    seg=lambda m,body:bytes([0xFF,m])+(len(body)+2).to_bytes(2,'big')+body
+    xmp=b'http://ns.adobe.com/xap/1.0/\0<x:xmpmeta><rdf:Description drone-dji:GimbalYawDegree="-87.5"/></x:xmpmeta>'
+    return j[:2]+seg(0xE1,xmp)+seg(0xED,b'Photoshop 3.0\0IPTC')+seg(0xE2,b'MPF\0stale offsets')+seg(0xFE,b'survey 42')+j[2:]
+
+def test_render_keeps_jpeg_metadata(tmp_path):
+    pytest.importorskip('PIL')
+    import io
+    from PIL import Image, ImageOps
+    from app.annotate import render, jpeg_segments
+    src=_drone_jpeg();p=tmp_path/'drone.jpg';p.write_bytes(src)
+    # ultralytics reads JPEGs upright, so boxes come in the 48x64 display frame of this orientation-6 image
+    out,mime=render(p,[{'class_id':1,'class_name':'rru','confidence':.91,'x1':5,'y1':5,'x2':30,'y2':40}],seen_size=(48,64))
+    assert mime=='image/jpeg'
+    meta=[s for m,s in jpeg_segments(src)[0] if m in (0xE0,0xE1,0xED,0xFE) or (m==0xE2 and s[4:].startswith(b'ICC_PROFILE'))]
+    assert all(s in out for s in meta) and b'MPF\0stale' not in out  # copied byte-for-byte; stale MPF index dropped
+    im=Image.open(io.BytesIO(out));ex=im.getexif()
+    assert im.size==(64,48) and ex[0x0112]==6 and ex[0x010F]=='DJI' and ex.get_ifd(0x8825)[1]=='N' and ex.get_ifd(0x8769)[0x927C]==b'DJI makernote \x01\x02'
+    up=ImageOps.exif_transpose(im).convert('RGB')
+    r,g,b=up.getpixel((5,20));assert g>r+20  # green rru outline where the box is in the upright frame
+    assert up.getpixel((40,60))==up.getpixel((44,62))  # background untouched
+
+def test_render_keeps_png_and_tiff_metadata(tmp_path):
+    pytest.importorskip('PIL')
+    import io
+    from PIL import Image, PngImagePlugin
+    from app.annotate import render
+    box=[{'class_id':0,'class_name':'antenna','x1':2,'y1':2,'x2':20,'y2':20}]
+    info=PngImagePlugin.PngInfo();info.add_text('Author','pilot');info.add_itxt('XML:com.adobe.xmp','<x:xmpmeta>drone-dji:FlightYawDegree="12" °</x:xmpmeta>')
+    pe=Image.Exif();pe[0x010F]='DJI';Image.new('RGBA',(40,30),(10,20,30,255)).save(tmp_path/'a.png',pnginfo=info,exif=pe,dpi=(300,300))
+    q=Image.open(io.BytesIO(render(tmp_path/'a.png',box)[0]))
+    assert q.mode=='RGBA' and q.text==Image.open(tmp_path/'a.png').text and q.getexif()[0x010F]=='DJI' and round(q.info['dpi'][0])==300
+    te=Image.Exif();te[271]='DJI';te[700]=b'<x:xmpmeta/>';te.get_ifd(0x8825).update({1:'N',2:(17.0,23.0,1.5)});te[0x8825]=0
+    Image.new('RGB',(40,30),(10,20,30)).save(tmp_path/'a.tif',exif=te)
+    r=Image.open(io.BytesIO(render(tmp_path/'a.tif',box)[0]))
+    assert r.tag_v2[271]=='DJI' and r.tag_v2[700]==b'<x:xmpmeta/>' and r.getexif().get_ifd(0x8825)[1]=='N'
+
+def test_annotated_download_endpoints():
+    pytest.importorskip('PIL')
+    import io, zipfile
+    from PIL import Image
+    from app.database import SessionLocal
+    from app.models import Detection, Job
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Annotated output'}).json()
+        m=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('DJI_0001.JPG',_drone_jpeg(),'image/jpeg')}).json()
+        with SessionLocal() as db:
+            job=Job(inspection_id=i['id'],kind='detection',status='completed',stage='detection');db.add(job);db.flush()
+            db.add(Detection(job_id=job.id,inspection_id=i['id'],media_id=m['id'],class_id=0,class_name='sector_antenna',confidence=.8,x1=4,y1=4,x2=40,y2=50,image_width=48,image_height=64,model_name='test'));db.commit()
+        r=client.get(f"/api/v1/media/{m['id']}/annotated")
+        assert r.status_code==200 and r.headers['x-annotation-source']=='model' and r.headers['x-box-count']=='1'
+        assert 'DJI_0001_detections.jpg' in r.headers['content-disposition']
+        assert Image.open(io.BytesIO(r.content)).getexif().get_ifd(0x8825)[1]=='N' and b'GimbalYawDegree' in r.content
+        assert client.get(f"/api/v1/media/{m['id']}/annotated?source=approved").status_code==404
+        client.put(f"/api/v1/media/{m['id']}/annotations",json={'workflow':'manual_qc','image_width':48,'image_height':64,'boxes':[]})
+        r=client.get(f"/api/v1/media/{m['id']}/annotated")
+        assert r.headers['x-annotation-source']=='approved' and r.headers['x-box-count']=='0'
+        z=client.get(f"/api/v1/inspections/{i['id']}/annotated.zip?source=model")
+        assert z.status_code==200
+        with zipfile.ZipFile(io.BytesIO(z.content)) as f:
+            assert f.namelist()==['DJI_0001_detections.jpg'] and b'drone-dji' in f.read('DJI_0001_detections.jpg')
+
+def test_vendor_tags_suggestions_and_csv(monkeypatch):
+    pytest.importorskip('PIL')
+    from app import vendor
+    with TestClient(app) as client:
+        info=client.get('/api/v1/vendors').json()
+        assert info['classes']==['sector_antenna','microwave_dish'] and 'Ericsson' in info['manufacturers']['sector_antenna']
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Vendor tags'}).json()
+        m=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('DJI_0002.JPG',_drone_jpeg(1),'image/jpeg')}).json()
+        boxes=[{'class_name':'sector_antenna','x1':2,'y1':2,'x2':30,'y2':40,'manufacturer':'Ericsson','product_model':'AIR 6449','vendor_source':'ai','vendor_confidence':.9,'vendor_evidence':'logo'},
+               {'class_name':'microwave_dish','x1':32,'y1':2,'x2':60,'y2':30,'manufacturer':'Huawei','vendor_source':'reviewer','vendor_confidence':.5},
+               {'class_name':'bolts','x1':40,'y1':35,'x2':50,'y2':45,'manufacturer':'Ericsson'}]
+        a=client.put(f"/api/v1/media/{m['id']}/annotations",json={'workflow':'manual_qc','image_width':64,'image_height':48,'boxes':boxes}).json()['annotations']
+        assert [(x['manufacturer'],x['product_model'],x['vendor_source'],x['vendor_confidence']) for x in a]==[('Ericsson','AIR 6449','ai',.9),('Huawei',None,'reviewer',None),(None,None,None,None)]
+        csv_text=client.get(f"/api/v1/inspections/{i['id']}/annotations.csv").text
+        assert 'DJI_0002.JPG,' in csv_text and 'Ericsson,AIR 6449,ai,0.9' in csv_text
+        seen={}
+        monkeypatch.setattr(vendor,'status',lambda:'ready')
+        monkeypatch.setattr(vendor,'suggest',lambda im,cls,refs=():seen.update(size=im.size,cls=cls,refs=[r[0] for r in refs]) or {'manufacturer':'Unknown','confidence':.1})
+        r=client.post(f"/api/v1/media/{m['id']}/vendor-suggestion",json={'class_name':'microwave_dish','x1':32,'y1':2,'x2':60,'y2':30,'image_width':64,'image_height':48})
+        assert r.status_code==200 and r.json()['manufacturer']=='Unknown' and seen['cls']=='microwave_dish' and seen['size']==(36,34)  # 28px box + 15% padding, clipped at the image edge
+        assert 'Huawei' not in seen['refs']  # the reviewer-tagged box itself is not offered as its own reference
+        client.post(f"/api/v1/media/{m['id']}/vendor-suggestion",json={'class_name':'microwave_dish','x1':2,'y1':30,'x2':30,'y2':47,'image_width':64,'image_height':48})
+        assert 'Huawei' in seen['refs']  # ...but it is a reference for other dishes
+        assert client.get('/api/v1/vendors').json()['reviewer_references']['microwave_dish']>=1
+        assert client.post(f"/api/v1/media/{m['id']}/vendor-suggestion",json={'class_name':'bolts','x1':1,'y1':1,'x2':9,'y2':9,'image_width':64,'image_height':48}).status_code==422
+        monkeypatch.setattr(vendor,'status',lambda:'unreachable')
+        assert client.post(f"/api/v1/media/{m['id']}/vendor-suggestion",json={'class_name':'sector_antenna','x1':1,'y1':1,'x2':9,'y2':9,'image_width':64,'image_height':48}).status_code==503
+
+def test_structure_decision_logic(monkeypatch):
+    pytest.importorskip('PIL')
+    from PIL import Image
+    from app import vendor
+    im=Image.new('RGB',(40,80),'white');refs=[('NEC',im),('NEC',im),('Ceragon',im)]
+    monkeypatch.setattr(vendor,'compare_model',lambda:'thinking-model')  # don't depend on a local Ollama
+    def run(answers):
+        it=iter(answers);monkeypatch.setattr(vendor,'_chat',lambda *a,**k:(next(it),1.0));return vendor.suggest(im,'microwave_dish',refs)
+    logo_unknown={'manufacturer':'Unknown','confidence':.1,'evidence':'plain'}
+    describe=lambda guess='Unknown',gc=0:{'features':{'dish_type':'shrouded'},'own_knowledge_guess':guess,'own_knowledge_confidence':gc,'reasoning':'r'}
+    compare=lambda ok,sim:{'same_equipment_type':True,'matching_features':['outline'],'differing_features':[] if ok else ['ODU position'],'same_product':'yes' if ok else 'no','similarity':sim,'reasoning':'v'}
+    r=run([{'manufacturer':'Huawei','confidence':.95,'evidence':'logo'}])
+    assert (r['manufacturer'],r['basis'])==('Huawei','logo_text')  # a legible logo wins; no structure pass
+    r=run([logo_unknown,describe(),compare(True,.9),compare(False,.2)])  # one call per manufacturer: NEC, then Ceragon
+    assert (r['manufacturer'],r['basis'],r['confidence'])==('NEC','reference_match',.6) and r['reference_vendors']==['NEC','Ceragon']  # capped below logo evidence
+    r=run([logo_unknown,describe(),compare(False,.3),compare(True,.8)])
+    assert r['manufacturer']=='Ceragon'
+    r=run([logo_unknown,describe(),compare(False,.3),compare(False,.2)])
+    assert (r['manufacturer'],r['basis'])==('Unknown','none') and 'No reference matched' in r['evidence']
+    r=run([logo_unknown,describe(),compare(True,.9),compare(True,.85)])
+    assert r['manufacturer']=='Unknown' and 'Ambiguous' in r['evidence'] and r['ambiguous']  # two close matches: don't pick one...
+    assert [(c['manufacturer'],c['similarity']) for c in r['candidates']]==[('NEC',.9),('Ceragon',.85)]  # ...offer both to the reviewer
+    def flaky(answers):  # a comparison that never answers is skipped, not fatal
+        it=iter(answers)
+        def chat(*a,**k):
+            x=next(it)
+            if x is None: raise RuntimeError('VLM returned no usable JSON')
+            return x,1.0
+        monkeypatch.setattr(vendor,'_chat',chat);return vendor.suggest(im,'microwave_dish',refs)
+    r=flaky([logo_unknown,describe(),None,compare(True,.8)])
+    assert r['manufacturer']=='Ceragon' and 'NEC gave no answer' in r['evidence']
+    monkeypatch.setattr(vendor,'compare_model',lambda:None)  # thinking model missing: skip, don't trust the instruct model
+    r=run([logo_unknown,describe()])
+    assert r['manufacturer']=='Unknown' and 'Structure comparison skipped' in r['evidence'] and not r['candidates']
+    monkeypatch.setattr(vendor,'compare_model',lambda:'thinking-model')
+    refs[:]=[('ANDREW',im),('CommScope',im),('Kathrein',im)]  # brands of one company are compared together: two calls, not three
+    r=run([logo_unknown,describe(),compare(True,.9),compare(False,.3)])
+    assert (r['manufacturer'],r['basis'])==('CommScope','reference_match') and r['reference_vendors']==['CommScope','Ericsson'] and 'ANDREW brand' in r['evidence']
+    refs[:]=[('NEC',im),('NEC',im),('Ceragon',im)]
+    r=run([logo_unknown,describe('Ericsson',.8),compare(False,.3),compare(False,.2)])
+    assert r['manufacturer']=='Unknown' and r['structure_hint']=='Ericsson' and 'Unverified hint' in r['evidence']  # model knowledge never becomes the tag
+
+def test_reference_library_import(tmp_path, monkeypatch):
+    pytest.importorskip('PIL')
+    import io, csv
+    from PIL import Image
+    from app import vendor, refs_import
+    monkeypatch.setattr(vendor,'VENDOR_REFERENCE_DIR',tmp_path)
+    def jpg(w,h):
+        b=io.BytesIO();Image.new('RGB',(w,h),'white').save(b,'JPEG');return b.getvalue()
+    got=[]
+    def fake_fetch(url,timeout=30):
+        got.append(url)
+        if 'missing' in url: raise OSError('404')
+        return jpg(600,900)
+    monkeypatch.setattr(refs_import,'fetch',fake_fetch)
+    man=tmp_path/'manifest.csv'
+    man.write_text('category,manufacturer,model,view,url,page,status,downloaded,notes\n'
+                   'Sector_Antennas,ANDREW,NNHH-65B-R4-V1,front,https://x/a.jpg/thumbnail,https://p,ok,NO,\n'
+                   'Sector_Antennas,ANDREW,NNHH-65B-R4-V1,bottom_straight,https://x/b.jpg,https://p,ok,NO,\n'
+                   'Sector_Antennas,ANDREW,NNHH-65B-R4-V1,side_installed,https://x/c.jpg,https://p,ok,NO,\n'
+                   'Microwave_Dishes,Aviat_Networks,AND-VHLP6,rear_three_quarter,https://x/missing.jpg,https://p,ok,NO,check model\n',encoding='utf-8')
+    rows=refs_import.import_manifest(man,log=lambda *a:None)
+    assert got[0]=='https://x/a.jpg/medium'  # thumbnail links are upgraded
+    assert [r['status'][:6] for r in rows]==['ok','ok','ok','failed'] and rows[3]['manufacturer']=='Aviat'
+    lib=vendor.library('sector_antenna')
+    assert {r['view']:r['match'] for r in lib}=={'front':True,'bottom_straight':False,'side_installed':True}  # connector ends: reviewer only
+    assert [p.name for _,p in vendor.folder_references('sector_antenna')]==['NNHH-65B-R4-V1__side_installed.jpg','NNHH-65B-R4-V1__front.jpg']  # drone-like views first
+    assert 'ANDREW' in vendor.manufacturers('sector_antenna')
+    (tmp_path/'sector_antenna'/'Huawei').mkdir();Image.new('RGB',(100,200)).save(tmp_path/'sector_antenna'/'Huawei'/'aau.jpg')  # added by hand
+    assert ('Huawei','aau.jpg') in [(m,p.name) for m,p in vendor.folder_references('sector_antenna')]
+    with TestClient(app) as client:
+        r=client.get('/api/v1/vendor-references',params={'class_name':'sector_antenna','manufacturer':'andrew'}).json()
+        assert len(r)==3 and all(x['url'].startswith('/vendor-refs/sector_antenna/ANDREW/') for x in r) and sum(x['match'] for x in r)==2
+    assert list(csv.DictReader(open(tmp_path/'references.csv',encoding='utf-8')))[3]['status'].startswith('failed')
+
+def test_condition_rules_and_second_opinion(monkeypatch):
+    pytest.importorskip('PIL')
+    from PIL import Image
+    from app import condition, vendor
+    n=condition.normalise
+    d=lambda t,s,e:{'type':t,'severity':s,'extent_percent':e,'location':'bracket','evidence':'brown flakes'}
+    r=n({'image_quality':'good','grade':'Good','health_score':95,'confidence':.8,'defects':[d('rust','severe',60)],'summary':'s'})
+    assert r['grade']=='Critical' and r['health_score']<=30 and r['rust_percent']==60  # a severe defect can't be Good
+    r=n({'image_quality':'good','grade':'Good','health_score':95,'confidence':.8,'defects':[d('rust','moderate',20)],'summary':'s'})
+    assert (r['grade'],r['rust_percent'])==('Poor',20)
+    assert n({'image_quality':'good','grade':'Poor','health_score':40,'confidence':.8,'defects':[],'summary':'s'})['grade']=='Fair'  # no defect, no Poor
+    r=n({'image_quality':'insufficient','grade':'Good','health_score':90,'confidence':.9,'defects':[],'summary':'s'})
+    assert (r['grade'],r['health_score'])==('Unknown',None)
+    calls=[];im=Image.new('RGB',(200,300),'white')
+    monkeypatch.setattr(vendor,'_chat',lambda *a,**k:calls.append(1))
+    r=condition.assess_verified(im,'bolts',(11,15))
+    assert r['grade']=='Unknown' and r['skipped'] and not calls  # too small: the model isn't asked
+    monkeypatch.setattr(vendor,'compare_model',lambda:'thinking-model')
+    def chat_seq(answers):
+        it=iter(answers);monkeypatch.setattr(vendor,'_chat',lambda *a,**k:(next(it),1.0))
+    rusty={'image_quality':'good','grade':'Fair','health_score':80,'confidence':.7,'defects':[d('rust','minor',10)],'summary':'Light rust.'}
+    clean={'image_quality':'good','grade':'Good','health_score':98,'confidence':.8,'defects':[],'summary':'Clean.'}
+    chat_seq([rusty,clean]);r=condition.assess_verified(im,'rru',(124,162))
+    assert r['verified']=='disputed' and r['confidence']<=.3 and 'check visually' in r['summary'] and r['defects'][0]['confirmed'] is False
+    chat_seq([rusty,{**rusty,'defects':[d('corrosion','minor',15)]}]);r=condition.assess_verified(im,'rru',(124,162))
+    assert r['verified']=='confirmed' and r['defects'][0]['confirmed']  # rust vs corrosion count as the same finding
+    chat_seq([clean]);r=condition.assess_verified(im,'rru',(124,162))
+    assert r['grade']=='Good' and r['verified']=='not_run'  # nothing to re-check
+
+def test_condition_saved_and_exported(monkeypatch):
+    pytest.importorskip('PIL')
+    from app import condition
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Condition'}).json()
+        m=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('DJI_0003.JPG',_drone_jpeg(1),'image/jpeg')}).json()
+        defects=[{'type':'rust','severity':'moderate','extent_percent':20,'location':'bracket base','evidence':'orange-brown flaking','source':'ai','confirmed':True}]
+        boxes=[{'class_name':'mounting_brackets','x1':2,'y1':2,'x2':40,'y2':40,'condition_grade':'Poor','condition_score':55,'condition_defects':defects,'condition_source':'ai','condition_confidence':.7,'condition_verified':'confirmed','condition_summary':'Rust on bracket.'},
+               {'class_name':'sector_antenna','x1':42,'y1':2,'x2':62,'y2':46,'condition_grade':'Good','condition_score':95,'condition_defects':[],'condition_source':'reviewer','condition_confidence':.9,'condition_verified':'confirmed'},
+               {'class_name':'bolts','x1':5,'y1':42,'x2':9,'y2':46,'condition_grade':'Shiny'}]  # invalid grade: ignored
+        a=client.put(f"/api/v1/media/{m['id']}/annotations",json={'workflow':'manual_qc','image_width':64,'image_height':48,'boxes':boxes}).json()['annotations']
+        assert (a[0]['condition_grade'],a[0]['condition_verified'],a[0]['condition_defects'][0]['extent_percent'])==('Poor','confirmed',20)
+        assert (a[1]['condition_source'],a[1]['condition_confidence'],a[1]['condition_verified'])==('reviewer',None,None)  # reviewer grades carry no AI confidence
+        assert a[2]['condition_grade'] is None
+        csv_text=client.get(f"/api/v1/inspections/{i['id']}/annotations.csv").text
+        assert 'Poor,55,20,rust moderate ~20% @ bracket base,ai,confirmed,Rust on bracket.' in csv_text
+        monkeypatch.setattr(condition.vendor,'status',lambda:'ready')
+        monkeypatch.setattr(condition,'assess_verified',lambda im,cls,size:{'grade':'Good','size':list(size),'cls':cls})
+        r=client.post(f"/api/v1/media/{m['id']}/condition-assessment",json={'class_name':'rru','x1':2,'y1':2,'x2':40,'y2':30,'image_width':64,'image_height':48}).json()
+        assert r=={'grade':'Good','size':[38.0,28.0],'cls':'rru'}
+
+def test_site_inventory_from_approved_images():
+    with TestClient(app) as client:
+        site=client.post('/api/v1/sites',json={'code':'TWR-INV-'+str(__import__('uuid').uuid4())[:6],'name':'Inventory test'}).json()
+        i=client.post('/api/v1/inspections',json={'site_id':site['id'],'label':'Survey'}).json()
+        up=lambda n:client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':(n,b'\x89PNG\r\n\x1a\n','image/png')}).json()
+        m1,m2=up('a.png'),up('b.png')
+        boxes=[{'class_name':'sector_antenna','x1':1,'y1':1,'x2':20,'y2':40,'manufacturer':'Ericsson','vendor_source':'reviewer','condition_grade':'Good','condition_score':95,'condition_defects':[],'condition_source':'reviewer'},
+               {'class_name':'mounting_brackets','x1':22,'y1':1,'x2':40,'y2':20,'condition_grade':'Poor','condition_score':50,'condition_source':'ai','condition_verified':'confirmed',
+                'condition_defects':[{'type':'rust','severity':'moderate','extent_percent':20,'location':'base','evidence':'brown'}]},
+               {'class_name':'sector_antenna','x1':42,'y1':1,'x2':60,'y2':40}]
+        client.put(f"/api/v1/media/{m1['id']}/annotations",json={'workflow':'manual_qc','image_width':64,'image_height':48,'boxes':boxes})
+        inv=client.get(f"/api/v1/sites/{site['id']}/inventory").json()
+        s=inv['summary']
+        assert (s['images_total'],s['images_approved'],s['items'],s['items_with_defects'])==(2,1,3,1)
+        assert s['grades']=={'Good':1,'Poor':1,'Not assessed':1} and s['manufacturers']=={'Ericsson':1} and s['defect_types']=={'rust':1} and s['verified']=={'confirmed':1}
+        ant=[c for c in s['by_class'] if c['class_name']=='sector_antenna'][0]
+        assert ant['count']==2 and ant['manufacturers']=={'Ericsson':1}
+        imgs={x['filename']:x for x in inv['images']}
+        assert imgs['a.png']['status']=='approved' and len(imgs['a.png']['items'])==3 and imgs['a.png']['image_width']==64
+        assert imgs['b.png']['status']=='pending' and imgs['b.png']['items']==[]
+        assert client.get(f"/api/v1/sites/{site['id']}/inventory",params={'inspection_id':999999}).json()['images']==[]
+        d=client.get('/api/v1/dashboard').json();assert d['observed_items']>=3 and d['items_with_defects']>=1
+
+def test_frame_plan_and_real_extraction(tmp_path):
+    from app import frames
+    assert frames.plan(1000,30,300)==list(range(0,1000,30))  # ~1 frame/s at 30 fps
+    assert len(frames.plan(30000,30,300))==300 and frames.plan(30000,30,300)[1]==100  # long flight: stride widens to stay under the cap
+    cv2=pytest.importorskip('cv2');np=pytest.importorskip('numpy')
+    v=tmp_path/'clip.mp4';w=cv2.VideoWriter(str(v),cv2.VideoWriter_fourcc(*'mp4v'),30,(64,48))
+    for i in range(90):w.write(np.full((48,64,3),i*2,np.uint8))
+    w.release()
+    out=frames.extract(v,tmp_path/'frames',stride=30)
+    assert [(f,round(t,2),wd,ht) for f,t,_,wd,ht in out]==[(0,0.0,64,48),(30,1.0,64,48),(60,2.0,64,48)] and all(p.is_file() for _,_,p,_,_ in out)
+    assert frames.label('DJI_0042.MP4',30,61.5)==('DJI_0042_f000030.jpg','01:01.5')
+
+def test_video_frames_and_scoped_processing(monkeypatch):
+    pytest.importorskip('PIL')
+    from PIL import Image
+    from app import detector, frames
+    from app.main import ROOT
+    box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':1,'y1':1,'x2':20,'y2':30}
+    monkeypatch.setattr(detector,'status',lambda:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    calls=[]
+    def fake_extract(video_path,out_dir,*a,**k):
+        calls.append(1);out_dir.mkdir(parents=True,exist_ok=True);out=[]
+        for idx,sec in ((0,0.0),(30,1.0)):
+            p=out_dir/f'{idx:06d}.jpg';Image.new('RGB',(64,48),'gray').save(p);out.append((idx,sec,p,64,48))
+        return out
+    monkeypatch.setattr(frames,'extract',fake_extract)
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Video'}).json()
+        img=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('a.jpg',_drone_jpeg(1),'image/jpeg')}).json()
+        vid=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('DJI_0042.MP4',b'not really a video','video/mp4')}).json()
+        j=client.post(f"/api/v1/inspections/{i['id']}/process",params={'media_ids':[vid['id']]}).json()  # just the new upload
+        assert j['media_ids']==[vid['id']]
+        j=client.get(f"/api/v1/jobs/{j['id']}").json()
+        assert j['status']=='completed' and 'incl. 2 video frames' in j['detail'],j
+        media=client.get(f"/api/v1/inspections/{i['id']}/media").json()
+        fr=[m for m in media if m['parent_media_id']==vid['id']]
+        assert [(m['filename'],m['frame_index'],m['frame_time'],m['content_type']) for m in fr]==[('DJI_0042_f000000.jpg',0,0.0,'image/jpeg'),('DJI_0042_f000030.jpg',30,1.0,'image/jpeg')]
+        assert client.get(fr[1]['url']).status_code==200  # served like any upload
+        dets=client.get(f"/api/v1/inspections/{i['id']}/detections").json()
+        assert sorted(d['media_id'] for d in dets)==sorted(m['id'] for m in fr)  # frames have boxes; the image wasn't processed yet
+        j2=client.post(f"/api/v1/inspections/{i['id']}/process",params={'only_new':True}).json()
+        assert j2['media_ids']==[img['id']]  # only the image is new
+        dets=client.get(f"/api/v1/inspections/{i['id']}/detections").json()
+        assert sorted(d['media_id'] for d in dets)==sorted([img['id']]+[m['id'] for m in fr])  # each file from its latest run
+        assert client.post(f"/api/v1/inspections/{i['id']}/process",params={'only_new':True}).status_code==409
+        client.post(f"/api/v1/inspections/{i['id']}/process")  # full re-run reuses the frames
+        assert len(calls)==1 and len([m for m in client.get(f"/api/v1/inspections/{i['id']}/media").json() if m['parent_media_id']])==2
+        assert len(client.get(f"/api/v1/inspections/{i['id']}/detections").json())==3
+        site=client.get(f"/api/v1/sites/1/inventory",params={'inspection_id':i['id']}).json()
+        assert {x['filename']:x['video'] for x in site['images']}=={'a.jpg':None,'DJI_0042_f000000.jpg':'DJI_0042.MP4','DJI_0042_f000030.jpg':'DJI_0042.MP4'}
+
+def test_annotated_output_uses_each_files_latest_run(monkeypatch):
+    pytest.importorskip('PIL')
+    from app import detector
+    box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':2,'y1':2,'x2':30,'y2':40}
+    monkeypatch.setattr(detector,'status',lambda:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Scoped runs'}).json()
+        old=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('old.jpg',_drone_jpeg(1),'image/jpeg')}).json()
+        client.post(f"/api/v1/inspections/{i['id']}/process")
+        new=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('new.jpg',_drone_jpeg(1),'image/jpeg')}).json()
+        client.post(f"/api/v1/inspections/{i['id']}/process",params={'only_new':True})  # newest run covers only new.jpg
+        for m in (old,new):  # the older photo still downloads with its boxes from the earlier run
+            r=client.get(f"/api/v1/media/{m['id']}/annotated?source=model")
+            assert r.status_code==200 and r.headers['x-box-count']=='1',(m['filename'],r.headers.get('x-box-count'))
+
+def test_review_regressions(monkeypatch):
+    pytest.importorskip('PIL')
+    import urllib.request
+    from PIL import Image
+    from app import detector, frames, vendor, condition
+    box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':2,'y1':2,'x2':30,'y2':40}
+    monkeypatch.setattr(detector,'status',lambda:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    def bad_video(*a,**k):raise RuntimeError('Cannot open video broken.MOV')
+    monkeypatch.setattr(frames,'extract',bad_video)
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Regressions'}).json()
+        up=lambda n,b,t:client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':(n,b,t)}).json()
+        a=up('a.jpg',_drone_jpeg(1),'image/jpeg');v=up('broken.MOV',b'xx','video/quicktime')
+        j=client.post(f"/api/v1/inspections/{i['id']}/process").json();j=client.get(f"/api/v1/jobs/{j['id']}").json()
+        assert j['status']=='completed' and 'FAILED 1: broken.MOV' in j['detail'] and j['media_ids']==[a['id']]  # bad video reported, photo kept
+        assert len(client.get(f"/api/v1/inspections/{i['id']}/detections").json())==1
+        b=up('b.jpg',_drone_jpeg(1),'image/jpeg')
+        j=client.post(f"/api/v1/inspections/{i['id']}/process",params={'only_new':True}).json()
+        assert sorted(j['media_ids'])==sorted([v['id'],b['id']])  # uploaded after a full run = new; the failed video is retried
+        # an HTML file declared as an image is stored as .png and can't be rendered as a page
+        h=up('x.html',b'<script>alert(1)</script>','image/png')
+        assert h['storage_key'].endswith('.png')
+        r=client.get('/uploads/'+h['storage_key']);assert r.headers['x-content-type-options']=='nosniff' and r.headers['content-type'].startswith('image/png')
+    def timeout(*a,**k):raise TimeoutError('timed out')
+    monkeypatch.setattr(urllib.request,'urlopen',timeout)
+    with pytest.raises(RuntimeError,match='timed out'):vendor._chat('p','img',{})
+    monkeypatch.setattr(vendor,'compare_model',lambda:'thinking-model')
+    first={'grade':'Fair','health_score':80,'defects':[{'type':'rust','severity':'minor','extent_percent':10,'location':'x','evidence':'y','source':'ai'}],'rust_percent':10,'image_quality':'good','confidence':.7,'summary':'s','recommended_action':'','model':'m','seconds':1}
+    r=condition.verify(Image.new('RGB',(80,80)),'rru',(80,80),first)
+    assert r['verified']=='not_run' and r['grade']=='Fair'  # a timed-out second opinion keeps the first assessment
+
+def test_ply_roundtrip_and_orientation(tmp_path):
+    np=pytest.importorskip('numpy')
+    from app import reconstruct as rc
+    pts=np.random.default_rng(1).normal(size=(50,3)).astype(np.float32);cols=np.random.default_rng(2).integers(0,255,(50,3),dtype=np.uint8);faces=np.array([[0,1,2],[2,3,4]],np.int32)
+    rc.write_ply(tmp_path/'m.ply',pts,cols,faces);r=rc.read_ply(tmp_path/'m.ply')
+    assert np.allclose(r['points'],pts) and (r['colors']==cols).all() and (r['faces']==faces).all()
+    (tmp_path/'a.ply').write_text('ply\nformat ascii 1.0\nelement vertex 2\nproperty float x\nproperty float y\nproperty float z\nend_header\n1 2 3\n4 5 6\n')
+    assert rc.read_ply(tmp_path/'a.ply')['points'].tolist()==[[1,2,3],[4,5,6]]
+    # synthetic drone orbit: 12 cameras circling 6 units above a vertical "tower", looking at it; then the whole scene is rotated arbitrarily
+    th=np.linspace(0,2*np.pi,12,endpoint=False);C=np.stack([10*np.cos(th),10*np.sin(th),np.full(12,6.0)],1)
+    tower=np.stack([np.random.default_rng(3).normal(0,.3,400),np.random.default_rng(4).normal(0,.3,400),np.random.default_rng(5).uniform(-8,4,400)],1)
+    a,b=.7,-1.1;Rx=np.array([[1,0,0],[0,np.cos(a),-np.sin(a)],[0,np.sin(a),np.cos(a)]]);Rz=np.array([[np.cos(b),-np.sin(b),0],[np.sin(b),np.cos(b),0],[0,0,1]]);R0=Rz@Rx
+    lines=['# images']
+    for i,c in enumerate(C):
+        z=-c/np.linalg.norm(c);x=np.cross(z,[0,0,1.0]);x/=np.linalg.norm(x);y=np.cross(z,x);R=np.stack([x,y,z])@R0.T  # world->camera in the rotated world
+        cw=R0@c;t=-R@cw;tr=np.trace(R);qw=np.sqrt(max(0,1+tr))/2
+        qx,qy,qz=(R[2,1]-R[1,2])/(4*qw),(R[0,2]-R[2,0])/(4*qw),(R[1,0]-R[0,1])/(4*qw)
+        lines+=[f'{i+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} 1 img{i}.jpg','']
+    (tmp_path/'images.txt').write_text('\n'.join(lines))
+    cams=rc.read_cameras_txt(tmp_path/'images.txt')
+    assert np.allclose(cams[0]['center'],R0@C[0],atol=1e-6)  # centres recovered from the quaternions
+    M=rc.normalising_transform((tower@R0.T).astype(np.float32),cams)
+    up=(R0@[0,0,1.0])@M[:3,:3].T;up/=np.linalg.norm(up)
+    assert up[1]>.98  # the tower stands upright (+Y)
+    assert all(rc._apply(M,np.array([c['center']]))[0][1]>0 for c in cams)  # cameras above the scene centre
+
+def test_reconstruction_job_flow(monkeypatch,tmp_path):
+    np=pytest.importorskip('numpy')
+    from app import reconstruct as rc
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'3D'}).json()
+        assert client.post(f"/api/v1/inspections/{i['id']}/reconstruct").status_code==503  # COLMAP not configured in tests
+        monkeypatch.setattr(rc,'status',lambda:'ready')
+        up=lambda n:client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':(n,_drone_jpeg(1),'image/jpeg')}).json()
+        up('DJI_0002.JPG');up('DJI_0001.JPG')
+        assert client.post(f"/api/v1/inspections/{i['id']}/reconstruct").status_code==409  # fewer than 3 photos
+        up('DJI_0003.JPG');seen={}
+        def fake_run(work,photos,videos,dense,progress):
+            seen.update(names=[p.name for p in photos],dense=dense);progress('mapping',40,'Solving cameras')
+            (work/'web').mkdir(parents=True);rc.write_ply(work/'web'/'points.ply',np.zeros((3,3),np.float32));(work/'web'/'cameras.json').write_text('[]')
+            return {'registered_images':3,'images_total':3,'sparse_points':1234,'models_found':1,'dense':dense,'dense_points':99,'mesh_faces':10,'seconds':5,
+                    'files':{'web_points':'web/points.ply','web_cameras':'web/cameras.json','log':'colmap.log'}}
+        monkeypatch.setattr(rc,'run',fake_run)
+        j=client.post(f"/api/v1/inspections/{i['id']}/reconstruct",params={'dense':True}).json()
+        assert j['kind']=='reconstruction'
+        assert len(seen['names'])==3 and seen['dense'] is True
+        job=client.get(f"/api/v1/jobs/{j['id']}").json()
+        assert job['status']=='completed' and '3/3 images placed' in job['detail'] and '99 dense points' in job['detail']
+        ms=client.get(f"/api/v1/inspections/{i['id']}/models").json()
+        assert ms[0]['status']=='completed' and ms[0]['dense'] is True and ms[0]['urls']['web_points'].endswith('/web/points.ply')
+        assert client.get(ms[0]['urls']['web_points']).status_code==200 and client.get(f"/api/v1/inspections/{i['id']}/model").json()['id']==ms[0]['id']
+        def boom(*a,**k):raise rc.Failed('COLMAP could not connect the images into one model: they need more overlap')
+        monkeypatch.setattr(rc,'run',boom)
+        j=client.post(f"/api/v1/inspections/{i['id']}/reconstruct").json()
+        job=client.get(f"/api/v1/jobs/{j['id']}").json();m=client.get(f"/api/v1/inspections/{i['id']}/models").json()[0]
+        assert job['status']=='failed' and 'more overlap' in job['detail'] and m['status']=='failed' and m['urls']['log'].endswith('colmap.log')
+        assert client.get(f"/api/v1/inspections/{i['id']}/detections").json()==[]  # reconstruction jobs aren't detection runs
+
+def _fake_colmap(rc,np):
+    """Stand-in for colmap.exe that writes the files each command would produce."""
+    calls=[]
+    def colmap(args,log,cwd=None):
+        cmd=args[0];a={str(args[i]):args[i+1] for i in range(1,len(args)-1,2)};calls.append(cmd)
+        with open(log,'a') as f:f.write(f'$ colmap {cmd}\n')
+        if cmd=='feature_extractor':__import__('pathlib').Path(a['--database_path']).write_bytes(b'x'*1000)
+        elif cmd=='mapper':  # a small text model (the app reads models itself, without colmap.exe)
+            d=__import__('pathlib').Path(a['--output_path'])/'0';d.mkdir(parents=True,exist_ok=True)
+            (d/'cameras.txt').write_text('1 SIMPLE_PINHOLE 64 48 50 32 24\n');(d/'points3D.txt').write_text('1 0 0 0 1 1 1 0.5\n')
+            (d/'images.txt').write_text(''.join(f'{i+1} 1 0 0 0 {i} 0 5 1 photos/{i:05d}.jpg\n\n' for i in range(3)))
+        elif cmd=='model_analyzer':
+            with open(log,'a') as f:f.write('Registered images: 3\nPoints: 500\nMean track length: 4.2\nMean reprojection error: 0.8px\n')
+        elif cmd=='model_converter' and a['--output_type']=='PLY':rc.write_ply(a['--output_path'],np.random.default_rng(0).normal(size=(500,3)).astype(np.float32))
+        elif cmd=='model_converter':
+            p=__import__('pathlib').Path(a['--output_path']);p.mkdir(parents=True,exist_ok=True)
+            (p/'images.txt').write_text('\n'.join(f'{i+1} 1 0 0 0 {i} 0 5 1 photos/{i:05d}.jpg\n' for i in range(3)))
+        elif cmd=='image_undistorter':(__import__('pathlib').Path(a['--output_path'])/'images').mkdir(parents=True,exist_ok=True)
+        elif cmd=='patch_match_stereo':
+            s=__import__('pathlib').Path(a['--workspace_path'])/'stereo'/'depth_maps';s.mkdir(parents=True,exist_ok=True);(s/'x.bin').write_bytes(b'd'*5000)
+        elif cmd=='stereo_fusion':rc.write_ply(a['--output_path'],np.random.default_rng(1).normal(size=(2000,3)).astype(np.float32),np.full((2000,3),200,np.uint8))
+        elif cmd=='poisson_mesher':rc.write_ply(a['--output_path'],np.eye(3,dtype=np.float32),faces=np.array([[0,1,2]],np.int32))
+    return colmap,calls
+
+def test_sparse_then_densify_pipeline(monkeypatch,tmp_path):
+    np=pytest.importorskip('numpy');pytest.importorskip('PIL')
+    import os
+    from PIL import Image
+    from app import reconstruct as rc
+    fake,calls=_fake_colmap(rc,np);monkeypatch.setattr(rc,'colmap',fake)
+    photos=[]
+    for i in range(3):p=tmp_path/f'DJI_{i}.JPG';Image.new('RGB',(64,48)).save(p);photos.append(p)
+    steps=[];prog=lambda s,p,d:steps.append((s,p))
+    r=rc.run(tmp_path/'w1',photos,[],False,prog)
+    assert (r['registered_images'],r['sparse_points'],r['sparse_model'],r['dense'])==(3,500,'sparse/0',False) and len(r['transform'])==4
+    w1=tmp_path/'w1'
+    assert not (w1/'database.db').exists() and not (w1/'sparse_txt').exists()  # build-only files cleaned up
+    assert (w1/'sparse'/'0'/'images.txt').exists() and (w1/'web'/'points.ply').exists() and (w1/'web'/'cameras.json').exists()
+    linked=w1/'images'/'photos'/'00000.jpg'
+    assert linked.exists() and (os.stat(linked).st_nlink>=2 or os.path.samefile(linked,photos[0]) or linked.stat().st_size==photos[0].stat().st_size)  # hard link where possible
+    calls.clear()
+    d=rc.densify(w1,tmp_path/'w2',prog,r)
+    assert 'feature_extractor' not in calls and 'mapper' not in calls and calls.count('patch_match_stereo')==1  # reuses the sparse solution
+    w2=tmp_path/'w2'
+    assert d['dense'] and d['dense_points']==2000 and d['mesh_faces']==1 and d['transform']==r['transform'] and d['registered_images']==3
+    assert not (w2/'dense'/'stereo').exists() and (w2/'dense'/'fused.ply').exists() and (w2/'web'/'mesh.ply').exists() and (w2/'sparse.ply').exists()
+    (w1/'sparse'/'0'/'images.txt').unlink()
+    with pytest.raises(rc.Failed,match='missing'):rc.densify(w1,tmp_path/'w3',prog,{})  # old build without its sparse model
+
+def test_densify_endpoint(monkeypatch):
+    np=pytest.importorskip('numpy')
+    from app import reconstruct as rc
+    monkeypatch.setattr(rc,'status',lambda:'ready')
+    def fake_run(work,photos,videos,dense,progress):
+        (work/'web').mkdir(parents=True);rc.write_ply(work/'web'/'points.ply',np.zeros((3,3),np.float32))
+        return {'registered_images':3,'images_total':3,'sparse_points':10,'models_found':1,'dense':False,'seconds':1,'sparse_model':'sparse/0','transform':np.eye(4).tolist(),'files':{'web_points':'web/points.ply'}}
+    got={}
+    def fake_densify(src,work,progress,q):
+        got.update(src=src.name,q=q);(work/'web').mkdir(parents=True);rc.write_ply(work/'web'/'points.ply',np.zeros((3,3),np.float32))
+        return {**{k:q[k] for k in ('registered_images','images_total','sparse_points','models_found')},'dense':True,'dense_points':99,'mesh_faces':5,'seconds':2,'files':{'web_points':'web/points.ply','web_mesh':'web/points.ply'}}
+    monkeypatch.setattr(rc,'run',fake_run);monkeypatch.setattr(rc,'densify',fake_densify)
+    with TestClient(app) as client:
+        i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Densify'}).json()
+        for n in ('a.jpg','b.jpg','c.jpg'):client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':(n,_drone_jpeg(1),'image/jpeg')})
+        sp=client.post(f"/api/v1/inspections/{i['id']}/reconstruct").json()
+        src=client.get(f"/api/v1/inspections/{i['id']}/models").json()[0]
+        j=client.post(f"/api/v1/models/{src['id']}/densify").json()
+        assert got['src']==f"{i['id']}_{sp['id']}" and got['q']['sparse_model']=='sparse/0'
+        job=client.get(f"/api/v1/jobs/{j['id']}").json();m=client.get(f"/api/v1/inspections/{i['id']}/models").json()[0]
+        assert job['status']=='completed' and f"dense from model #{src['id']}" in job['detail'] and m['dense'] and m['quality']['source_model']==src['id'] and m['urls']['web_mesh']
+        assert client.post(f"/api/v1/models/{m['id']}/densify").status_code==409  # already dense
+        assert client.post('/api/v1/models/999999/densify').status_code==404
+
+def test_registration_boxes_from_synthetic_colmap(monkeypatch,tmp_path):
+    np=pytest.importorskip('numpy')
+    from types import SimpleNamespace as NS
+    from app import registration as reg
+    rng=np.random.default_rng(0);f,W,H=1000.0,2000,1500
+    # two 0.6 wide x 1.2 tall x 0.2 deep panel antennas facing outward on opposite sides of a tower at the origin
+    ants={'east':np.array([2.0,3.0,0.0]),'west':np.array([-2.0,3.0,0.0])}
+    pts=[];pid=1;owner={}
+    for name,c in ants.items():
+        for _ in range(150):
+            p=c+[rng.uniform(-.1,.1),rng.uniform(-.6,.6),rng.uniform(-.3,.3)];pts.append((pid,p));owner[pid]=name;pid+=1
+    def look(cam,target):
+        z=target-cam;z/=np.linalg.norm(z);x=np.cross(z,[0,1.0,0]);x/=np.linalg.norm(x);y=np.cross(z,x);return np.stack([x,y,z])  # COLMAP: x right, y down, z forward
+    def quat(R):
+        qw=np.sqrt(max(0,1+np.trace(R)))/2;return qw,(R[2,1]-R[1,2])/(4*qw),(R[0,2]-R[2,0])/(4*qw),(R[1,0]-R[0,1])/(4*qw)
+    cams=[np.array([6.0*np.cos(a),5.0,6.0*np.sin(a)]) for a in np.radians([10,80,170,260])]
+    img_lines=[];dets=[];media=[]
+    for i,C in enumerate(cams):
+        R=look(C,np.array([0,3.0,0]));t=-R@C;obs=[];per={}
+        for pid_,p in pts:
+            q=R@p+t
+            if q[2]<=0:continue
+            u,v=f*q[0]/q[2]+W/2,f*q[1]/q[2]+H/2
+            if 0<=u<W and 0<=v<H:obs.append(f'{u} {v} {pid_}');per.setdefault(owner[pid_],[]).append((u,v))
+        qw,qx,qy,qz=quat(R);img_lines+=[f'{i+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} 1 photos/{i:05d}.jpg',' '.join(obs)]
+        media.append(NS(id=100+i,parent_media_id=None,content_type='image/jpeg',filename=f'DJI_{i:04d}.JPG',storage_key=f'k{i}.jpg'))
+        for name,uv in per.items():
+            uv=np.array(uv);dets.append(NS(id=len(dets)+1,media_id=100+i,class_name='sector_antenna',confidence=.9,x1=uv[:,0].min(),y1=uv[:,1].min(),x2=uv[:,0].max(),y2=uv[:,1].max()))
+    txt=tmp_path/'txt';txt.mkdir();(tmp_path/'sparse'/'0').mkdir(parents=True)
+    (txt/'images.txt').write_text('\n'.join(img_lines)+'\n');(txt/'cameras.txt').write_text(f'1 PINHOLE {W} {H} {f} {f} {W/2} {H/2}\n')
+    (txt/'points3D.txt').write_text('\n'.join(f'{i} {p[0]} {p[1]} {p[2]} 128 128 128 0.5' for i,p in pts)+'\n')
+    def fake_convert(model_dir):yield txt
+    monkeypatch.setattr(reg,'_convert_model',fake_convert)
+    out=reg.build_candidates(tmp_path,np.eye(4).tolist(),media,dets)
+    assert len(out)==2 and {c['class_name'] for c in out}=={'sector_antenna'}
+    for c in out:
+        side='east' if c['position'][0]>0 else 'west';centre=ants[side]
+        assert np.linalg.norm(c['position']-centre)<.25  # where the antenna is
+        assert .4<c['size_w']<.9 and .9<c['size_h']<1.6 and c['size_d']<c['size_w']  # about 0.6 wide, 1.2 tall, thin
+        assert abs(abs(c['yaw'])-np.pi/2)<.3  # faces outward along +/-X, away from the tower axis
+    assert reg.rule_for('bolts')['radius']<reg.rule_for('sector_antenna')['radius'] and reg.rule_for('anything_new')==reg.DEFAULT_RULE  # every class is registered
+
+def test_registration_dense_boxes_separate_neighbours(monkeypatch,tmp_path):
+    np=pytest.importorskip('numpy')
+    from types import SimpleNamespace as NS
+    from app import registration as reg, reconstruct
+    rng=np.random.default_rng(1);f,W,H=1200.0,2000,1500
+    # two 0.3 wide x 1.2 tall x 0.15 deep panels side by side (0.45 apart) on the east face of a pole at the origin;
+    # the sparse model has almost nothing on them, the dense cloud covers their surfaces and the pole behind
+    ants=[np.array([1.0,3.0,-.225]),np.array([1.0,3.0,.225])];half=np.array([.075,.6,.15])
+    def surface(c,n):
+        p=rng.uniform(-1,1,(n,3));k=rng.integers(0,3,n);p[np.arange(n),k]=np.sign(p[np.arange(n),k]);return c+p*half
+    pole=np.c_[.3*np.cos(a:=rng.uniform(0,2*np.pi,20000)),rng.uniform(0,6,20000),.3*np.sin(a)]
+    dense=np.vstack([surface(c,6000) for c in ants]+[pole])
+    reconstruct.write_ply(tmp_path/'fused.ply',dense.astype(np.float32))
+    def look(cam,target):
+        z=target-cam;z/=np.linalg.norm(z);x=np.cross(z,[0,1.0,0]);x/=np.linalg.norm(x);y=np.cross(z,x);return np.stack([x,y,z])
+    def quat(R):
+        qw=np.sqrt(max(0,1+np.trace(R)))/2;return qw,(R[2,1]-R[1,2])/(4*qw),(R[0,2]-R[2,0])/(4*qw),(R[1,0]-R[0,1])/(4*qw)
+    img_lines=[];dets=[];media=[];sparse=[]
+    corners=lambda c:c+np.array([[sx,sy,sz] for sx in(-1,1) for sy in(-1,1) for sz in(-1,1)])*half
+    for i,a in enumerate(np.radians([-35,-15,0,15,35])):
+        C=np.array([6*np.cos(a),4.0,6*np.sin(a)]);R=look(C,np.array([1.0,3.0,0]));t=-R@C
+        qw,qx,qy,qz=quat(R);img_lines+=[f'{i+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} 1 photos/{i:05d}.jpg','']
+        media.append(NS(id=100+i,parent_media_id=None,content_type='image/jpeg',filename=f'DJI_{i:04d}.JPG',storage_key=f'k{i}.jpg'))
+        for c in ants:  # YOLO box = the panel's outline in this photo
+            q=corners(c)@R.T+t;uv=f*q[:,:2]/q[:,2:]+[W/2,H/2]
+            dets.append(NS(id=len(dets)+1,media_id=100+i,class_name='sector_antenna',confidence=.9,image_width=W,image_height=H,
+                           x1=uv[:,0].min(),y1=uv[:,1].min(),x2=uv[:,0].max(),y2=uv[:,1].max()))
+    txt=tmp_path/'txt';txt.mkdir();(tmp_path/'sparse'/'0').mkdir(parents=True)
+    (txt/'images.txt').write_text('\n'.join(img_lines)+'\n');(txt/'cameras.txt').write_text(f'1 PINHOLE {W} {H} {f} {f} {W/2} {H/2}\n')
+    (txt/'points3D.txt').write_text('1 0 3 0 128 128 128 0.5\n')
+    def fake_convert(model_dir):yield txt
+    monkeypatch.setattr(reg,'_convert_model',fake_convert)
+    out=reg.build_candidates(tmp_path,np.eye(4).tolist(),media,dets,tmp_path/'fused.ply')
+    assert len(out)==2 and all(c['box_method']=='dense' and c['media_count']==5 for c in out)  # one box per panel, not merged
+    for c in sorted(out,key=lambda c:c['position'][2]):
+        truth=ants[0] if c['position'][2]<0 else ants[1]
+        assert np.linalg.norm(c['position']-truth)<.1
+        assert .2<c['size_w']<.45 and 1.0<c['size_h']<1.4 and c['size_d']<c['size_w']  # 0.3 wide, 1.2 tall, thin
+        assert abs(abs(c['yaw'])-np.pi/2)<.35  # thin side along X (both panels sit on one face, so the tower axis can't say which way is out)
+    # a group whose boxes don't line up with each other in 3D is not one object: dropped, not drawn
+    assert reg.fit_box(np.zeros((2,3)),np.zeros(2)) is None and reg.fit_box(np.full((10,3),np.nan),np.zeros(2)) is None
+
+def test_remote_gpu_worker_runs_queued_work(monkeypatch):
+    """GPU_WORKER=remote (Railway): GPU work is queued; the worker claims it over HTTPS with its token, computes it
+    without database access and posts the result, which the server applies. Errors come back to the waiting request."""
+    import threading
+    from app import gpu, worker, tasks
+    from app.database import SessionLocal
+    from app.models import WorkerTask, Job, Detection
+    monkeypatch.setattr(gpu, 'REMOTE', True); monkeypatch.setattr(gpu, 'TOKEN', 'tok'); monkeypatch.setattr(gpu, 'CALL_TIMEOUT', 20)
+    caps = {'detector': {'status': 'ready', 'model': 'w/best.pt', 'classes': {'0': 'rru'}}, 'reconstruction': {'status': 'ready'}, 'gpu': 'Test GPU'}
+    monkeypatch.setattr(worker, 'capabilities', lambda: caps)
+    monkeypatch.setattr(tasks.detector, 'detect', lambda path, save: [(None, 640, 480, [{'class_id': 0, 'class_name': 'rru', 'confidence': .9, 'x1': 1, 'y1': 2, 'x2': 30, 'y2': 40}])])
+    stop = threading.Event(); monkeypatch.setattr(worker, '_stop', stop)
+    with TestClient(app) as client:
+        assert client.post('/api/v1/worker/claim', json={'name': 'x'}).status_code == 401  # token required
+        r = client.post('/api/v1/models/999999/register-assets')  # nobody connected yet: fail fast, say why
+        assert r.status_code == 503 and 'offline' in r.json()['detail']
+        wc = TestClient(app, headers={'X-Worker-Token': 'tok'})
+        assert wc.post('/api/v1/worker/claim', json={'name': 'test-gpu', 'info': caps}).status_code == 204  # heartbeat, nothing queued
+        assert client.get('/health').json()['worker']['online'] and client.get('/api/v1/detector').json()['status'] == 'ready'
+        assert {'id': 0, 'name': 'rru'} in client.get('/api/v1/classes').json()  # class list reported by the worker
+        lanes = [threading.Thread(target=worker.lane_loop, args=(l, wc), daemon=True) for l in ('quick', 'long')]
+        for t in lanes: t.start()
+        try:
+            r = client.post('/api/v1/models/999999/register-assets')  # the server-side error reaches the browser
+            assert r.status_code == 404 and r.json()['detail'] == 'Completed 3D model not found'
+            r = client.post('/api/v1/media/999999/condition-assessment', json={'class_name': 'rru', 'x1': 0, 'y1': 0, 'x2': 10, 'y2': 10, 'image_width': 100, 'image_height': 100})
+            assert r.status_code == 404
+            ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'remote'}).json()
+            up = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('a.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')}).json()
+            job = client.post(f"/api/v1/inspections/{ins['id']}/process").json()
+            assert job['status'] == 'queued' and 'w/best.pt' in job['detail']
+            for _ in range(100):  # the long lane picks it up, detects on the GPU side, the server stores the boxes
+                if client.get(f"/api/v1/jobs/{job['id']}").json()['status'] in ('completed', 'failed'): break
+                time.sleep(.1)
+            done = client.get(f"/api/v1/jobs/{job['id']}").json()
+            assert done['status'] == 'completed' and done['progress'] == 100, done
+            with SessionLocal() as db:
+                d = db.query(Detection).filter_by(job_id=job['id']).one()
+                assert (d.media_id, d.class_name, d.image_width, d.model_name) == (up['id'], 'rru', 640, 'w/best.pt')
+                assert db.query(WorkerTask).filter_by(kind='run_detection').order_by(WorkerTask.id.desc()).first().status == 'done'
+        finally:
+            stop.set()
+            for t in lanes: t.join(5)
+
+def test_password_gate_and_web_app(monkeypatch, tmp_path):
+    from app import main
+    monkeypatch.setattr(main, 'PASSWORD', 'secret')
+    with TestClient(app) as client:
+        assert client.get('/api/v1/sites').status_code == 401 and client.get('/health').status_code == 200
+        assert client.get('/api/v1/sites', auth=('aeromind', 'wrong')).status_code == 401
+        assert client.get('/api/v1/sites', headers={'Authorization': 'Basic !!notbase64'}).status_code == 401
+        assert client.get('/api/v1/sites', auth=('aeromind', 'secret')).status_code == 200
+        if (main.DIST / 'index.html').is_file():  # built frontend: client-side routes get the app, unknown API paths stay 404
+            r = client.get('/twin', auth=('aeromind', 'secret'))
+            assert r.status_code == 200 and '<div id="root"' in r.text
+            assert client.get('/api/v1/nope', auth=('aeromind', 'secret')).status_code == 404
+            assert client.get('/../backend/.env', auth=('aeromind', 'secret')).status_code in (200, 404) and 'VLM' not in client.get('/..%2fbackend%2f.env', auth=('aeromind', 'secret')).text

@@ -1,0 +1,4 @@
+-r requirements.txt
+# Matches the training env (yolo-gpu): Python 3.12, torch 2.14.1+cu130.
+# Install CUDA torch first: pip install torch --index-url https://download.pytorch.org/whl/cu130
+ultralytics==8.4.192

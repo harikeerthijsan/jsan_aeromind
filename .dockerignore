@@ -1,0 +1,17 @@
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.env
+**/*.env
+**/*.db
+**/*.db-*
+frontend/dist
+frontend/tsconfig.tsbuildinfo
+backend/uploads
+backend/reconstructions
+backend/vendor_refs
+backend/tests.py
+backend/conftest.py
+docs
+.git

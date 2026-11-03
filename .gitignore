@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.env
+*.db
+__pycache__/
+.pytest_cache/
+.venv/
+uploads/
+.DS_Store
+*.pyc
+# manufacturer reference photos: third-party images, keep out of the repository
+backend/vendor_refs/*/
+backend/vendor_refs/references.csv
+# 3D reconstruction workspaces (large, regenerable)
+backend/reconstructions/
+# GPU worker connection settings (database URL, bucket keys)
+backend/worker.env
+backend/*.db-*
+frontend/tsconfig.tsbuildinfo
+.claude/
+.vite/
+backend/railway-login.txt
