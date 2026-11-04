@@ -72,10 +72,30 @@ def reconstruct_model(payload, progress):
                 if storage.enabled(): progress('downloading', 1, f"Fetching {len(payload['photos']) + len(payload['videos'])} file(s) from storage")
                 photos = [storage.fetch(ROOT / k) for k in payload['photos']]; videos = [storage.fetch(ROOT / k) for k in payload['videos']]
                 r = reconstruct.run(work, photos, videos, payload['dense'], progress)
+            src_scale = (payload.get('source') or {}).get('quality', {}).get('scale')
+            if src_scale: r['scale'] = src_scale  # a dense model keeps its sparse model's viewer frame, so the same scale
+            else:
+                try: r['scale'] = scale_of(work, payload.get('scale_photos') or [])
+                except Exception as e: r['scale_error'] = str(e)[:300]  # no GPS etc.: the model is still fine, only unscaled
             if storage.enabled(): progress('uploading', 99, 'Saving the model to storage'); storage.push_tree(work, skip=('images',))  # images: copies of uploads
             return r
         except Exception:
             storage.push(work / 'colmap.log'); raise
+
+def scale_of(work, photo_keys):
+    """Metres per viewer unit of a built model: its cameras (web/cameras.json) fitted to the photos' GPS positions."""
+    import json
+    from . import scale
+    cams = json.loads(storage.fetch(Path(work) / 'web' / 'cameras.json').read_text())
+    # the build named its photos photos/00000.jpg ... in this order (reconstruct.prepare_images)
+    names = {f'photos/{i:05d}{Path(k).suffix.lower()}': k for i, k in enumerate(photo_keys[:reconstruct.MAX_IMAGES])}
+    positions = {n: scale.read_position(storage.fetch(ROOT / k)) for n, k in names.items() if any(c['name'] == n for c in cams)}
+    return scale.estimate(cams, positions)
+
+def model_scale(payload, progress=None):
+    """payload: {'work', 'photos': [keys in build order]} -> scale dict (see app/scale.py)"""
+    try: return scale_of(reconstruct.RECON_DIR / payload['work'], payload['photos'])
+    except (ValueError, FileNotFoundError) as e: raise HTTPException(422, f'Cannot detect the scale: {e}')
 
 # ---------- vision-model suggestions ----------
 def vendor_suggestion(payload, progress=None):
@@ -123,5 +143,5 @@ def plain(v):
     if isinstance(v, (list, tuple)): return [plain(x) for x in v]
     return v.tolist() if hasattr(v, 'tolist') else v
 
-COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'vendor_suggestion': vendor_suggestion,
+COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'model_scale': model_scale, 'vendor_suggestion': vendor_suggestion,
            'condition_assessment': condition_assessment, 'register_assets': register_assets}

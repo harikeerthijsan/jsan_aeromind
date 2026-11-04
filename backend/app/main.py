@@ -601,6 +601,42 @@ def site_inventory(site_id:int,inspection_id:int|None=None,db:Session=Depends(ge
         'images_total':len(images),'images_approved':sum(i['status']=='approved' for i in images),'items':sum(len(i['items']) for i in images),
         'items_with_defects':issues,'grades':dict(grades),'manufacturers':dict(makers.most_common()),'defect_types':dict(defect_types.most_common()),'verified':dict(verified),
         'by_class':sorted(({**c,'manufacturers':dict(c['manufacturers'].most_common()),'grades':dict(c['grades'])} for c in by_class.values()),key=lambda c:-c['count'])}}
+def _photo_keys(items):
+    """Photos of a build in the order the build used them (reconstruct.prepare_images names them photos/00000 ... by this order)."""
+    return [m.storage_key for m in sorted(items,key=lambda m:(m.filename.lower(),m.id)) if m.content_type.startswith('image/') and m.parent_media_id is None]
+class ScaleIn(BaseModel):
+    m_per_unit:float=Field(gt=0,le=1e6)
+    reference_m:float|None=Field(None,gt=0)       # the known real length that was measured ...
+    reference_units:float|None=Field(None,gt=0)   # ... and its length in model units
+    note:str|None=Field(None,max_length=200)
+def _set_scale(db,model,value):
+    q=dict(model.quality or {})
+    if value is None:q.pop('scale',None)
+    else:q['scale']=value|{'set_at':now().isoformat()}
+    model.quality=q;db.commit();db.refresh(model);return (model.quality or {}).get('scale')
+def _completed_model(db,model_id):
+    m=db.get(Model3D,model_id)
+    if not m or m.status!='completed' or m.job_id is None:raise HTTPException(404,'Completed 3D model not found')
+    return m
+@app.get('/api/v1/models/{model_id}/scale')
+def model_scale(model_id:int,db:Session=Depends(get_db)):
+    """Metres per model unit, or null when the model has not been scaled (measurements are then in model units only)."""
+    return (_completed_model(db,model_id).quality or {}).get('scale')
+@app.post('/api/v1/models/{model_id}/scale/detect')
+def detect_model_scale(model_id:int):
+    """Scale from the photos' GPS / RTK positions (runs where the photos are: here or on the GPU worker)."""
+    return gpu.call('model_scale',model_id=model_id)
+def _scale_prepare(db,model_id):
+    m=_completed_model(db,model_id);job=db.get(Job,m.job_id)
+    return {'work':f'{m.inspection_id}_{m.job_id}','photos':_photo_keys(db.scalars(select(Media).where(Media.id.in_(job.media_ids or []))).all() if job else [])}
+gpu.register('model_scale',prepare=_scale_prepare,apply=lambda db,result,model_id:_set_scale(db,db.get(Model3D,model_id),result),lane='quick')
+@app.put('/api/v1/models/{model_id}/scale')
+def set_model_scale(model_id:int,data:ScaleIn,db:Session=Depends(get_db)):
+    """Manual calibration: a reviewer measured something of known length (e.g. a 2.6 m antenna) in the model."""
+    return _set_scale(db,_completed_model(db,model_id),{'method':'manual',**data.model_dump(exclude_none=True)})
+@app.delete('/api/v1/models/{model_id}/scale',status_code=204)
+def clear_model_scale(model_id:int,db:Session=Depends(get_db)):
+    _set_scale(db,_completed_model(db,model_id),None);return Response(status_code=204)
 def model_dict(x):
     d=to_dict(x);files=(x.quality or {}).get('files',{});base=f'/recon/{x.inspection_id}_{x.job_id}/'
     return d|{'urls':{k:base+v for k,v in files.items()}}
@@ -744,7 +780,7 @@ def _recon_prepare(db,job_id,model_id,dense,source_model_id=None):
     items=db.scalars(select(Media).where(Media.id.in_(job.media_ids or []))).all()
     order=lambda m:(m.filename.lower(),m.id)  # capture order (DJI_0001 ...) helps sequential matching
     src=db.get(Model3D,source_model_id) if source_model_id else None
-    return {'work':f'{job.inspection_id}_{job.id}','dense':dense,
+    return {'work':f'{job.inspection_id}_{job.id}','dense':dense,'scale_photos':_photo_keys(items),
             'photos':[m.storage_key for m in sorted(items,key=order) if m.content_type.startswith('image/')] if not src else [],
             'videos':[m.storage_key for m in sorted(items,key=order) if m.content_type.startswith('video/')] if not src else [],
             'source':{'dir':f'{src.inspection_id}_{src.job_id}','quality':src.quality or {}} if src else None}

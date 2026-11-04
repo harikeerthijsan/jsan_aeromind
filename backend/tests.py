@@ -821,3 +821,60 @@ def test_site_management():
         assert client.delete(f"/api/v1/sites/{s['id']}").status_code == 409   # has an inspection: archive instead
         empty = client.post('/api/v1/sites', json={'code': 'TWR-902', 'name': 'Empty'}).json()
         assert client.delete(f"/api/v1/sites/{empty['id']}").status_code == 204 and client.get(f"/api/v1/sites/{empty['id']}").status_code == 404
+
+def _synthetic_flight(scale_m=7.5, n=12):
+    """Camera centres in arbitrary model units and the matching drone positions (lat/lon/alt) for a known scale."""
+    import math, numpy as np
+    rng = np.random.default_rng(3); a = .7
+    R = np.array([[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]])  # any rotation of the model frame
+    enu = np.c_[20 * np.cos(np.linspace(0, 5, n)), 20 * np.sin(np.linspace(0, 5, n)), 30 + rng.uniform(-3, 3, n)]  # an orbit, metres
+    centres = ((enu - enu.mean(0)) / scale_m) @ R.T + [1.0, -2.0, .5]
+    lat0, lon0 = 53.538, -2.3027
+    pos = [{'lat': lat0 + math.degrees(e[1] / 6378137.0), 'lon': lon0 + math.degrees(e[0] / (6378137.0 * math.cos(math.radians(lat0)))), 'alt': float(e[2]), 'rtk': True} for e in enu]
+    return [{'name': f'photos/{i:05d}.jpg', 'center': c.tolist()} for i, c in enumerate(centres)], pos
+
+def test_scale_from_drone_positions(tmp_path):
+    from app import scale
+    cams, pos = _synthetic_flight()
+    s = scale.estimate(cams, {c['name']: p for c, p in zip(cams, pos)})
+    assert abs(s['m_per_unit'] - 7.5) < .01 and s['method'] == 'gps_rtk' and s['residual_median_m'] < .02 and s['cameras'] == 12
+    with pytest.raises(ValueError): scale.estimate(cams[:3], {c['name']: p for c, p in zip(cams, pos)})  # too few photos with GPS
+    # DJI XMP (as written by the aircraft) and plain EXIF GPS
+    (tmp_path / 'dji.jpg').write_bytes(b'\xff\xd8 <x drone-dji:GpsLatitude="+53.538060825" drone-dji:GpsLongitude="-2.302693401" '
+                                        b'drone-dji:AbsoluteAltitude="+189.824" drone-dji:RelativeAltitude="+34.020" drone-dji:RtkFlag="50"/> \xff\xd9')
+    assert scale.read_position(tmp_path / 'dji.jpg') == {'lat': 53.538060825, 'lon': -2.302693401, 'alt': 189.824, 'rtk': True}
+    from PIL import Image
+    ex = Image.Exif(); ex[0x8825] = {1: 'S', 2: (33.0, 52.0, 4.2), 3: 'E', 4: (151.0, 12.0, 30.0), 5: 0, 6: 41.5}
+    Image.new('RGB', (8, 8)).save(tmp_path / 'exif.jpg', exif=ex)
+    p = scale.read_position(tmp_path / 'exif.jpg')
+    assert abs(p['lat'] + 33.86783) < 1e-4 and abs(p['lon'] - 151.20833) < 1e-4 and abs(p['alt'] - 41.5) < 1e-6 and not p['rtk']
+    assert scale.read_position(tmp_path / 'missing.jpg') is None
+
+def test_model_scale_endpoints():
+    import json, os
+    from pathlib import Path
+    from app import reconstruct
+    from app.database import SessionLocal
+    from app.models import Job, Media, Model3D
+    cams, pos = _synthetic_flight(scale_m=4.0, n=8)
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'scale'}).json()
+        root = Path(os.environ['UPLOAD_DIR'])
+        with SessionLocal() as db:
+            ids = []
+            for i, p in enumerate(pos):  # photos named so their build order is the camera order
+                key = f'scale_{ins["id"]}_{i}.jpg'
+                (root / key).write_bytes(f'<x drone-dji:GpsLatitude="{p["lat"]}" drone-dji:GpsLongitude="{p["lon"]}" drone-dji:AbsoluteAltitude="{p["alt"]}" drone-dji:RtkFlag="50"/>'.encode())
+                m = Media(inspection_id=ins['id'], filename=f'DJI_{i:04d}.JPG', storage_key=key, content_type='image/jpeg', sha256='0' * 64, size_bytes=1); db.add(m); db.flush(); ids.append(m.id)
+            job = Job(inspection_id=ins['id'], kind='reconstruction', status='completed', stage='done', media_ids=ids); db.add(job); db.flush()
+            model = Model3D(inspection_id=ins['id'], job_id=job.id, dense=False, status='completed', quality={'files': {}}); db.add(model); db.commit(); mid = model.id
+            web = reconstruct.RECON_DIR / f'{ins["id"]}_{job.id}' / 'web'; web.mkdir(parents=True); (web / 'cameras.json').write_text(json.dumps(cams))
+        assert client.get(f'/api/v1/models/{mid}/scale').json() is None
+        s = client.post(f'/api/v1/models/{mid}/scale/detect').json()
+        assert abs(s['m_per_unit'] - 4.0) < .01 and s['method'] == 'gps_rtk'
+        assert client.get(f'/api/v1/models/{mid}/scale').json()['m_per_unit'] == s['m_per_unit']   # saved with the model
+        r = client.put(f'/api/v1/models/{mid}/scale', json={'m_per_unit': 4.1, 'reference_m': 2.6, 'reference_units': .634, 'note': 'antenna'})
+        assert r.status_code == 200 and r.json()['method'] == 'manual' and r.json()['m_per_unit'] == 4.1
+        assert client.put(f'/api/v1/models/{mid}/scale', json={'m_per_unit': 0}).status_code == 422
+        assert client.delete(f'/api/v1/models/{mid}/scale').status_code == 204 and client.get(f'/api/v1/models/{mid}/scale').json() is None
+        assert client.post('/api/v1/models/999999/scale/detect').status_code == 404
