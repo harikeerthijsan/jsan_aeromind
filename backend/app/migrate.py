@@ -5,10 +5,14 @@
     python -m app.migrate files
         uploads uploads/, reconstructions/ (without the images/ copies of uploaded photos) and vendor_refs/ to the
         bucket from the S3_* settings; files already there with the same size are skipped, so it can be re-run.
+    python -m app.migrate media-layout [--apply] [--delete-old]
+        reorganises existing media into uploads/sites/<tower>/inspections/<inspection>/{images|videos|frames}/ locally
+        and in the configured bucket. The default is a dry run; --delete-old removes old objects only after every new
+        object is stored and the database keys are committed.
 """
 from __future__ import annotations
 
-import argparse, os, sys, time
+import argparse, os, shutil, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timezone
 from pathlib import Path
@@ -61,14 +65,77 @@ def copy_files(workers=8):
             f.result(); done += futures[f].stat().st_size
             if n % 25 == 0 or n == len(jobs): print(f'  {n}/{len(jobs)} files, {done / 1e6:.0f}/{total / 1e6:.0f} MB, {done / 1e6 / max(time.time() - t0, 1):.1f} MB/s', flush=True)
 
+def media_layout(apply=False,delete_old=False):
+    """Safely copy legacy media to the structured local/bucket keys, then atomically switch database references."""
+    from sqlalchemy import select, func
+    from .database import SessionLocal
+    from .models import Media, Inspection, Site, Job
+    from .tasks import ROOT  # also registers ROOT with the production bucket adapter
+    from . import media_paths, storage
+    if delete_old and not apply:sys.exit('--delete-old requires --apply')
+    with SessionLocal() as db:
+        active=db.scalar(select(func.count()).select_from(Job).where(Job.status.in_(['queued','running']))) or 0
+        if active:sys.exit(f'Refusing to reorganise media while {active} processing job(s) are queued or running')
+        rows=db.scalars(select(Media).order_by(Media.parent_media_id.is_not(None),Media.id)).all()
+        by_id={m.id:m for m in rows};inspections={};sites={};planned={};moves=[]
+        for m in rows:
+            inspection=inspections.setdefault(m.inspection_id,db.get(Inspection,m.inspection_id))
+            if not inspection:continue
+            site=sites.setdefault(inspection.site_id,db.get(Site,inspection.site_id))
+            if not site:continue
+            if media_paths.is_structured(m.storage_key):new=m.storage_key
+            else:
+                parent=by_id.get(m.parent_media_id) if m.parent_media_id else None
+                parent_key=planned.get(parent.id,parent.storage_key) if parent else None
+                new=media_paths.migrated_key(site.code,inspection.id,m.id,m.filename,m.content_type,m.storage_key,parent_key,parent.id if parent else None,m.frame_index)
+            planned[m.id]=new
+            if new!=m.storage_key:moves.append((m,m.storage_key,new))
+        total=sum((ROOT/old).stat().st_size if (ROOT/old).is_file() else 0 for _,old,_ in moves)
+        print(f'{len(moves)} of {len(rows)} media file(s) need the structured layout ({total/1e6:.1f} MB currently local)')
+        for _,old,new in moves[:20]:print(f'  {old} -> {new}')
+        if len(moves)>20:print(f'  ... and {len(moves)-20} more')
+        print(f'  bucket: {storage.BUCKET if storage.enabled() else "not configured (local files only)"}')
+        if not apply:return {'planned':len(moves),'total':len(rows)}
+        copied=[];missing=[]
+        try:
+            for n,(_,old,new) in enumerate(moves,1):
+                src=storage.fetch(ROOT/old);dst=ROOT/new
+                if not dst.is_file():
+                    if not src.is_file():missing.append(old);continue
+                    dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src,dst);copied.append(dst)
+                storage.push(dst)
+                if n%25==0 or n==len(moves):print(f'  stored {n}/{len(moves)}',flush=True)
+            if missing:raise RuntimeError(f'{len(missing)} source file(s) are missing locally and in the bucket; first: {missing[0]}')
+            for m,_,new in moves:m.storage_key=new
+            db.commit()
+        except Exception:
+            db.rollback()
+            print('Database keys were not changed. Any copied destination objects are safe to reuse on the next run.',file=sys.stderr)
+            raise
+        deleted=0
+        if delete_old:
+            new_keys=set(planned.values())
+            for _,old,new in moves:
+                if old in new_keys or db.scalar(select(func.count()).select_from(Media).where(Media.storage_key==old)):continue
+                path=ROOT/old;storage.delete(path);path.unlink(missing_ok=True);deleted+=1
+                parent=path.parent
+                while parent!=ROOT and ROOT in parent.parents:
+                    try:parent.rmdir()
+                    except OSError:break
+                    parent=parent.parent
+        print(f'Media layout complete: {len(moves)} database key(s) updated, {deleted} old object(s) removed.')
+        return {'migrated':len(moves),'deleted':deleted,'total':len(rows)}
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('db'); d.add_argument('--source', default='sqlite:///tower_vision.db'); d.add_argument('--target', required=True); d.add_argument('--replace', action='store_true')
     f = sub.add_parser('files'); f.add_argument('--workers', type=int, default=8)
+    m = sub.add_parser('media-layout');m.add_argument('--apply',action='store_true');m.add_argument('--delete-old',action='store_true')
     a = ap.parse_args()
     if a.cmd == 'db': copy_db(a.source, a.target, a.replace)
-    else: copy_files(a.workers)
+    elif a.cmd == 'files': copy_files(a.workers)
+    else: media_layout(a.apply,a.delete_old)
 
 if __name__ == '__main__':
     main()

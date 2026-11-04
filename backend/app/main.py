@@ -1,11 +1,11 @@
-import os, uuid, hashlib, shutil, csv, io, tempfile, zipfile, threading, math, secrets, base64
+import os, uuid, hashlib, shutil, csv, io, tempfile, zipfile, threading, math
 from urllib.parse import quote
 from collections import Counter
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response, FileResponse
+from fastapi.responses import StreamingResponse, Response, FileResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
@@ -15,8 +15,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func, update, delete, inspect, text, and_, or_
 from .database import Base, engine, SessionLocal
 from .models import Site, Inspection, Media, Asset, Defect, Job, Model3D, RegistrationCandidate, Detection, ImageReview, Annotation, now
-from . import detector, vendor, condition, frames, reconstruct, registration, storage, gpu
+from . import detector, vendor, condition, frames, reconstruct, registration, storage, gpu, media_paths
 from .tasks import ROOT  # uploads folder; it and the 3D/reference folders are backed by the bucket when one is configured
+from . import auth
 MAX_SIZE = int(os.getenv('MAX_UPLOAD_BYTES', str(500 * 1024 * 1024)))
 ALLOWED = {'image/jpeg':'.jpg','image/png':'.png','image/tiff':'.tif','video/mp4':'.mp4','video/quicktime':'.mov'}  # stored extension comes from the checked type, never the client's filename
 WORKFLOWS = {'ai_detection','manual_qc'}
@@ -67,24 +68,29 @@ async def lifespan(app):
             db.execute(update(Job).where(Job.status.in_(['queued','running'])).values(status='failed',detail='Interrupted by server restart; re-run processing.'))
             db.execute(update(Model3D).where(Model3D.status.in_(['queued','running'])).values(status='failed'));db.commit()
         if os.getenv('ENABLE_DEMO_SEED','true').lower()=='true': seed(db)
+        auth.seed_users(db)
     if storage.enabled():  # the reference library is small and listed (not just opened), so keep a full copy
         threading.Thread(target=lambda:storage.fetch_tree(vendor.VENDOR_REFERENCE_DIR),daemon=True).start()
     yield
 
 app=FastAPI(title='AeroMind API',version='0.1.0',lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','),allow_methods=['*'],allow_headers=['*'])
+app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','),allow_methods=['*'],allow_headers=['*'],allow_credentials=True)  # credentials: the session cookie in local dev (separate ports)
 @app.middleware('http')
 async def no_sniff(request,call_next):
     r=await call_next(request);r.headers['X-Content-Type-Options']='nosniff';return r  # browsers must not reinterpret uploads as HTML
-USER,PASSWORD=os.getenv('APP_USERNAME','aeromind'),os.getenv('APP_PASSWORD','')
 @app.middleware('http')
-async def password_gate(request,call_next):
-    # Optional shared login for a public deployment (APP_PASSWORD set): the browser asks once and sends it with every request.
-    if PASSWORD and request.url.path!='/health' and not request.url.path.startswith('/api/v1/worker/'):  # the worker has its own token
-        try:user,_,pw=base64.b64decode(request.headers.get('authorization','').removeprefix('Basic ')).decode('utf-8','replace').partition(':')
-        except ValueError:user=pw=''
-        if not (secrets.compare_digest(user,USER) and secrets.compare_digest(pw,PASSWORD)):
-            return Response('Login required',401,{'WWW-Authenticate':'Basic realm="AeroMind", charset="UTF-8"'})
+async def authentication_gate(request,call_next):
+    path=request.url.path
+    # the web app's own files are public (the login page must load); the API and every data file (drone photos,
+    # 3D models, reference photos) need a signed-in user. The worker uses its own token.
+    data=path.startswith(('/api/v1/','/uploads/','/recon/','/vendor-refs/'))
+    public=path in ('/health','/api/v1/auth/login','/api/v1/auth/config') or path.startswith('/api/v1/worker/') or not data
+    if public or request.method=='OPTIONS' or os.getenv('AUTH_DISABLED','false').lower()=='true':return await call_next(request)
+    with SessionLocal() as db:user=auth.authenticate(db,auth.token_from(request))
+    if not user:return JSONResponse({'detail':'Authentication required'},401,{'WWW-Authenticate':'Bearer'})
+    required=auth.minimum_role(path,request.method)
+    if auth.ROLE_LEVEL.get(user.role,-1)<auth.ROLE_LEVEL[required]:return JSONResponse({'detail':f'{required.title()} role required'},403)
+    request.state.auth_user=user
     return await call_next(request)
 class SyncedFiles(StaticFiles):
     """Static files that are downloaded from the bucket on first request when they aren't on this machine yet."""
@@ -92,6 +98,7 @@ class SyncedFiles(StaticFiles):
         full,_=self.lookup_path(path)
         if not full and storage.enabled() and '..' not in path:await run_in_threadpool(storage.fetch,Path(self.directory)/path)
         return await super().get_response(path,scope)
+app.include_router(auth.router)
 app.include_router(gpu.router)
 app.mount('/uploads',SyncedFiles(directory=ROOT),name='uploads')
 reconstruct.RECON_DIR.mkdir(parents=True,exist_ok=True)
@@ -266,6 +273,73 @@ def sites_overview(db:Session=Depends(get_db)):
             'images':images.get(i,0),'approved_images':approved.get(i,0),'items':items.get(i,0),'items_with_defects':defective.get(i,0),'poor_or_critical':critical.get(i,0),
             'models':models.get(i,0),'dense_models':dense.get(i,0),'boxes_3d':boxes.get(i,0),'jobs_running':running.get(i,0)}})
     return out
+THUMB_DIR=ROOT/'.thumbs'  # small cached JPEGs for cards (drone originals are ~15 MB); regenerated on demand, never pushed to the bucket
+@app.get('/api/v1/media/{media_id}/thumb')
+def media_thumb(media_id:int,w:int=Query(480,ge=120,le=1280),db:Session=Depends(get_db)):
+    m=db.get(Media,media_id)
+    if not m or not m.content_type.startswith('image/'):raise HTTPException(404,'Image not found')
+    out=THUMB_DIR/f'{media_id}_{w}.jpg'
+    if not out.is_file():
+        src=storage.fetch(ROOT/m.storage_key)
+        if not src.is_file():raise HTTPException(404,'Image file not found')
+        from PIL import Image,ImageOps
+        THUMB_DIR.mkdir(parents=True,exist_ok=True);tmp=out.with_suffix(f'.{uuid.uuid4().hex}.part')
+        with Image.open(src) as im:
+            im=ImageOps.exif_transpose(im);im.thumbnail((w,w));im.convert('RGB').save(tmp,'JPEG',quality=82,optimize=True)
+        os.replace(tmp,out)
+    return FileResponse(out,media_type='image/jpeg',headers={'Cache-Control':'public, max-age=86400'})
+def _cover(db,inspection_id):
+    """First photo of an inspection in capture order: the picture shown on its cards."""
+    return db.scalar(select(Media.id).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None),Media.content_type.like('image/%')).order_by(func.lower(Media.filename),Media.id).limit(1))
+def _workflow(db,x):
+    """Where one inspection stands: upload -> detection -> QC -> condition -> 3D model -> 3D boxes, each with a 0..1 completion."""
+    cnt=lambda q:db.scalar(q) or 0
+    photos=cnt(select(func.count()).select_from(Media).where(Media.inspection_id==x.id,Media.parent_media_id.is_(None)))
+    images=cnt(select(func.count()).select_from(Media).where(Media.inspection_id==x.id,Media.content_type.like('image/%')))
+    detections=cnt(select(func.count()).select_from(Detection).where(Detection.inspection_id==x.id))
+    ran=cnt(select(func.count()).select_from(Job).where(Job.inspection_id==x.id,Job.kind=='detection',Job.status=='completed'))
+    approved=cnt(select(func.count()).select_from(ImageReview).where(ImageReview.inspection_id==x.id,ImageReview.status=='approved'))
+    items=cnt(select(func.count()).select_from(Annotation).where(Annotation.inspection_id==x.id))
+    assessed=cnt(select(func.count()).select_from(Annotation).where(Annotation.inspection_id==x.id,Annotation.condition_grade.is_not(None)))
+    models=db.scalars(select(Model3D).where(Model3D.inspection_id==x.id,Model3D.status=='completed')).all()
+    boxes=cnt(select(func.count()).select_from(RegistrationCandidate).where(RegistrationCandidate.inspection_id==x.id,RegistrationCandidate.status!='rejected'))
+    boxes_ok=cnt(select(func.count()).select_from(RegistrationCandidate).where(RegistrationCandidate.inspection_id==x.id,RegistrationCandidate.status=='approved'))
+    steps=[{'key':'upload','label':'Upload drone photos or video','page':'upload','done':1.0 if photos else 0.0,'detail':f'{photos} file(s)' if photos else 'No files yet'},
+           {'key':'detect','label':'Run AI detection','page':'detection','done':1.0 if ran else 0.0,'detail':f'{detections:,} detections' if ran else 'Not run yet'},
+           {'key':'qc','label':'QC review and approve images','page':'review','done':approved/images if images else 0.0,'detail':f'{approved}/{images} images approved'},
+           {'key':'condition','label':'Assess equipment condition','page':'defects','done':assessed/items if items else 0.0,'detail':f'{assessed:,} of {items:,} items assessed'},
+           {'key':'model','label':'Build the 3D model','page':'reconstruction','done':1.0 if models else 0.0,'detail':(' + '.join('dense' if m.dense else 'sparse' for m in models)+' model') if models else 'Not built yet'},
+           {'key':'boxes','label':'Place and review 3D equipment boxes','page':'twin','done':boxes_ok/boxes if boxes else 0.0,'detail':f'{boxes} boxes · {boxes_ok} approved' if boxes else 'Not generated yet'}]
+    return {'steps':steps,'progress':round(sum(st['done'] for st in steps)/len(steps)*100)}
+@app.get('/api/v1/overview')
+def overview(days:int=Query(90,ge=7,le=366),db:Session=Depends(get_db)):
+    """Everything the Overview page shows: totals, daily activity, the latest inspection's workflow, towers and recent jobs."""
+    from datetime import timedelta
+    today=now().date();start=today-timedelta(days=days-1);day=lambda d:(d if d.tzinfo else d.replace(tzinfo=now().tzinfo)).date()
+    activity={(start+timedelta(days=i)).isoformat():{'approved':0,'inspections':0,'models':0} for i in range(days)}
+    for d in db.scalars(select(ImageReview.reviewed_at).where(ImageReview.status=='approved')):
+        if d and (k:=day(d).isoformat()) in activity:activity[k]['approved']+=1
+    for d in db.scalars(select(Inspection.created_at)):
+        if d and (k:=day(d).isoformat()) in activity:activity[k]['inspections']+=1
+    for d in db.scalars(select(Model3D.created_at).where(Model3D.status=='completed')):
+        if d and (k:=day(d).isoformat()) in activity:activity[k]['models']+=1
+    sites=sites_overview(db)
+    for st in sites:
+        last=db.scalar(select(Inspection).where(Inspection.site_id==st['id']).order_by(Inspection.created_at.desc(),Inspection.id.desc()))
+        st['cover_media_id']=next((c for i in db.scalars(select(Inspection.id).where(Inspection.site_id==st['id']).order_by(Inspection.created_at.desc(),Inspection.id.desc())) if (c:=_cover(db,i))),None)
+        st['last_inspection']={'id':last.id,'label':last.label} if last else None
+    latest=next((i for i in db.scalars(select(Inspection).order_by(Inspection.created_at.desc(),Inspection.id.desc())) if _cover(db,i.id)),None)
+    latest_out=None
+    if latest:
+        site=db.get(Site,latest.site_id)
+        latest_out=to_dict(latest)|{'site':{'id':site.id,'code':site.code,'name':site.name} if site else None,'cover_media_id':_cover(db,latest.id)}|_workflow(db,latest)
+    jobs=[]
+    for j,i,st in db.execute(select(Job,Inspection,Site).join(Inspection,Inspection.id==Job.inspection_id).join(Site,Site.id==Inspection.site_id).order_by(Job.id.desc()).limit(25)):
+        jobs.append({'id':j.id,'kind':j.kind,'status':j.status,'stage':j.stage,'progress':j.progress,'detail':j.detail,'inspection':{'id':i.id,'label':i.label},'site':{'id':st.id,'code':st.code}})
+    live=[x for x in sites if x['status']!='archived'];tot=lambda k:sum(x['stats'][k] for x in live)
+    return {'totals':{'sites':len(live),'inspections':tot('inspections'),'images':tot('images'),'approved_images':tot('approved_images'),'items':tot('items'),
+                      'items_with_defects':tot('items_with_defects'),'poor_or_critical':tot('poor_or_critical'),'models':tot('models'),'boxes_3d':tot('boxes_3d'),'jobs_running':tot('jobs_running')},
+            'activity':[{'date':k,**v} for k,v in activity.items()],'latest':latest_out,'sites':sites,'jobs':jobs}
 @app.get('/api/v1/sites/{site_id}/inspections-summary')
 def site_inspections_summary(site_id:int,db:Session=Depends(get_db)):
     """The tower's inspections, newest first, each with its files, QC progress, detection runs and 3D models."""
@@ -300,10 +374,14 @@ def create_inspection(data:InspectionIn,db:Session=Depends(get_db)):
     x=Inspection(**data.model_dump());db.add(x);db.commit();db.refresh(x);return to_dict(x)
 @app.post('/api/v1/inspections/{inspection_id}/media',status_code=201)
 async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends(get_db)):
-    if not db.get(Inspection,inspection_id):raise HTTPException(404,'Inspection not found')
+    inspection=db.get(Inspection,inspection_id)
+    if not inspection:raise HTTPException(404,'Inspection not found')
+    site=db.get(Site,inspection.site_id)
+    if not site:raise HTTPException(404,'Site not found')
     if file.content_type not in ALLOWED:raise HTTPException(415,'Unsupported image/video type')
-    key=uuid.uuid4().hex+ALLOWED[file.content_type]
-    target=ROOT/key;size=0;sha=hashlib.sha256()
+    name=Path(file.filename or 'upload').name[:255]
+    key=media_paths.upload_key(site.code,inspection.id,name,file.content_type,ALLOWED[file.content_type])
+    target=ROOT/key;target.parent.mkdir(parents=True,exist_ok=True);size=0;sha=hashlib.sha256()
     try:
         with target.open('wb') as out:
             while chunk:=await file.read(1024*1024):
@@ -311,7 +389,7 @@ async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends
                 if size>MAX_SIZE:raise HTTPException(413,'File too large')
                 sha.update(chunk);out.write(chunk)
         await run_in_threadpool(storage.push,target)
-        x=Media(inspection_id=inspection_id,filename=Path(file.filename or 'upload').name[:255],storage_key=key,content_type=file.content_type,sha256=sha.hexdigest(),size_bytes=size)
+        x=Media(inspection_id=inspection_id,filename=name,storage_key=key,content_type=file.content_type,sha256=sha.hexdigest(),size_bytes=size)
         db.add(x);db.commit();db.refresh(x);return to_dict(x)
     except Exception:
         target.unlink(missing_ok=True)

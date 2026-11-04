@@ -493,6 +493,11 @@ def test_review_regressions(monkeypatch):
         # an HTML file declared as an image is stored as .png and can't be rendered as a page
         h=up('x.html',b'<script>alert(1)</script>','image/png')
         assert h['storage_key'].endswith('.png')
+        assert h['storage_key'].startswith(f"sites/TWR-001/inspections/INS-{i['id']:06d}/images/")
+        from app import media_paths,storage
+        from app.tasks import ROOT
+        assert storage.key_for(ROOT/h['storage_key'])=='uploads/'+h['storage_key']  # identical hierarchy in production S3
+        assert media_paths.frame_dir(h['storage_key'],123).as_posix()==f"sites/TWR-001/inspections/INS-{i['id']:06d}/frames/MEDIA-000123"
         r=client.get('/uploads/'+h['storage_key']);assert r.headers['x-content-type-options']=='nosniff' and r.headers['content-type'].startswith('image/png')
     def timeout(*a,**k):raise TimeoutError('timed out')
     monkeypatch.setattr(urllib.request,'urlopen',timeout)
@@ -732,6 +737,21 @@ def test_mounting_bracket_refinement_can_keep_dense_surface_anchor():
     assert np.allclose(candidate['position'],[0.,0.,5.])
     assert 'mounting_brackets' in reg.SURFACE_ANCHORED_CLASSES
 
+def test_login_sessions_and_role_enforcement(monkeypatch):
+    monkeypatch.setenv('AUTH_DISABLED','false')
+    with TestClient(app) as client:
+        viewer=client.post('/api/v1/auth/login',json={'email':'viewer@aeromind.local','password':'AeroMind@123'});assert viewer.status_code==200
+        vh={'Authorization':'Bearer '+viewer.json()['token']}
+        assert client.get('/api/v1/auth/me',headers=vh).json()['role']=='viewer'
+        assert client.get('/api/v1/sites',headers=vh).status_code==200
+        assert client.post('/api/v1/sites',headers=vh,json={'code':'NOPE','name':'Not allowed'}).status_code==403
+        admin=client.post('/api/v1/auth/login',json={'email':'admin@aeromind.local','password':'AeroMind@123'});assert admin.status_code==200
+        ah={'Authorization':'Bearer '+admin.json()['token']}
+        assert client.get('/api/v1/users',headers=ah).status_code==200
+        made=client.post('/api/v1/users',headers=ah,json={'email':'new@example.com','name':'New Inspector','role':'inspector','password':'SafePassword1!'});assert made.status_code==201
+        assert client.post('/api/v1/auth/logout',headers=vh).status_code==204
+        assert client.get('/api/v1/auth/me',headers=vh).status_code==401
+
 def test_remote_gpu_worker_runs_queued_work(monkeypatch):
     """GPU_WORKER=remote (Railway): GPU work is queued; the worker claims it over HTTPS with its token, computes it
     without database access and posts the result, which the server applies. Errors come back to the waiting request."""
@@ -776,19 +796,15 @@ def test_remote_gpu_worker_runs_queued_work(monkeypatch):
             stop.set()
             for t in lanes: t.join(5)
 
-def test_password_gate_and_web_app(monkeypatch, tmp_path):
+def test_web_app_fallback_and_api_isolation(tmp_path):
     from app import main
-    monkeypatch.setattr(main, 'PASSWORD', 'secret')
     with TestClient(app) as client:
-        assert client.get('/api/v1/sites').status_code == 401 and client.get('/health').status_code == 200
-        assert client.get('/api/v1/sites', auth=('aeromind', 'wrong')).status_code == 401
-        assert client.get('/api/v1/sites', headers={'Authorization': 'Basic !!notbase64'}).status_code == 401
-        assert client.get('/api/v1/sites', auth=('aeromind', 'secret')).status_code == 200
+        assert client.get('/health').status_code == 200
         if (main.DIST / 'index.html').is_file():  # built frontend: client-side routes get the app, unknown API paths stay 404
-            r = client.get('/twin', auth=('aeromind', 'secret'))
+            r = client.get('/twin')
             assert r.status_code == 200 and '<div id="root"' in r.text
-            assert client.get('/api/v1/nope', auth=('aeromind', 'secret')).status_code == 404
-            assert client.get('/../backend/.env', auth=('aeromind', 'secret')).status_code in (200, 404) and 'VLM' not in client.get('/..%2fbackend%2f.env', auth=('aeromind', 'secret')).text
+            assert client.get('/api/v1/nope').status_code == 404
+            assert client.get('/../backend/.env').status_code in (200, 404) and 'VLM' not in client.get('/..%2fbackend%2f.env').text
 
 def test_small_parts_may_use_photo_boxes_when_consistent():
     from app.registration import candidate_is_valid
@@ -878,3 +894,23 @@ def test_model_scale_endpoints():
         assert client.put(f'/api/v1/models/{mid}/scale', json={'m_per_unit': 0}).status_code == 422
         assert client.delete(f'/api/v1/models/{mid}/scale').status_code == 204 and client.get(f'/api/v1/models/{mid}/scale').json() is None
         assert client.post('/api/v1/models/999999/scale/detect').status_code == 404
+
+def test_session_cookie_for_files_and_reads_only(monkeypatch):
+    """Images and 3D files are fetched by the browser without the Authorization header: the login also sets an
+    HttpOnly cookie that works for reads only, and data files are no longer public."""
+    import os
+    from pathlib import Path
+    monkeypatch.setenv('AUTH_DISABLED', 'false')
+    (Path(os.environ['UPLOAD_DIR']) / 'cookie-check.txt').write_text('private')
+    with TestClient(app) as client:
+        anon = TestClient(app)
+        assert anon.get('/uploads/cookie-check.txt').status_code == 401        # data files need a login now
+        r = client.post('/api/v1/auth/login', json={'email': 'admin@aeromind.local', 'password': 'AeroMind@123'})
+        assert r.status_code == 200 and 'aeromind_session' in r.cookies and 'httponly' in r.headers['set-cookie'].lower()
+        assert client.get('/uploads/cookie-check.txt').text == 'private'      # the cookie alone opens files
+        assert client.get('/api/v1/sites').status_code == 200                  # and reads
+        assert client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'csrf'}).status_code == 401  # but never changes
+        h = {'Authorization': 'Bearer ' + r.json()['token']}
+        assert client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'header'}, headers=h).status_code == 201
+        assert client.post('/api/v1/auth/logout', headers=h).status_code == 204
+        assert client.get('/uploads/cookie-check.txt').status_code == 401

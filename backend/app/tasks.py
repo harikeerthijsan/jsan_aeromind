@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from fastapi import HTTPException
 
-from . import detector, frames, reconstruct, storage, vendor
+from . import detector, frames, reconstruct, storage, vendor, media_paths
 
 ROOT = Path(os.getenv('UPLOAD_DIR', './uploads')).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -42,7 +42,8 @@ def detect(payload, progress):
                 else:
                     progress('frame_extraction', int((n - 1) * 100 / len(items)), f"Extracting frames from {m['filename']} ({n}/{len(items)})")
                     with _frames_lock:
-                        for idx, sec, p, w, h in frames.extract(storage.fetch(ROOT / m['storage_key']), ROOT / 'frames' / str(m['id'])):
+                        frame_root=ROOT/media_paths.frame_dir(m['storage_key'],m['id'])
+                        for idx, sec, p, w, h in frames.extract(storage.fetch(ROOT / m['storage_key']),frame_root):
                             data = p.read_bytes(); storage.push(p)
                             res['new_frames'].append({'frame_index': idx, 'frame_time': sec, 'storage_key': p.relative_to(ROOT).as_posix(),
                                                       'filename': frames.label(m['filename'], idx, sec)[0], 'sha256': hashlib.sha256(data).hexdigest(), 'size_bytes': len(data)})

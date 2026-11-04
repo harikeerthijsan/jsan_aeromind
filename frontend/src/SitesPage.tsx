@@ -79,7 +79,7 @@ function Confirm({title,body,action,danger,onCancel,onConfirm}:{title:string;bod
 function Progress({done,total}:{done:number;total:number}){const pct=total?Math.round(done*100/total):0;
  return <div className="st-progress" title={`${done} of ${total} images approved in QC`}><div><i style={{width:pct+'%'}}/></div><small>{total?`${done}/${total}`:'—'}</small></div>}
 
-function SiteDrawer({site,onClose,onEdit,onArchive,onDelete,go,select,reload}:{site:SiteRow;onClose:()=>void;onEdit:()=>void;onArchive:()=>void;onDelete:()=>void;go:(p:string)=>void;select:(id:number)=>void;reload:()=>void}){
+function SiteDrawer({site,onClose,onEdit,onArchive,onDelete,go,select,reload,canManage}:{site:SiteRow;onClose:()=>void;onEdit:()=>void;onArchive:()=>void;onDelete:()=>void;go:(p:string)=>void;select:(id:number)=>void;reload:()=>void;canManage:boolean}){
  const [rows,setRows]=useState<InspectionRow[]|null>(null),[error,setError]=useState(''),[label,setLabel]=useState(''),[adding,setAdding]=useState(false);
  const load=()=>request<InspectionRow[]>(`/api/v1/sites/${site.id}/inspections-summary`).then(setRows).catch(e=>setError(errText(e)));
  useEffect(()=>{setRows(null);setError('');setAdding(false);load()},[site.id]);
@@ -91,10 +91,10 @@ function SiteDrawer({site,onClose,onEdit,onArchive,onDelete,go,select,reload}:{s
  return <div className="st-overlay st-drawer-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><aside className="st-drawer">
   <div className="st-drawer-head"><div className="st-modal-icon"><RadioTower size={18}/></div><div><h2>{site.code}</h2><small>{site.name}</small></div><span className={'st-status '+site.status}>{statusLabel(site.status)}</span><button className="st-icon-btn" onClick={onClose} aria-label="Close"><X size={18}/></button></div>
   <div className="st-drawer-actions">
-   <button className="btn primary" onClick={()=>{setAdding(true);setLabel('Drone survey '+new Date().toLocaleDateString())}} disabled={archived}><Plus size={14}/>New inspection</button>
-   <button className="btn outline" onClick={()=>open('upload')}><UploadCloud size={14}/>Upload media</button>
+   {canManage&&<button className="btn primary" onClick={()=>{setAdding(true);setLabel('Drone survey '+new Date().toLocaleDateString())}} disabled={archived}><Plus size={14}/>New inspection</button>}
+   {canManage&&<button className="btn outline" onClick={()=>open('upload')}><UploadCloud size={14}/>Upload media</button>}
    <button className="btn outline" onClick={()=>open('twin')}><Layers size={14}/>Digital twin</button>
-   <button className="btn outline" onClick={onEdit}><Edit3 size={14}/>Edit</button>
+   {canManage&&<button className="btn outline" onClick={onEdit}><Edit3 size={14}/>Edit</button>}
   </div>
   {adding&&<form className="st-inline-form" onSubmit={e=>{e.preventDefault();addInspection()}}><input autoFocus value={label} onChange={e=>setLabel(e.target.value)} placeholder="Inspection label"/><button className="btn primary" disabled={label.trim().length<2}>Create</button><button type="button" className="btn outline" onClick={()=>setAdding(false)}>Cancel</button></form>}
   <div className="st-drawer-body">
@@ -119,16 +119,16 @@ function SiteDrawer({site,onClose,onEdit,onArchive,onDelete,go,select,reload}:{s
      <div className="st-ins-links"><button className="text-btn" onClick={()=>open('detection')}>Detections</button><button className="text-btn" onClick={()=>open('review')}><ClipboardCheck size={12}/>QC review</button><button className="text-btn" onClick={()=>open('reconstruction')}><Box size={12}/>3D</button><button className="text-btn" onClick={()=>open('assets')}>Inventory <ArrowRight size={12}/></button></div>
     </div>)}</div>}
   </div>
-  <div className="st-drawer-foot">
+  {canManage&&<div className="st-drawer-foot">
    <button className="btn outline" onClick={onArchive}>{archived?<><ArchiveRestore size={14}/>Restore</>:<><Archive size={14}/>Archive</>}</button>
    <button className="btn outline st-danger-outline" onClick={onDelete} disabled={s.inspections>0} title={s.inspections?'Towers with inspections can be archived, not deleted':'Delete this empty tower'}><Trash2 size={14}/>Delete</button>
    {site.created_at&&<small className="muted">Added {fmtDate(site.created_at)}</small>}
-  </div>
+  </div>}
  </aside></div>;
 }
 
-type Props={go:(page:string)=>void;selectSite:(id:number)=>void;onChanged:()=>void;addSignal:number};
-export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
+type Props={go:(page:string)=>void;selectSite:(id:number)=>void;onChanged:()=>void;addSignal:number;canManage:boolean};
+export default function SitesPage({go,selectSite,onChanged,addSignal,canManage}:Props){
  const [rows,setRows]=useState<SiteRow[]|null>(null),[error,setError]=useState(''),[view,setView]=useState<'table'|'map'>(()=>{try{return localStorage.getItem('aeromind.sites.view')==='map'?'map':'table'}catch{return 'table'}});
  const switchView=(v:'table'|'map')=>{setView(v);try{localStorage.setItem('aeromind.sites.view',v)}catch{}};
  const [query,setQuery]=useState(''),[status,setStatus]=useState('current'),[region,setRegion]=useState(''),[structure,setStructure]=useState(''),[sort,setSort]=useState('code');
@@ -136,7 +136,7 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
  const load=()=>request<SiteRow[]>('/api/v1/sites-overview').then(r=>{setRows(r);setError('')}).catch(e=>setError(errText(e)));
  useEffect(()=>{load();const t=setInterval(load,30000);return()=>clearInterval(t)},[]);
  const seenSignal=useRef(addSignal);  // the header's Add Tower button: react to new clicks only, not to the count when the page opens
- useEffect(()=>{if(addSignal!==seenSignal.current){seenSignal.current=addSignal;setForm({site:null})}},[addSignal]);
+ useEffect(()=>{if(addSignal!==seenSignal.current){seenSignal.current=addSignal;if(canManage)setForm({site:null})}},[addSignal,canManage]);
  const changed=async()=>{await load();onChanged()};
  const all=rows||[];
  const regions=useMemo(()=>[...new Set(all.map(s=>s.region).filter(Boolean))].sort(),[rows]),structures=useMemo(()=>[...new Set(all.map(s=>s.tower_type))].sort(),[rows]);
@@ -166,7 +166,7 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
     {filtered&&<button className="text-btn" onClick={()=>{setQuery('');setRegion('');setStructure('');setStatus('current')}}>Reset</button>}
    </div>
    {error&&<div className="error"><AlertTriangle size={16}/>{error}<button onClick={load}>Retry</button></div>}
-   {!rows&&!error?<p className="muted">Loading sites…</p>:!shown.length?<div className="st-empty"><RadioTower size={34}/><p>{all.length?'No sites match these filters.':'No tower sites yet. Add the first tower to start uploading inspections.'}</p>{all.length?<button className="btn outline" onClick={()=>{setQuery('');setRegion('');setStructure('');setStatus('current')}}>Clear filters</button>:<button className="btn primary" onClick={()=>setForm({site:null})}><Plus size={15}/>Add tower</button>}</div>
+   {!rows&&!error?<p className="muted">Loading sites…</p>:!shown.length?<div className="st-empty"><RadioTower size={34}/><p>{all.length?'No sites match these filters.':'No tower sites yet.'}</p>{all.length?<button className="btn outline" onClick={()=>{setQuery('');setRegion('');setStructure('');setStatus('current')}}>Clear filters</button>:canManage?<button className="btn primary" onClick={()=>setForm({site:null})}><Plus size={15}/>Add tower</button>:null}</div>
    :view==='map'?<div className="st-mapview"><SitesMap sites={shown} selectedId={openId} onSelect={setOpenId}/>
      {shown.some(s=>s.latitude==null||s.longitude==null)&&<div className="st-unlocated"><MapPin size={14}/><span>No location yet:</span>{shown.filter(s=>s.latitude==null||s.longitude==null).map(s=><button key={s.id} className="text-btn" onClick={()=>setForm({site:s})} title="Edit to add coordinates">{s.code}</button>)}</div>}</div>
    :<div className="st-table-wrap"><table className="st-table"><thead><tr><th>Tower</th><th>Region · operator</th><th>Structure</th><th>Location</th><th>Inspections</th><th>QC progress</th><th>3D</th><th>Condition</th><th>Status</th><th></th></tr></thead>
@@ -183,7 +183,7 @@ export default function SitesPage({go,selectSite,onChanged,addSignal}:Props){
      <td><button className="text-btn" onClick={e=>{e.stopPropagation();setOpenId(s.id)}}>Details <ArrowRight size={13}/></button></td>
     </tr>)}</tbody></table></div>}
   </section>
-  {current&&<SiteDrawer site={current} onClose={()=>setOpenId(null)} go={go} select={selectSite} reload={changed} onEdit={()=>setForm({site:current})}
+  {current&&<SiteDrawer site={current} onClose={()=>setOpenId(null)} go={go} select={selectSite} reload={changed} canManage={canManage} onEdit={()=>setForm({site:current})}
     onArchive={()=>current.status==='archived'?request(`/api/v1/sites/${current.id}`,json('PATCH',{status:'active'})).then(changed).catch(e=>setError(errText(e))):setConfirm({kind:'archive',site:current})}
     onDelete={()=>setConfirm({kind:'delete',site:current})}/>}
   {form&&<TowerForm site={form.site} others={all} onClose={()=>setForm(null)} onSaved={async s=>{setForm(null);await changed();setOpenId(s.id)}}/>}

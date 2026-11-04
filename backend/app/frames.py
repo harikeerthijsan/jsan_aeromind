@@ -1,8 +1,9 @@
 """Turn an uploaded video into still frames so they go through the same review flow as photos.
 
 Every VIDEO_FRAME_STRIDE-th frame is kept (default: YOLO_VID_STRIDE, i.e. ~1 per second of 30 fps footage); the stride
-grows for long videos so no more than VIDEO_MAX_FRAMES frames are written. Frames are JPEGs under
-<UPLOAD_DIR>/frames/<video media id>/ and become Media rows pointing at the video (parent_media_id, frame_index, frame_time).
+grows for long videos so no more than VIDEO_MAX_FRAMES frames are written. Frames are JPEGs beside their inspection at
+<UPLOAD_DIR>/sites/<tower>/inspections/<inspection>/frames/MEDIA-<video id>/ and become Media rows pointing at the video
+(parent_media_id, frame_index, frame_time). Legacy flat uploads continue using frames/<video id>/.
 Drone telemetry (GPS/gimbal in DJI .SRT sidecars or video metadata) is not carried onto the frames.
 """
 import math, os

@@ -1,4 +1,9 @@
 export const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://localhost:8000' : '');  // production build: same origin as the page
+export type AuthRole='viewer'|'inspector'|'manager'|'admin';
+export type AuthUser={id:number;email:string;name:string;role:AuthRole;active:boolean;created_at:string;last_login:string|null};
+const TOKEN_KEY='aeromind_session';
+export const getAuthToken=()=>localStorage.getItem(TOKEN_KEY);
+export function setAuthToken(token:string|null){if(token)localStorage.setItem(TOKEN_KEY,token);else localStorage.removeItem(TOKEN_KEY)}
 export type Site={id:number;code:string;name:string;region:string;tower_type:string;height_m:number|null;status:string;latitude?:number|null;longitude?:number|null;operator?:string|null;address?:string|null;notes?:string|null;created_at?:string|null};
 export type Inspection={id:number;site_id:number;label:string;status:string;created_at:string};
 export type Asset={id:number;site_id:number;code:string;category:string;condition:string;identity_status:string;localization_status:string;x:number|null;y:number|null;z:number|null;description:string};
@@ -18,5 +23,15 @@ export type VendorCandidate={manufacturer:string;similarity:number;brands:string
 export type VendorSuggestion={candidates:VendorCandidate[];ambiguous:boolean;manufacturer:string;product_model:string|null;confidence:number;basis:string;evidence:string;features:Record<string,string>;reference_vendors:string[];visible_text:string;model:string;seconds:number};
 export type DetectorInfo={status:string;model:string|null;imgsz:number;conf:number;device:string;vid_stride:number;loaded:boolean;classes?:Record<string,string>};
 export type RegistrationCandidate={id:number;model_id:number;inspection_id:number;site_id:number;class_name:string;x:number;y:number;z:number;confidence:number;status:string;evidence_count:number;media_count:number;point_count:number;spread:number;detection_ids:number[];created_at:string;size_w?:number|null;size_h?:number|null;size_d?:number|null;yaw?:number|null;box_method?:string|null;box_points?:number|null;fit_iou?:number|null};
-export async function request<T>(path:string, options:RequestInit={}):Promise<T>{const r=await fetch(API+path,options); if(!r.ok)throw Error((await r.text()).slice(0,250));return r.status===204?undefined as T:r.json();}
+export async function request<T>(path:string, options:RequestInit={}):Promise<T>{
+ const headers=new Headers(options.headers);const token=getAuthToken();if(token)headers.set('Authorization',`Bearer ${token}`);options={credentials:'include',...options};  // include: the session cookie for images/files in local dev
+ const r=await fetch(API+path,{...options,headers});
+ if(!r.ok){
+  if(r.status===401&&!path.endsWith('/auth/login')){setAuthToken(null);window.dispatchEvent(new Event('aeromind-auth-expired'))}
+  const raw=(await r.text()).slice(0,500);let detail=raw;try{detail=JSON.parse(raw).detail||raw}catch{/* plain-text API error */}
+  throw Error(detail||`Request failed (${r.status})`)
+ }
+ return r.status===204?undefined as T:r.json();
+}
 export const json=(method:string,body:unknown):RequestInit=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+export async function download(path:string,filename:string){const headers=new Headers();const token=getAuthToken();if(token)headers.set('Authorization',`Bearer ${token}`);const r=await fetch(API+path,{headers,credentials:'include'});if(!r.ok)throw Error((await r.text()).slice(0,250));const url=URL.createObjectURL(await r.blob());const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;document.body.appendChild(anchor);anchor.click();anchor.remove();URL.revokeObjectURL(url)}
