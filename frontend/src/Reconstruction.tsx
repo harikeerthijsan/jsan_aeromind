@@ -1,14 +1,18 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,ThreeEvent,useFrame,useThree} from '@react-three/fiber';import {OrbitControls,Grid,TransformControls} from '@react-three/drei';import {LabelAnchor} from './Label3D';
 import * as THREE from 'three';import {PLYLoader} from 'three/examples/jsm/loaders/PLYLoader.js';
-import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize} from 'lucide-react';
+import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize,X} from 'lucide-react';
 import {API,request,Inspection,Job,Media,RegistrationCandidate} from './api';
 
 // 3D models built by COLMAP photogrammetry (backend app/reconstruct.py)
 type ReconInfo={status:string;colmap:string|null;colmap_path_env:string|null;video_stride:number;max_images:number;dense_max_size:number};
 export type Model3D={id:number;inspection_id:number;job_id:number;status:string;dense:boolean;created_at:string|null;urls:Record<string,string>;
- quality:{registered_images?:number;images_total?:number;sparse_points?:number;dense_points?:number;mesh_faces?:number;mean_reprojection_error_px?:number|null;mean_track_length?:number|null;models_found?:number;seconds?:number;error?:string;source_model?:number}};
+ quality:{registered_images?:number;images_total?:number;sparse_points?:number;dense_points?:number;mesh_faces?:number;mean_reprojection_error_px?:number|null;mean_track_length?:number|null;models_found?:number;seconds?:number;error?:string;source_model?:number;scale?:ModelScale|null}};
+/** Metres per model unit (app/scale.py): from the drone's GPS / RTK positions, or calibrated by a reviewer. */
+export type ModelScale={m_per_unit:number;method:'gps_rtk'|'gps'|'manual'|string;cameras?:number;rtk?:boolean;residual_median_m?:number;uncertainty_pct?:number|null;reference_m?:number;note?:string};
 type Cam={name:string;center:[number,number,number];dir:[number,number,number]};
+export type MeasurementMode='distance'|'area';
+export type MeasurementPoint=[number,number,number];
 const insCode=(id:number)=>'INS-'+String(id).padStart(4,'0');
 const fmt=(n?:number|null)=>n==null?'—':n.toLocaleString();
 const running=(j:Job)=>['queued','running'].includes(j.status);
@@ -18,9 +22,11 @@ function usePly(url?:string){
  useEffect(()=>{setGeo(null);setErr('');if(!url)return;let live=true;new PLYLoader().load(API+url,g=>{if(live)setGeo(g)},undefined,e=>live&&setErr(String((e as Error)?.message||e)));return()=>{live=false}},[url]);
  return {geo,err};
 }
-function Cameras({url}:{url?:string}){
+function Cameras({url,selected,onPick}:{url?:string;selected?:string|null;onPick:(cam:Cam)=>void}){
  const [cams,setCams]=useState<Cam[]>([]);
+ const hits=useRef<THREE.InstancedMesh>(null!);
  useEffect(()=>{if(!url)return;fetch(API+url).then(r=>r.json()).then(setCams).catch(()=>setCams([]))},[url]);
+ useEffect(()=>{if(!hits.current)return;const matrix=new THREE.Matrix4();cams.forEach((c,i)=>{matrix.makeTranslation(...c.center);hits.current.setMatrixAt(i,matrix)});hits.current.instanceMatrix.needsUpdate=true},[cams]);
  // dots stay a few pixels on screen at any zoom; direction ticks scale with the spacing between shots so they never pile up
  const objs=useMemo(()=>{if(!cams.length)return null;const P=cams.map(c=>new THREE.Vector3(...c.center));
   const gaps=P.slice(1).map((p,i)=>p.distanceTo(P[i])).filter(g=>g>0).sort((a,b)=>a-b),gap=gaps.length?gaps[Math.floor(gaps.length/2)]:.5,len=Math.min(Math.max(gap*.8,.05),.6);
@@ -29,7 +35,13 @@ function Cameras({url}:{url?:string}){
    new THREE.LineBasicMaterial({color:'#ffb020',transparent:true,opacity:.55}));
   const path=new THREE.Line(new THREE.BufferGeometry().setFromPoints(P),new THREE.LineBasicMaterial({color:'#ffb020',transparent:true,opacity:.3}));
   return [dots,ticks,path]},[cams]);
- return objs&&<group>{objs.map((o,i)=><primitive key={i} object={o}/>)}</group>;
+ const chosen=cams.find(c=>c.name===selected);
+ return objs&&<group>{objs.map((o,i)=><primitive key={i} object={o}/>)}
+  <instancedMesh ref={hits} args={[undefined,undefined,cams.length]} onClick={(e:ThreeEvent<MouseEvent>)=>{e.stopPropagation();if(e.instanceId!=null)onPick(cams[e.instanceId])}} onPointerOver={e=>{e.stopPropagation();document.body.style.cursor='pointer'}} onPointerOut={()=>{document.body.style.cursor='auto'}}>
+   <sphereGeometry args={[.025,8,6]}/><meshBasicMaterial transparent opacity={0} depthWrite={false}/>
+  </instancedMesh>
+  {chosen&&<mesh position={chosen.center} renderOrder={25}><sphereGeometry args={[.022,12,8]}/><meshBasicMaterial color="#fff4a6" depthTest={false}/></mesh>}
+ </group>;
 }
 // stable colour per equipment class (same palette as the 2D box editor)
 const CLASS_PALETTE=['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4','#469990','#dcbeff','#9a6324','#fffac8','#800000','#aaffc3'];
@@ -71,6 +83,27 @@ function RegistrationMarkers({markers,selected,editing,editMode,onPick,onTransfo
  // oriented 3D boxes where the size is known; older candidates without a size stay as dots
  return <group>{markers.map(m=><RegistrationMarker key={m.id} m={m} selected={selected===m.id} editing={editing===m.id} editMode={editMode} onPick={onPick} onTransform={onTransform}/>)}</group>;
 }
+function MeasurementLayer({mode,points}:{mode:MeasurementMode;points:MeasurementPoint[]}){
+ const path=useMemo(()=>{const pairs:THREE.Vector3[]=[];for(let i=1;i<points.length;i++)pairs.push(new THREE.Vector3(...points[i-1]),new THREE.Vector3(...points[i]));if(mode==='area'&&points.length===4)pairs.push(new THREE.Vector3(...points[3]),new THREE.Vector3(...points[0]));return new THREE.BufferGeometry().setFromPoints(pairs)},[mode,points]);
+ const fill=useMemo(()=>{const g=new THREE.BufferGeometry();if(mode==='area'&&points.length===4){const v=[points[0],points[1],points[2],points[0],points[2],points[3]].flat();g.setAttribute('position',new THREE.Float32BufferAttribute(v,3));g.computeVertexNormals()}return g},[mode,points]);
+ useEffect(()=>()=>{path.dispose();fill.dispose()},[path,fill]);
+ return <group renderOrder={40}>
+  {mode==='area'&&points.length===4&&<mesh geometry={fill} renderOrder={38} raycast={()=>{}}><meshBasicMaterial color="#42c8ff" transparent opacity={.2} side={THREE.DoubleSide} depthTest={false} depthWrite={false}/></mesh>}
+  {points.length>1&&<lineSegments geometry={path} raycast={()=>{}} renderOrder={40}><lineBasicMaterial color="#72dcff" depthTest={false}/></lineSegments>}
+  {points.map((point,index)=><ScreenDot key={index} position={point} color={index===0?'#fff257':'#42c8ff'}/>)}
+ </group>;
+}
+/** A measurement point drawn at a fixed size on screen (radius in px) at any zoom. A sphere with a size in model units
+ * was ~0.8 m wide on a scaled tower and hid the spot that was picked. */
+function ScreenDot({position,color,px=4}:{position:MeasurementPoint;color:string;px?:number}){
+ const g=useRef<THREE.Group>(null!),{camera,size}=useThree(),v=useRef(new THREE.Vector3());
+ useFrame(()=>{if(!g.current)return;const fov=THREE.MathUtils.degToRad((camera as THREE.PerspectiveCamera).fov||45);
+  const perPx=v.current.set(...position).distanceTo(camera.position)*2*Math.tan(fov/2)/size.height;g.current.scale.setScalar(perPx)});
+ return <group ref={g} position={position} renderOrder={41}>
+  <mesh renderOrder={41} raycast={()=>{}}><sphereGeometry args={[px+1.5,16,10]}/><meshBasicMaterial color="#ffffff" depthTest={false}/></mesh>
+  <mesh renderOrder={42} raycast={()=>{}}><sphereGeometry args={[px,16,10]}/><meshBasicMaterial color={color} depthTest={false}/></mesh>
+ </group>;
+}
 type FocusAnimation={fromPosition:THREE.Vector3;toPosition:THREE.Vector3;fromTarget:THREE.Vector3;toTarget:THREE.Vector3;progress:number};
 function CameraFocus({marker,request=0}:{marker?:RegistrationCandidate;request?:number}){
  const {camera,controls}=useThree(),animation=useRef<FocusAnimation|null>(null);
@@ -87,17 +120,53 @@ function CameraFocus({marker,request=0}:{marker?:RegistrationCandidate;request?:
  });
  return null;
 }
-export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMarker,editingMarker,markerEditMode='translate',focusRequest=0,onMarkerPick,onMarkerTransform}:{model:Model3D;mode:'points'|'mesh';pointSize:number;showCams:boolean;markers?:RegistrationCandidate[];selectedMarker?:number|null;editingMarker?:number|null;markerEditMode?:MarkerEditMode;focusRequest?:number;onMarkerPick?:(id:number)=>void;onMarkerTransform?:(id:number,position:[number,number,number],yaw:number)=>void}){
+/** Picking measurement points without hit-testing on every mouse move. Event handlers on the cloud made the 3D
+ * library ray-test all of its points (1.5M on a dense model, with a 1-unit default tolerance) on each pointer move and
+ * froze the page. Here only a click (not an orbit drag) is turned into a ray, once: for a point cloud the point nearest
+ * that ray within a few pixels (front-most first), for a mesh the first triangle hit (else its nearest vertex). */
+const PICK_PX=6;
+function nearestPoint(points:THREE.Points|THREE.Mesh,ray:THREE.Ray,camera:THREE.Camera,heightPx:number):THREE.Vector3|null{
+ const pos=points.geometry.getAttribute('position') as THREE.BufferAttribute,a=pos.array as ArrayLike<number>;
+ const inv=new THREE.Matrix4().copy(points.matrixWorld).invert(),local=ray.clone().applyMatrix4(inv);
+ const o=local.origin,d=local.direction.normalize(),ox=o.x,oy=o.y,oz=o.z,dx=d.x,dy=d.y,dz=d.z;
+ const fov=THREE.MathUtils.degToRad((camera as THREE.PerspectiveCamera).fov||45),perPx=2*Math.tan(fov/2)/heightPx*PICK_PX;  // tolerance per unit distance
+ // 1) every point within the tolerance of the click ray, 2) of those on the front-most surface (within a thin depth
+ // band behind the nearest one) the one closest to the clicked pixel - not just the front-most, which can be pixels off
+ const hits:number[]=[];let front=Infinity;
+ for(let i=0,n=pos.count*3;i<n;i+=3){const vx=a[i]-ox,vy=a[i+1]-oy,vz=a[i+2]-oz,t=vx*dx+vy*dy+vz*dz;
+  if(t<=0)continue;const tol=t*perPx;if(vx*vx+vy*vy+vz*vz-t*t<tol*tol){hits.push(i);if(t<front)front=t}}
+ if(!hits.length)return null;
+ const band=Math.max(front*perPx*2,front*.004);let best=-1,bestPx=Infinity;
+ for(const i of hits){const vx=a[i]-ox,vy=a[i+1]-oy,vz=a[i+2]-oz,t=vx*dx+vy*dy+vz*dz;if(t>front+band)continue;
+  const off=Math.sqrt(Math.max(0,vx*vx+vy*vy+vz*vz-t*t))/t;if(off<bestPx){bestPx=off;best=i}}  // angular offset from the ray ~ pixels
+ return new THREE.Vector3(a[best],a[best+1],a[best+2]).applyMatrix4(points.matrixWorld)}
+function MeasurePicker({object,onPick}:{object:THREE.Object3D;onPick:(point:MeasurementPoint)=>void}){
+ const {gl,camera}=useThree(),pick=useRef(onPick);pick.current=onPick;
+ useEffect(()=>{const el=gl.domElement,prev=el.style.cursor;let down:{x:number;y:number}|null=null;el.style.cursor='crosshair';
+  const onDown=(e:PointerEvent)=>{down=e.button===0?{x:e.clientX,y:e.clientY}:null};
+  const onUp=(e:PointerEvent)=>{const start=down;down=null;if(!start||e.button!==0||Math.hypot(e.clientX-start.x,e.clientY-start.y)>5)return;  // a drag orbits the view
+   const r=el.getBoundingClientRect(),ray=new THREE.Raycaster();ray.setFromCamera(new THREE.Vector2((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1),camera);
+   const hit=object instanceof THREE.Points?nearestPoint(object,ray.ray,camera,r.height)
+    :ray.intersectObject(object,false)[0]?.point??(object instanceof THREE.Mesh?nearestPoint(object,ray.ray,camera,r.height):null);  // the web mesh has gaps: fall back to its nearest vertex
+   if(hit)pick.current([hit.x,hit.y,hit.z])};
+  el.addEventListener('pointerdown',onDown);el.addEventListener('pointerup',onUp);
+  return()=>{el.removeEventListener('pointerdown',onDown);el.removeEventListener('pointerup',onUp);el.style.cursor=prev}},[gl,camera,object]);
+ return null}
+export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMarker,editingMarker,markerEditMode='translate',focusRequest=0,onMarkerPick,onMarkerTransform,measurementMode,measurementPoints=[],onMeasurementPoint}:{model:Model3D;mode:'points'|'mesh';pointSize:number;showCams:boolean;markers?:RegistrationCandidate[];selectedMarker?:number|null;editingMarker?:number|null;markerEditMode?:MarkerEditMode;focusRequest?:number;onMarkerPick?:(id:number)=>void;onMarkerTransform?:(id:number,position:[number,number,number],yaw:number)=>void;measurementMode?:MeasurementMode|null;measurementPoints?:MeasurementPoint[];onMeasurementPoint?:(point:MeasurementPoint)=>void}){
  const useMesh=mode==='mesh'&&!!model.urls.web_mesh;const {geo,err}=usePly(useMesh?model.urls.web_mesh:model.urls.web_points);
+ const [selectedCam,setSelectedCam]=useState<Cam|null>(null);
  const obj=useMemo(()=>{if(!geo)return null;const colors=!!geo.getAttribute('color');
   if(useMesh){geo.computeVertexNormals();return new THREE.Mesh(geo,new THREE.MeshStandardMaterial({vertexColors:colors,color:colors?'#ffffff':'#c8d3de',side:THREE.DoubleSide,roughness:.9}))}
   return new THREE.Points(geo,new THREE.PointsMaterial({size:pointSize,vertexColors:colors,color:colors?'#ffffff':'#9fd0ff',sizeAttenuation:true}))},[geo,useMesh]);
  useEffect(()=>{if(obj instanceof THREE.Points)(obj.material as THREE.PointsMaterial).size=pointSize},[obj,pointSize]);
+ useEffect(()=>{if(!showCams)setSelectedCam(null)},[showCams]);
  const label=useRef<HTMLDivElement>(null),sel=markers.find(m=>m.id===selectedMarker);// selected box label, positioned by LabelAnchor
+ const cameraRoot=model.urls.web_cameras?.replace(/\/web\/cameras\.json(?:\?.*)?$/,'')||'',cameraImage=selectedCam?`${API}${cameraRoot}/images/${selectedCam.name.split('/').map(encodeURIComponent).join('/')}`:'';
  return <><div ref={label} className="three-label floating-label">{sel&&<><strong>{sel.class_name.replaceAll('_',' ')}</strong><br/><small>Estimated · {sel.media_count} images · {Math.round(sel.confidence*100)}%</small></>}</div>{err&&<div className="recon-msg">Could not load the model: {err}</div>}{!geo&&!err&&<div className="recon-msg">Loading 3D model…</div>}
+  {selectedCam&&<div className="camera-preview"><div className="camera-preview-head"><span><Camera size={14}/><b>Drone capture</b></span><button type="button" onClick={()=>setSelectedCam(null)} title="Close image preview"><X size={15}/></button></div><img src={cameraImage} alt={`Drone capture ${selectedCam.name}`}/><div className="camera-preview-meta"><span>{selectedCam.name.split('/').pop()}</span><small>Captured from the selected yellow camera point</small></div></div>}
   <Canvas camera={{position:[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}}>{/* high enough to show the tower and the drone path above it */}
    <color attach="background" args={['#0f1f31']}/><ambientLight intensity={.9}/><directionalLight position={[8,12,6]} intensity={1.2}/>
-   {obj&&<primitive object={obj}/>} {showCams&&<Cameras url={model.urls.web_cameras}/>}<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/><LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
+   {obj&&<primitive object={obj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
    <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={[0,1,0]}/><CameraFocus marker={sel} request={focusRequest}/>
   </Canvas></>;
 }
@@ -150,7 +219,7 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
      <button className={full?'on':''} title="Full screen" onClick={()=>document.fullscreenElement?document.exitFullscreen():shell.current?.requestFullscreen()}>{full?<Minimize size={15}/>:<Maximize size={15}/>}</button></div></div>
    <div className="recon-stage">{model?<ModelView key={model.id} model={model} mode={mode} pointSize={pointSize} showCams={showCams}/>
     :<div className="det-empty"><Box size={46}/><p>{active?'Building the model… it appears here when done.':'Build a 3D model from this inspection’s photos or video.'}</p></div>}
-    {model&&<div className="ann-hint">Drag to orbit · right-drag to pan · wheel to zoom · camera button = show drone positions</div>}</div></div>
+    {model&&<div className="ann-hint">Drag to orbit · right-drag to pan · wheel to zoom · camera button = show positions · click a yellow point = source image</div>}</div></div>
   <div className="viewer-right"><div className="panel-head"><h2>Model quality</h2>{model&&<span className={'badge '+(placed!=null&&placed>=.8?'good':placed!=null&&placed>=.5?'fair':'poor')}>{placed!=null?`${Math.round(placed*100)}% placed`:'—'}</span>}</div>
    {model?<>
     <div className="info"><small>Images placed</small><b>{q.registered_images} / {q.images_total}</b></div>

@@ -22,8 +22,16 @@ function useMap(opts:L.MapOptions={}){
  return {el,map,ready};
 }
 
-const pinIcon=(s:MapSite,on:boolean)=>L.divIcon({className:'st-pin'+(on?' on':''),iconSize:[18,18],iconAnchor:[9,9],
- html:`<i class="${esc(s.status)}"></i><b>${esc(s.code)}</b>`});
+const towerSvg=`<svg viewBox="0 0 44 58" aria-hidden="true">
+ <ellipse class="st-tower-shadow" cx="22" cy="53" rx="17" ry="3"/>
+ <path class="st-tower-pad" d="M5 50.5 15 46.5 39 49.5 29 54.5Z"/>
+ <g class="st-tower-back"><path d="M15 48 22 5 35 49M22 5 9 52"/><path d="m17 38 15 2-13-12 11 1-9-10 7 1M15 47l18-7M17 38l-8 14M19 28 35 49M21 19 30 29"/></g>
+ <g class="st-tower-front"><path d="M9 52 22 5 29 54M9 52h20"/><path d="m12 42 15 2-12-12 10 2-8-12 6 2M12 42l17 12M15 32 9 22M17 22l8 12M20 12l3 12"/></g>
+ <g class="st-tower-depth"><path d="M9 52 15 48M29 54l6-5M12 42l5-4M27 44l5-4M15 32l4-4M25 34l5-5M17 22l4-3M23 24l5-4"/></g>
+ <path class="st-tower-platform" d="M15 18.5 20 16l10 1.5-5 3Z"/><path class="st-tower-mast" d="M21.3 6V1.5h1.5V6"/><circle class="st-tower-beacon" cx="22.05" cy="1.7" r="1.8"/>
+ </svg>`;
+const pinIcon=(s:MapSite,on:boolean)=>L.divIcon({className:'st-pin st-tower-pin'+(on?' on':''),iconSize:[44,58],iconAnchor:[22,53],
+ html:`<span class="st-tower ${esc(s.status)}">${towerSvg}</span><b>${esc(s.code)}</b>`});
 
 /** Every tower with coordinates; clicking one calls onSelect (the page opens its detail panel). */
 export function SitesMap({sites,selectedId,onSelect}:{sites:MapSite[];selectedId:number|null;onSelect:(id:number)=>void}){
@@ -34,7 +42,7 @@ export function SitesMap({sites,selectedId,onSelect}:{sites:MapSite[];selectedId
   layer.current?.remove();const g=L.layerGroup().addTo(m);layer.current=g;
   for(const s of sites.filter(located))
    L.marker([s.latitude!,s.longitude!],{icon:pinIcon(s,s.id===selectedId),riseOnHover:true,zIndexOffset:s.id===selectedId?1000:0,keyboard:true,title:`${s.code} · ${s.name}`})
-    .bindTooltip(`<b>${esc(s.code)}</b> · ${esc(s.name)}`,{direction:'top',offset:[0,-10]}).on('click',()=>onSelect(s.id)).addTo(g);
+    .bindTooltip(`<b>${esc(s.code)}</b> · ${esc(s.name)}`,{direction:'top',offset:[0,-45]}).on('click',()=>onSelect(s.id)).addTo(g);
   const key=sites.filter(located).map(s=>`${s.id}:${s.latitude},${s.longitude}`).join('|');
   if(key!==fitted.current){fitted.current=key;fit()}  // re-fit only when the set of locations changes, not on selection
   declutter();

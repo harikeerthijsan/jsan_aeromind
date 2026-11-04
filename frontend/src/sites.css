@@ -118,14 +118,14 @@
 .st-map-btn:hover{background:#f1f5f9}
 .st-map-legend{position:absolute;left:10px;bottom:22px;z-index:500;display:flex;gap:10px;background:#ffffffe6;border-radius:7px;padding:6px 9px;font-size:10.5px;color:#455a70;box-shadow:0 2px 6px #0f1f3118}
 .st-map-legend span{display:inline-flex;align-items:center;gap:5px}
-.st-map-legend i,.st-pin i{width:10px;height:10px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px #0f1f3140;background:#8fa0b2}
-.st-map-legend i.active,.st-pin i.active{background:#16835a}
-.st-map-legend i.maintenance,.st-pin i.maintenance{background:#d39b14}
-.st-map-legend i.decommissioned,.st-pin i.decommissioned{background:#c6463b}
-.st-pin{display:flex;align-items:center;justify-content:center}
-.st-pin i{display:block;width:16px;height:16px;flex-shrink:0;transition:transform .12s}
-.st-pin b{position:absolute;left:20px;top:50%;transform:translateY(-50%);white-space:nowrap;font:700 10.5px 'DM Sans',sans-serif;color:#172c46;background:#fff;border-radius:5px;padding:2px 6px;box-shadow:0 1px 4px #0f1f3133}
-.st-pin:hover i,.st-pin.on i{transform:scale(1.35)}
+.st-map-legend i{width:10px;height:10px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px #0f1f3140;background:#8fa0b2}
+.st-map-legend i.active{background:#16835a}.st-map-legend i.maintenance{background:#d39b14}.st-map-legend i.decommissioned{background:#c6463b}
+.st-pin{display:flex;align-items:center;justify-content:center;background:transparent;border:0}
+.st-tower{display:block;width:44px;height:58px;color:#48b3ee;transform-origin:50% 90%;transition:transform .16s ease,filter .16s ease;filter:drop-shadow(0 3px 2px #10263a42)}
+.st-tower svg{display:block;width:100%;height:100%;overflow:visible}.st-tower-shadow{fill:#10263a;opacity:.18}.st-tower-pad{fill:#dceff8;stroke:#fff;stroke-width:.75}.st-tower-back,.st-tower-front,.st-tower-depth{fill:none;stroke-linecap:round;stroke-linejoin:round}.st-tower-back{stroke:#8dd6f5;opacity:.9;stroke-width:1.65}.st-tower-front{stroke:#238cc8;stroke-width:2.1}.st-tower-depth{stroke:#51b5e8;opacity:.88;stroke-width:1.3}.st-tower-platform{fill:#1769aa;stroke:#e8f7ff;stroke-width:.65}.st-tower-mast{fill:none;stroke:#1769aa;stroke-width:1.3}.st-tower-beacon{fill:#ff695e;stroke:#fff;stroke-width:.7}
+.st-pin b{position:absolute;left:39px;top:22px;white-space:nowrap;font:700 10.5px 'DM Sans',sans-serif;color:#172c46;background:#fff;border:1px solid #e2e8ee;border-radius:6px;padding:3px 7px;box-shadow:0 3px 10px #0f1f3124;transition:background .15s,color .15s,border-color .15s}
+.st-pin:hover .st-tower,.st-pin.on .st-tower{transform:scale(1.16) translateY(-2px);filter:drop-shadow(0 5px 4px #10263a55)}
+.st-pin.on b{background:#1769aa;border-color:#1769aa;color:#fff;box-shadow:0 4px 12px #1769aa45}
 .st-pin.on b{background:#1769aa;color:#fff}
 .st-pick span{position:absolute;left:1px;top:0;width:24px;height:24px;background:#c6463b;border:2px solid #fff;border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 2px 6px #0f1f3155}
 .st-pick span:after{content:'';position:absolute;inset:6px;border-radius:50%;background:#fff}
