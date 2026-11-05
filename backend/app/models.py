@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, Float, DateTime, ForeignKey, Text, JSON, UniqueConstraint, Boolean
+from sqlalchemy import String, Integer, BigInteger, Float, DateTime, ForeignKey, Text, JSON, UniqueConstraint, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -54,7 +54,7 @@ class Media(Base):
     storage_key: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str] = mapped_column(String(128))
     sha256: Mapped[str] = mapped_column(String(64))
-    size_bytes: Mapped[int] = mapped_column(Integer)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)  # videos and point clouds can exceed 2 GB
     # a still frame extracted from an uploaded video (see frames.py); None for files uploaded directly
     parent_media_id: Mapped[int | None] = mapped_column(ForeignKey('media.id'), nullable=True, index=True)
     frame_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -229,6 +229,6 @@ class PointCloudFile(Base):
     filename: Mapped[str] = mapped_column(String(255))
     storage_key: Mapped[str] = mapped_column(String(500))
     file_format: Mapped[str] = mapped_column(String(16))  # extension without the dot: las, laz, ply, xyz, pts, txt, csv, lax, prj
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

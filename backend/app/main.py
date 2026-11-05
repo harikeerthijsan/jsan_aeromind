@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func, update, delete, inspect, text, and_, or_
+from sqlalchemy import select, func, update, delete, inspect, text, and_, or_, BigInteger
 from .database import Base, engine, SessionLocal
 from .models import PointCloudFile, Site, Inspection, Media, Asset, Defect, Job, Model3D, RegistrationCandidate, Detection, ImageReview, Annotation, now
 from . import detector, vendor, condition, frames, reconstruct, registration, storage, gpu, media_paths
@@ -49,6 +49,10 @@ def add_missing_columns():
             have={c['name'] for c in insp.get_columns(t.name)}
             for c in t.columns:
                 if c.name not in have and c.nullable:conn.execute(text(f'ALTER TABLE {t.name} ADD COLUMN {c.name} {c.type.compile(engine.dialect)}'))
+            if engine.dialect.name=='postgresql':  # widen INTEGER columns the models now declare BIGINT (SQLite integers are 64-bit already)
+                types={c['name']:str(c['type']).upper() for c in insp.get_columns(t.name)}
+                for c in t.columns:
+                    if isinstance(c.type,BigInteger) and types.get(c.name)=='INTEGER':conn.execute(text(f'ALTER TABLE {t.name} ALTER COLUMN {c.name} TYPE BIGINT'))
 def import_snapshot():
     """One-time move of a local installation: IMPORT_DB_FROM_BUCKET=<key of an SQLite file in the bucket> fills an empty
     database from it at startup (python -m app.migrate db, run where the database is reachable). Ignored once there is data."""
@@ -469,6 +473,7 @@ def start_chunked(inspection_id:int,body:ChunkedStartIn,db:Session=Depends(get_d
     return {'upload_id':uid,'part_size':UPLOAD_PART,'parts':parts}
 def _abort_chunked(s):
     if s['s3_id']:storage.multipart_abort(s['s3_key'],s['s3_id'])
+    if s.get('completed'):storage.delete(ROOT/s['key'])  # already assembled in the bucket: never leave an unlisted object behind
     (ROOT/s['key']).unlink(missing_ok=True)
 @app.put('/api/v1/chunked-uploads/{upload_id}/parts/{number}')
 async def chunked_part(upload_id:str,number:int,request:Request):
@@ -489,14 +494,14 @@ async def chunked_complete(upload_id:str,db:Session=Depends(get_db)):
     if not s:raise HTTPException(404,'Upload session not found (the server may have restarted); start the upload again')
     missing=[n for n in range(1,s['parts']+1) if n not in s['digests']]
     if missing:raise HTTPException(409,f'{len(missing)} part(s) missing, first {missing[0]}')
-    if s['s3_id']:await run_in_threadpool(storage.multipart_complete,s['s3_key'],s['s3_id'],s['etags'])
-    _chunked.pop(upload_id,None)
+    if s['s3_id'] and not s.get('completed'):await run_in_threadpool(storage.multipart_complete,s['s3_key'],s['s3_id'],s['etags'])
+    s['completed']=True  # a failed database write can be retried; cancelling now deletes the assembled file
     sha=hashlib.sha256(b''.join(s['digests'][n] for n in range(1,s['parts']+1))).hexdigest()  # digest of the 32 MB part digests
     if s['kind']=='pointcloud':
         x=PointCloudFile(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],file_format=s['ext'][1:],size_bytes=s['size'],sha256=sha)
-        db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
-    x=Media(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],content_type=s['content_type'],sha256=sha,size_bytes=s['size'])
-    db.add(x);db.commit();db.refresh(x);return to_dict(x)
+    else:x=Media(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],content_type=s['content_type'],sha256=sha,size_bytes=s['size'])
+    db.add(x);db.commit();db.refresh(x);_chunked.pop(upload_id,None)
+    return _pc_dict(x) if s['kind']=='pointcloud' else to_dict(x)
 @app.delete('/api/v1/chunked-uploads/{upload_id}',status_code=204)
 def chunked_cancel(upload_id:str):
     s=_chunked.pop(upload_id,None)

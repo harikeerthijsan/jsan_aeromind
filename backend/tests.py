@@ -1107,3 +1107,10 @@ def test_chunked_upload_local_and_bucket(monkeypatch):
         for n, b in ((2, b'4567'), (1, b'0123'), (3, b'89')): assert put(v['upload_id'], n, b).status_code == 200
         m = client.post(f"/api/v1/chunked-uploads/{v['upload_id']}/complete").json()
         assert m['content_type'] == 'video/mp4' and fake.o['uploads/' + m['storage_key']] == data
+
+def test_file_sizes_over_2_gb_fit():
+    from sqlalchemy import BigInteger
+    from app.models import Media, PointCloudFile
+    assert isinstance(Media.__table__.c.size_bytes.type, BigInteger) and isinstance(PointCloudFile.__table__.c.size_bytes.type, BigInteger)
+    from sqlalchemy.dialects import postgresql
+    assert PointCloudFile.__table__.c.size_bytes.type.compile(dialect=postgresql.dialect()) == 'BIGINT'
