@@ -537,6 +537,11 @@ VOTE_MAX_POINTS = 2_500_000  # voxel-thinned points used for voting (~3 cm apart
 VOTE_MIN_OBJECT = 12      # points an object needs (fewer: noise)
 VOTE_SPECIFIC = .8        # classes within this share of a point's best support compete; the most specific one wins
 VOTE_LINK = 1.8           # points closer than this many voxels belong to one object
+VOTE_MERGE_MIN = 3        # photos in which one detection box must hold two pieces before they are merged
+VOTE_MERGE_GAP_M = 1.0    # ... and the pieces must be this close (metres)
+VOTE_APART = .15          # ... and separate boxes may hold them in at most this share of the photos boxing both
+VOTE_MIN_EVIDENCE = 2     # photos whose same-class detection box must hold an object's centre
+VOTE_KEEP_SHARE = .45     # an object must be detected in at least this share of the best detection rate of its class
 
 def _voxel_thin(P, target):
     import numpy as np
@@ -632,30 +637,79 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
     close = ok & (ratio >= VOTE_SPECIFIC * top)
     best = np.where(close, -area[:, None], -np.inf).argmax(0); labelled = close.any(0)
     axis = np.median(to_view(V[labelled])[:, [0, 2]], 0) if labelled.any() else np.zeros(2)
-    out = []
+    parts = []
     for c, name in enumerate(classes):
         sel = np.flatnonzero(labelled & (best == c))
         if len(sel) < VOTE_MIN_OBJECT: continue
         pairs = cKDTree(V[sel]).query_pairs(voxel * VOTE_LINK, output_type='ndarray')
         g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(sel), len(sel)))
         k, comp = connected_components(g, directed=False)
-        parts = []
         for j in range(k):
             pts = sel[comp == j]
             if len(pts) < VOTE_MIN_OBJECT: continue
             n_obj = _instances(V[pts], name, shots, by_media, poses, cameras) if len(pts) >= 4 * VOTE_MIN_OBJECT else 1
-            lab = _split(V[pts], n_obj); parts += [pts[lab == i] for i in range(lab.max() + 1)]
-        for pts in parts:
-            if len(pts) < VOTE_MIN_OBJECT: continue
-            box = fit_box(to_view(V[pts]), axis)
-            if box is None: continue
-            out.append({'class_name': name, **box, 'box_method': 'dense', 'box_points': int(len(pts)), 'point_count': int(len(pts)),
-                        'media_count': int(votes[c, pts].max()), 'spread': float(np.median(np.linalg.norm(to_view(V[pts]) - box['position'], axis=1))),
-                        '_centre': np.median(V[pts], 0), '_score': float(ratio[c, pts].mean())})
-    out = _drop_fragments(_drop_overlaps(out), s)
+            lab = _split(V[pts], n_obj); parts += [(name, pts[lab == i]) for i in range(lab.max() + 1) if (lab == i).sum() >= VOTE_MIN_OBJECT]
+    parts = _merge_by_detections(parts, V, shots, by_media, poses, cameras)
+    out = []
+    for name, pts in parts:
+        c = cid[name]; box = fit_box(to_view(V[pts]), axis)
+        if box is None: continue
+        out.append({'class_name': name, **box, 'box_method': 'dense', 'box_points': int(len(pts)), 'point_count': int(len(pts)),
+                    'media_count': int(votes[c, pts].max()), 'spread': float(np.median(np.linalg.norm(to_view(V[pts]) - box['position'], axis=1))),
+                    '_centre': np.median(V[pts], 0), '_score': float(ratio[c, pts].mean())})
+    out = _drop_overlaps(out)
     _attach_detections(out, shots, by_media, poses, cameras)
+    out = _drop_fragments(out, s)
     for c in out: c.pop('_centre', None); c.pop('_score', None)
     return out
+
+def _merge_by_detections(parts, V, shots, by_media, poses, cameras):
+    """Clean up the voted pieces with the detections themselves. parts: [(class name, point indices)].
+    1. A real object is detected in a fair share of the photos that have it in view; a piece that only sometimes falls
+       inside a large box of its class (a ladder box covers much of the tower behind the ladder) is not. Pieces
+       detected in less than VOTE_KEEP_SHARE of the best rate of their class are dropped.
+    2. Pieces of one object (a ladder or cable run seen in parts, a cluster split once too often) sit inside the same
+       detection box, and are hardly ever boxed separately; neighbouring objects (antennas side by side) are, in the
+       photos that see them apart. Two same-class pieces less than VOTE_MERGE_GAP_M apart are merged when one box held
+       both in at least VOTE_MERGE_MIN photos and separate boxes held them in at most VOTE_APART of the photos that
+       boxed both."""
+    import numpy as np
+    from collections import Counter
+    from scipy.spatial import cKDTree
+    if not parts: return parts
+    X = np.array([np.median(V[p], 0) for _, p in parts]); cls = [n for n, _ in parts]
+    inview, held = np.zeros(len(parts), int), np.zeros(len(parts), int)
+    same, both = Counter(), Counter()
+    for m, name in shots:
+        pose = poses[name]; cam = cameras[pose[3]]; uv, z = project(X, pose[4], pose[5], cam); front = z > 0
+        inview += front & (uv[:, 0] >= 0) & (uv[:, 0] < cam[2]) & (uv[:, 1] >= 0) & (uv[:, 1] < cam[3])
+        holders = {}  # piece -> ids of the same-class boxes holding its centre in this photo
+        for d in by_media[m.id]:
+            x1, x2, y1, y2 = _box_px(d, cam)
+            for i in np.flatnonzero(front & (uv[:, 0] >= x1) & (uv[:, 0] <= x2) & (uv[:, 1] >= y1) & (uv[:, 1] <= y2)):
+                if cls[i] == d.class_name: holders.setdefault(int(i), set()).add(d.id)
+        ids = sorted(holders)
+        for i in ids: held[i] += 1
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                if cls[ids[a]] == cls[ids[b]]:
+                    both[ids[a], ids[b]] += 1
+                    if holders[ids[a]] & holders[ids[b]]: same[ids[a], ids[b]] += 1
+    rate = held / np.maximum(inview, 1)
+    best = {c: max(rate[i] for i in range(len(parts)) if cls[i] == c) for c in set(cls)}
+    keep = [i for i in range(len(parts)) if held[i] >= VOTE_MIN_EVIDENCE and rate[i] >= VOTE_KEEP_SHARE * best[cls[i]]]
+    trees = {i: cKDTree(V[parts[i][1]]) for i in keep}
+    root = {i: i for i in keep}
+    def find(i):
+        while root[i] != i: root[i] = root[root[i]]; i = root[i]
+        return i
+    for (a, b), n in same.items():
+        if a in root and b in root and n >= VOTE_MERGE_MIN and both[a, b] - n <= VOTE_APART * both[a, b] and np.linalg.norm(X[a] - X[b]) < 8 \
+                and trees[a].query(V[parts[b][1]], distance_upper_bound=VOTE_MERGE_GAP_M)[0].min() < VOTE_MERGE_GAP_M:
+            root[find(a)] = find(b)
+    groups = {}
+    for i in keep: groups.setdefault(find(i), []).append(i)
+    return [(cls[g[0]], np.concatenate([parts[i][1] for i in g])) for g in groups.values()]
 
 def _instances(P, name, shots, by_media, poses, cameras, step=3):
     """How many separate objects of this class a cluster of points is: in the photos that frame it, the number of
