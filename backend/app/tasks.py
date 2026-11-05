@@ -28,10 +28,48 @@ def _annotate():
 # ---------- detection ----------
 _frames_lock = threading.Lock()
 
+PREFETCH = max(1, int(os.getenv('DETECT_PREFETCH', '8')))  # photos downloaded in parallel ahead of the detector
+
+class _Prefetch:
+    """Downloads the next photos from the bucket while YOLO works on the current one (YOLO needs ~0.04 s per photo
+    on the GPU, one download ~1.8 s), keeping at most `window` files ahead. In bucket mode a photo this job had to
+    download is deleted right after detection, so a large job never piles up on the local disk."""
+    def __init__(self, keys, workers=PREFETCH, window=PREFETCH * 2):
+        from concurrent.futures import ThreadPoolExecutor
+        self.keys, self.window, self.next = list(dict.fromkeys(keys)), window, 0
+        self.pool = ThreadPoolExecutor(workers, thread_name_prefix='prefetch') if storage.enabled() else None
+        self.jobs, self.fresh = {}, set()
+        self._fill(0)
+    def _fill(self, upto):
+        while self.pool and self.next < len(self.keys) and self.next < upto + self.window:
+            k = self.keys[self.next]; self.next += 1
+            if not (ROOT / k).is_file(): self.fresh.add(k)
+            self.jobs[k] = self.pool.submit(storage.fetch, ROOT / k)
+    def get(self, key):
+        if key in self.jobs:
+            fut = self.jobs.pop(key); self._fill(self.keys.index(key) + 1)
+            try: return fut.result()
+            except Exception: pass  # a failed parallel download (network hiccup) is retried once below
+        return storage.fetch(ROOT / key)
+    def done(self, key):
+        if key in self.fresh and storage.bucket_only(): (ROOT / key).unlink(missing_ok=True); self.fresh.discard(key)
+    def close(self):
+        if self.pool:
+            for f in self.jobs.values(): f.cancel()
+            self.pool.shutdown(wait=True)
+            for k in list(self.fresh):
+                if storage.bucket_only(): (ROOT / k).unlink(missing_ok=True)
+
 def detect(payload, progress):
     """payload: {'model', 'items': [{id, filename, content_type, storage_key, frames: [{id, storage_key}] | None}]}
     -> {'files': [{id, ok, error, new_frames: [...], targets: [{media_id | frame_index, w, h, boxes}]}]}"""
     items, out = payload['items'], []
+    ahead = [m['storage_key'] for m in items if m['content_type'].startswith('image/')] + [f['storage_key'] for m in items for f in (m.get('frames') or [])]
+    pre = _Prefetch(ahead)
+    try: return _detect(items, out, progress, pre)
+    finally: pre.close()
+
+def _detect(items, out, progress, pre):
     for n, m in enumerate(items, 1):
         res = {'id': m['id'], 'ok': True, 'error': None, 'new_frames': [], 'targets': []}
         try:
@@ -51,8 +89,9 @@ def detect(payload, progress):
             for k, t in enumerate(targets, 1):
                 progress('detection', int(((n - 1) + (k - 1) / len(targets)) * 100 / len(items)),
                          f"Detecting in {m['filename']}" + (f' · frame {k}/{len(targets)}' if len(targets) > 1 or 'frame_index' in t else '') + f' ({n}/{len(items)})')
-                for _, w, h, boxes in detector.detect(storage.fetch(ROOT / t['storage_key']), False):
+                for _, w, h, boxes in detector.detect(pre.get(t['storage_key']), False):
                     res['targets'].append({**{k2: t[k2] for k2 in ('media_id', 'frame_index') if k2 in t}, 'w': w, 'h': h, 'boxes': boxes})
+                pre.done(t['storage_key'])
         except Exception as e:  # one unreadable file shouldn't hide every other file's results
             res.update(ok=False, error=f"{m['filename']}: {e}"[:200], targets=[], new_frames=[])
         out.append(res)

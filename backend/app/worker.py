@@ -64,7 +64,10 @@ def lane_loop(lane, http=None):
             if str(e) != last_error: log(f'[{lane}] cannot reach {SERVER}: {e}'); last_error = str(e)
             _stop.wait(10); continue
         tid, kind = task['id'], task['kind']; t0 = time.time(); log(f'[{lane}] task {tid} {kind}')
-        def progress(stage, pct, detail):
+        last = {'t': 0.0, 'stage': None}
+        def progress(stage, pct, detail):  # at most every 2 s (each report is a round trip to the server), always on a new stage
+            if stage == last['stage'] and time.time() - last['t'] < 2: return
+            last.update(t=time.time(), stage=stage)
             try: http.post(f'/api/v1/worker/tasks/{tid}/progress', json={'stage': stage, 'pct': int(pct), 'detail': detail})
             except Exception: pass  # progress is best effort
         try:
