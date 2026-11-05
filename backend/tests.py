@@ -1050,3 +1050,23 @@ def test_storage_namespace_bucket_mode_stream_and_trim(monkeypatch, tmp_path):
         freed = storage.trim_cache(max_bytes=1500)  # in-use folders do not count
     assert (busy / 'big.bin').exists() and freed >= 1000
     assert fake.o.get('dev/uploads/local-only.bin') == b'y' * 1000 or (root / 'local-only.bin').exists()  # pushed before removal
+
+def test_cancel_upload_deletes_unprocessed_media_only():
+    import os
+    from pathlib import Path
+    from app.database import SessionLocal
+    from app.models import Detection
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'cancel'}).json()
+        up = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('a.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')}).json()
+        path = Path(os.environ['UPLOAD_DIR']) / up['storage_key']; assert path.is_file()
+        assert client.delete(f"/api/v1/media/{up['id']}").status_code == 204 and not path.exists()
+        assert client.get(f"/api/v1/inspections/{ins['id']}/media").json() == []
+        assert client.delete(f"/api/v1/media/{up['id']}").status_code == 404
+        done = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('b.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')}).json()
+        from app.models import Job
+        with SessionLocal() as db:
+            j = Job(inspection_id=ins['id'], kind='detection', status='completed', stage='detection'); db.add(j); db.flush()
+            db.add(Detection(job_id=j.id, inspection_id=ins['id'], media_id=done['id'], frame_index=0, class_id=0, class_name='rru', confidence=.9,
+                             x1=0, y1=0, x2=1, y2=1, image_width=2, image_height=2, model_name='t')); db.commit()
+        r = client.delete(f"/api/v1/media/{done['id']}"); assert r.status_code == 409 and 'detections' in r.json()['detail']  # processed: kept

@@ -478,6 +478,21 @@ def _pc_apply(db,r,job_id,model_id):
     db.commit();return {'model_id':m3.id,'status':m3.status}
 def _pc_fail(db,error,job_id,model_id):_recon_fail(db,error,job_id,model_id,True)
 gpu.register('run_pointcloud_model',prepare=_pc_prepare,apply=_pc_apply,fail=_pc_fail,progress=lambda *a,**k:_job_progress(*a,**k))  # defined further down
+@app.delete('/api/v1/media/{media_id}',status_code=204)
+def delete_media(media_id:int,db:Session=Depends(get_db)):
+    """Remove an upload (and the frames extracted from it): used to cancel an upload. Refused once the file has been
+    processed or reviewed (detections, approved boxes), so review work is never lost this way."""
+    m=db.get(Media,media_id)
+    if not m:raise HTTPException(404,'Media not found')
+    items=[m,*db.scalars(select(Media).where(Media.parent_media_id==m.id)).all()];ids=[x.id for x in items]
+    for model,label in ((Detection,'detections'),(Annotation,'approved boxes'),(ImageReview,'reviews')):
+        if db.scalar(select(func.count()).select_from(model).where(model.media_id.in_(ids))):
+            raise HTTPException(409,f'{m.filename} already has {label}; it can no longer be removed as an upload')
+    for x in items:
+        path=ROOT/x.storage_key;path.unlink(missing_ok=True);storage.delete(path)
+        for t in THUMB_DIR.glob(f'{x.id}_*.jpg') if THUMB_DIR.is_dir() else []:t.unlink(missing_ok=True)
+    for x in sorted(items,key=lambda x:x.parent_media_id is None):db.delete(x)  # frames before their video
+    db.commit();return Response(status_code=204)
 @app.get('/api/v1/inspections/{inspection_id}/media')
 def media(inspection_id:int,db:Session=Depends(get_db)):
     return [to_dict(m)|{'url':f'/uploads/{m.storage_key}'} for m in db.scalars(select(Media).where(Media.inspection_id==inspection_id)).all()]

@@ -35,3 +35,14 @@ export async function request<T>(path:string, options:RequestInit={}):Promise<T>
 }
 export const json=(method:string,body:unknown):RequestInit=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 export async function download(path:string,filename:string){const headers=new Headers();const token=getAuthToken();if(token)headers.set('Authorization',`Bearer ${token}`);const r=await fetch(API+path,{headers,credentials:'include'});if(!r.ok)throw Error((await r.text()).slice(0,250));const url=URL.createObjectURL(await r.blob());const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;document.body.appendChild(anchor);anchor.click();anchor.remove();URL.revokeObjectURL(url)}
+/** Upload one file with byte progress and a way to cancel it (fetch has neither). Rejects with name 'AbortError' when cancelled. */
+export function uploadFile<T>(path:string,file:File,onProgress:(loaded:number,total:number)=>void,signal?:AbortSignal):Promise<T>{
+ return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST',API+path);x.withCredentials=true;
+  const t=getAuthToken();if(t)x.setRequestHeader('Authorization',`Bearer ${t}`);
+  const abort=()=>x.abort();signal?.addEventListener('abort',abort,{once:true});
+  x.upload.onprogress=e=>onProgress(e.loaded,e.total||file.size);
+  x.onabort=()=>reject(Object.assign(Error('Upload cancelled'),{name:'AbortError'}));
+  x.onerror=()=>reject(Error(`Network error while uploading ${file.name}`));
+  x.onload=()=>{signal?.removeEventListener('abort',abort);if(x.status>=200&&x.status<300)resolve(JSON.parse(x.responseText));
+   else{let d=x.responseText;try{d=JSON.parse(d).detail}catch{/* plain text */}if(x.status===401)window.dispatchEvent(new Event('aeromind-auth-expired'));reject(Error(`${file.name}: ${d||x.status}`))}};
+  const body=new FormData();body.append('file',file);x.send(body)})}
