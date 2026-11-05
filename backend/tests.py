@@ -1114,3 +1114,26 @@ def test_file_sizes_over_2_gb_fit():
     assert isinstance(Media.__table__.c.size_bytes.type, BigInteger) and isinstance(PointCloudFile.__table__.c.size_bytes.type, BigInteger)
     from sqlalchemy.dialects import postgresql
     assert PointCloudFile.__table__.c.size_bytes.type.compile(dialect=postgresql.dialect()) == 'BIGINT'
+
+def test_cancel_queued_job_only(monkeypatch):
+    """A second click queues a duplicate job: it can be cancelled while it waits; a job the worker already took cannot."""
+    from app import gpu
+    from app.database import SessionLocal
+    from app.models import WorkerTask, Job, Model3D
+    monkeypatch.setattr(gpu, 'REMOTE', True)
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'twice'}).json()
+        with SessionLocal() as db:
+            jobs = [Job(inspection_id=ins['id'], status='queued', stage='reconstruction', progress=0, detail='Queued') for _ in range(2)]
+            db.add_all(jobs); db.flush()
+            for j in jobs: db.add(Model3D(inspection_id=ins['id'], job_id=j.id, status='queued'))
+            tasks = [WorkerTask(kind='run_pointcloud_model', lane='long', payload={'job_id': j.id, 'model_id': 0}) for j in jobs]
+            db.add_all(tasks); db.flush(); tasks[0].status = 'running'; jobs[0].status = 'running'; db.commit()
+            ids, tids = [j.id for j in jobs], [t.id for t in tasks]
+        assert client.post(f'/api/v1/jobs/{ids[0]}/cancel').status_code == 409          # running on the GPU
+        r = client.post(f'/api/v1/jobs/{ids[1]}/cancel'); assert r.status_code == 200 and r.json()['status'] == 'cancelled'
+        assert client.post(f'/api/v1/jobs/{ids[1]}/cancel').status_code == 409          # nothing left to cancel
+        assert client.post('/api/v1/jobs/999999/cancel').status_code == 404
+        with SessionLocal() as db:
+            assert db.get(WorkerTask, tids[1]).status == 'failed' and db.get(WorkerTask, tids[0]).status == 'running'
+            assert db.query(Model3D).filter_by(job_id=ids[1]).one().status == 'cancelled'

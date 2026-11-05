@@ -1,6 +1,6 @@
 import {useState} from 'react';
-import {AlertTriangle,ArrowRight,Box,CheckCircle2,Clock3,Cpu,RefreshCw,Search} from 'lucide-react';
-import {Inspection,Job,Site} from './api';
+import {AlertTriangle,ArrowRight,Box,CheckCircle2,Clock3,Cpu,RefreshCw,Search,X} from 'lucide-react';
+import {Inspection,Job,Site,request} from './api';
 import './processing.css';
 
 type Filter='all'|'active'|'completed'|'failed';
@@ -8,7 +8,9 @@ type Props={jobs:Job[];inspections:Inspection[];sites:Site[];onRefresh:()=>void;
 const jobName=(job:Job)=>job.kind==='reconstruction'?'3D reconstruction':job.kind==='detection'?'AI detection':(job.kind||'Processing job').replaceAll('_',' ');
 
 export default function ProcessingPage({jobs,inspections,sites,onRefresh,go,selectSite}:Props){
- const [query,setQuery]=useState(''),[filter,setFilter]=useState<Filter>('all');
+ const [query,setQuery]=useState(''),[filter,setFilter]=useState<Filter>('all'),[cancelling,setCancelling]=useState<number|null>(null),[error,setError]=useState('');
+ async function cancel(job:Job){if(!confirm(`Cancel JOB-${String(job.id).padStart(4,'0')} (${jobName(job)})? It has not started yet.`))return;setCancelling(job.id);setError('');
+  try{await request(`/api/v1/jobs/${job.id}/cancel`,{method:'POST'});onRefresh()}catch(e){setError(String((e as Error).message||e))}finally{setCancelling(null)}}
  const inspectionOf=(job:Job)=>inspections.find(inspection=>inspection.id===job.inspection_id);
  const siteOf=(job:Job)=>{const inspection=inspectionOf(job);return sites.find(site=>site.id===inspection?.site_id)};
  const active=jobs.filter(job=>['queued','running','awaiting_worker'].includes(job.status)).length,completed=jobs.filter(job=>job.status==='completed').length,failed=jobs.filter(job=>job.status==='failed').length;
@@ -25,10 +27,11 @@ export default function ProcessingPage({jobs,inspections,sites,onRefresh,go,sele
   <section className="pc-panel">
    <div className="pc-panel-head"><div><h2>Processing jobs</h2><p>Detection and reconstruction work across inspections</p></div><button onClick={onRefresh}><RefreshCw size={14}/>Refresh</button></div>
    <div className="pc-toolbar"><label><Search size={15}/><input value={query} onChange={event=>setQuery(event.target.value)} placeholder="Search jobs, inspections or towers"/></label><div>{(['all','active','completed','failed'] as Filter[]).map(value=><button key={value} className={filter===value?'on':''} onClick={()=>setFilter(value)}>{value[0].toUpperCase()+value.slice(1)}</button>)}</div></div>
+   {error&&<div className="pc-cancel-error"><AlertTriangle size={14}/>{error}</div>}
    <div className="pc-list">{rows.map(job=>{const inspection=inspectionOf(job),site=siteOf(job),isActive=['queued','running','awaiting_worker'].includes(job.status),status=job.status==='awaiting_worker'?'waiting':job.status.replaceAll('_',' ');return <article key={job.id} className={'pc-job '+(isActive?'active':job.status)}>
     <span className="pc-job-icon">{job.kind==='reconstruction'?<Box size={19}/>:<Cpu size={19}/>}</span>
     <div className="pc-job-main"><div><b>{jobName(job)}</b><span>JOB-{String(job.id).padStart(4,'0')}</span></div><p>{inspection?.label||`Inspection ${job.inspection_id}`}{site&&<> · {site.code} · {site.name}</>}</p><small>{job.detail||'No processing detail available.'}</small></div>
-    <div className="pc-job-stage"><span>{job.stage.replaceAll('_',' ')}</span><div><i style={{width:`${Math.max(job.progress,isActive?3:0)}%`}}/></div><small>{job.progress}%</small></div>
+    <div className="pc-job-stage"><span>{job.stage.replaceAll('_',' ')}</span><div><i style={{width:`${Math.max(job.progress,isActive?3:0)}%`}}/></div><small>{job.progress}%</small>{['queued','awaiting_worker'].includes(job.status)&&<button className="pc-job-cancel" disabled={cancelling===job.id} onClick={()=>cancel(job)} title="Cancel this job before it starts"><X size={12}/>{cancelling===job.id?'Cancelling…':'Cancel'}</button>}</div>
     <span className={'pc-status '+(isActive?'active':job.status)}><i/>{status}</span>
     <button className="pc-open" onClick={()=>open(job)} aria-label={`Open ${jobName(job)}`}><ArrowRight size={15}/></button>
    </article>})}

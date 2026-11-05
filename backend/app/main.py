@@ -628,6 +628,22 @@ gpu.register('run_detection',prepare=_detection_prepare,apply=_detection_apply,f
 def run_detection(job_id:int):gpu.run_local('run_detection',{'job_id':job_id})
 @app.get('/api/v1/jobs')
 def jobs(db:Session=Depends(get_db)):return [to_dict(x) for x in db.scalars(select(Job).order_by(Job.id.desc())).all()]
+@app.post('/api/v1/jobs/{job_id}/cancel')
+def cancel_job(job_id:int,db:Session=Depends(get_db)):
+    """Cancel a job still waiting for the GPU worker (e.g. a second click). A job already running there cannot be stopped part-way."""
+    from .models import WorkerTask
+    job=db.get(Job,job_id)
+    if not job:raise HTTPException(404,'Job not found')
+    if not gpu.REMOTE:raise HTTPException(409,'Jobs run in this server process here and cannot be cancelled')
+    tasks=[t for t in db.scalars(select(WorkerTask).where(WorkerTask.status.in_(('queued','running')))).all() if (t.payload or {}).get('job_id')==job_id]
+    if any(t.status=='running' for t in tasks) or job.status=='running':raise HTTPException(409,'This job is already running on the GPU worker and cannot be stopped part-way')
+    if not tasks:raise HTTPException(409,f'Job is {job.status.replace("_"," ")}, not waiting in the queue')
+    done=db.execute(update(WorkerTask).where(WorkerTask.id.in_([t.id for t in tasks]),WorkerTask.status=='queued')
+                    .values(status='failed',error={'status':499,'detail':'Cancelled'},finished_at=now())).rowcount
+    if done!=len(tasks):db.rollback();raise HTTPException(409,'The GPU worker picked this job up just now')
+    job.status='cancelled';job.stage='cancelled';job.detail='Cancelled before it started'
+    for m in db.scalars(select(Model3D).where(Model3D.job_id==job_id)).all():m.status='cancelled'
+    db.commit();return to_dict(job)
 @app.get('/api/v1/jobs/{job_id}')
 def job_detail(job_id:int,db:Session=Depends(get_db)):
     x=db.get(Job,job_id)

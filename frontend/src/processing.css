@@ -9,3 +9,5 @@
 
 /* Slightly larger labels and metadata while preserving the dense job layout. */
 .pc-summary small{font-size:9px}.pc-panel-head h2{font-size:15px}.pc-panel-head p{font-size:9px}.pc-panel-head>button{font-size:9px}.pc-toolbar input{font-size:10px}.pc-toolbar>div button{font-size:9px}.pc-job-main b{font-size:11px}.pc-job-main>div span{font-size:9px}.pc-job-main p{font-size:9.5px}.pc-job-main small{font-size:9px}.pc-job-stage>span{font-size:9px}.pc-job-stage small{font-size:8px}.pc-status{font-size:8.5px}.pc-empty b{font-size:11px}.pc-empty span,.pc-empty button{font-size:9px}.pc-flow h3{font-size:11px}.pc-flow p,.pc-flow li{font-size:9px}.pc-flow li span{font-size:8px}
+.pc-job-cancel{display:inline-flex;align-items:center;gap:4px;margin:6px 0 0 8px;padding:3px 8px;border:1px solid #f1c7c7;border-radius:8px;background:#fff;color:#b42318;font-size:9px;font-weight:700;cursor:pointer}.pc-job-cancel:hover{background:#fef3f2}.pc-job-cancel:disabled{opacity:.6;cursor:default}
+.pc-cancel-error{display:flex;align-items:center;gap:7px;margin:0 0 10px;padding:9px 12px;border-radius:8px;background:#fef3f2;color:#b42318;font-size:13px}
