@@ -152,11 +152,11 @@ def _clusters(rows, radius):
                        'detection_ids': [rows[i]['detection_id'] for i in members]})
     return result
 
-def build_candidates(work: Path, transform, media, detections, dense_path: Path | None = None, reviewed_media=(), refine_poses=False):
+def build_candidates(work: Path, transform, media, detections, dense_path: Path | None = None, reviewed_media=(), metadata_cameras=False, progress=None):
     """Return reviewable candidate dicts in the same coordinate frame as web/*.ply.
     Detections on photos a reviewer approved are used whatever their confidence (the class floor is for raw YOLO output).
-    refine_poses: the camera poses come from drone metadata (no COLMAP solve): they are corrected from a first pass
-    before the boxes are placed (see refine_rotations)."""
+    metadata_cameras: a point cloud model whose camera poses come from drone metadata: every detection counts, whatever
+    its confidence, and objects are found by voting on the cloud's points (vote_candidates)."""
     import numpy as np
     work = Path(work); sparse = work/'sparse'/'0'
     if not sparse.is_dir():
@@ -169,9 +169,18 @@ def build_candidates(work: Path, transform, media, detections, dense_path: Path 
     photo_names = {m.id:f'photos/{i:05d}{Path(m.storage_key).suffix.lower()}' for i,m in enumerate(photos)}
     by_media = defaultdict(list)
     for d in detections:
-        if d.media_id in photo_names and (d.media_id in reviewed_media or (d.confidence or 0) >= rule_for(d.class_name)['confidence']): by_media[d.media_id].append(d)
+        if d.media_id in photo_names and (metadata_cameras or d.media_id in reviewed_media or (d.confidence or 0) >= rule_for(d.class_name)['confidence']): by_media[d.media_id].append(d)
     by_media = {media_id: _nms(boxes) for media_id, boxes in by_media.items()}
     if not by_media: return []
+    if metadata_cameras and dense_path and Path(dense_path).is_file():
+        converter = _convert_model(sparse); txt = next(converter)
+        try:
+            out = vote_candidates(reconstruct.read_ply(dense_path)['points'], M, photos, photo_names, by_media, _read_images(txt/'images.txt'),
+                                  _read_camera_models(txt/'cameras.txt'), progress)
+        finally:
+            try: converter.close()
+            except Exception: pass
+        return sorted(out, key=lambda c: (c['class_name'], -c['confidence'], -c['media_count']))
 
     converter = _convert_model(sparse); txt = next(converter)
     try:
@@ -207,11 +216,7 @@ def build_candidates(work: Path, transform, media, detections, dense_path: Path 
             for c in _clusters(rows, rule_for(class_name)['radius']): out.append({'class_name':class_name,**c})
         out = add_boxes(out)
         if dense_path and Path(dense_path).is_file():  # place, group and size everything from the dense cloud instead
-            dense_pts, cams = reconstruct.read_ply(dense_path)['points'], _read_camera_models(txt/'cameras.txt')
-            if refine_poses:
-                groups = []; dense_candidates(dense_pts, M, photos, photo_names, by_media, observations, cams, groups_out=groups)
-                observations = refine_rotations(observations, cams, groups)
-            out = dense_candidates(dense_pts, M, photos, photo_names, by_media, observations, cams)
+            out = dense_candidates(reconstruct.read_ply(dense_path)['points'], M, photos, photo_names, by_media, observations, _read_camera_models(txt/'cameras.txt'))
         return sorted(out,key=lambda c:(c['class_name'],-c['confidence'],-c['media_count']))
     finally:
         try: converter.close()
@@ -340,9 +345,8 @@ def _group(rows, radius_of):
         if len(set(media[members].tolist())) >= 2: groups.append(members.tolist())
     return groups
 
-def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, cameras, groups_out=None):
-    """Candidates (viewer coordinates, with fitted boxes) from the dense cloud; see the comment above.
-    groups_out: filled with (model-space centre, [(photo name, detection)]) of every group, for refine_rotations."""
+def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, cameras):
+    """Candidates (viewer coordinates, with fitted boxes) from the dense cloud; see the comment above."""
     import numpy as np
     M = np.asarray(M, float); s = float(np.linalg.norm(M[:3, 0])); Rm, T = M[:3, :3] / s, M[:3, 3]
     to_view = lambda X: s * (np.atleast_2d(X) @ Rm.T) + T
@@ -377,56 +381,12 @@ def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, c
         obj = c.pop('_obj'); box = fit_box(obj, axis) if obj is not None else None
         if box: c.update(box, box_method='dense', box_points=int(len(obj)))
         fit_to_detections(c, c['_views'], poses, cameras, M, move_centre=c['class_name'] not in SURFACE_ANCHORED_CLASSES)
-    if groups_out is not None:
-        groups_out.extend((((np.asarray(c['position']) - T) @ Rm) / s, c['_views']) for c in out if len(c['_views']) >= 3)
-        return []
     out = merge_duplicate_candidates(out, poses, cameras, M)
     clean = []
     for c in out:
         c.pop('_views', None)
         if candidate_is_valid(c): clean.append(c)
     return clean
-
-# ---------- camera rotations from drone metadata ----------
-# Gimbal angles are good to about a degree: tens of pixels at 20-30 m, enough to split one antenna's detections into
-# several groups. Each photo's rotation is corrected (camera centre kept: RTK positions are cm-accurate) so the
-# first-pass group centres project onto that photo's detection boxes, like a bundle adjustment on the equipment.
-REFINE_MAX_DEG = 3.0
-REFINE_HUBER_PX = 25.0
-
-def _rotvec(w):
-    import numpy as np
-    a = float(np.linalg.norm(w))
-    if a < 1e-12: return np.eye(3)
-    k = w / a; K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-    return np.eye(3) + math.sin(a) * K + (1 - math.cos(a)) * K @ K
-
-def refine_rotations(poses, cameras, groups, min_matches=3):
-    """poses: name -> (xy, ids, centre, camera id, R, t) -> the same with each photo's R, t corrected (small rotation,
-    robust least squares on detection-box centres). Photos with too few matched groups keep their metadata pose."""
-    import numpy as np
-    obs = defaultdict(list)
-    for X, views in groups:
-        for name, det in views: obs[name].append((X, ((det.x1 + det.x2) / 2, (det.y1 + det.y2) / 2)))
-    out = dict(poses)
-    for name, pairs in obs.items():
-        if len(pairs) < min_matches or name not in poses: continue
-        xy, ids, C, cid, R0, _ = poses[name]; cam = cameras[cid]
-        X = np.array([p[0] for p in pairs]); u = np.array([p[1] for p in pairs], float)
-        def residual(w):
-            R = _rotvec(w) @ R0; uv, z = project(X, R, -R @ C, cam); return (uv - u).ravel(), z
-        def cost(r): a = np.abs(r); return float(np.sum(np.where(a <= REFINE_HUBER_PX, .5 * a * a, REFINE_HUBER_PX * (a - .5 * REFINE_HUBER_PX))))
-        w = np.zeros(3); r, z = residual(w)
-        if (z <= 0).any(): continue
-        start = cost(r)
-        for _ in range(8):  # Gauss-Newton with Huber weights; numeric Jacobian (3 unknowns)
-            J = np.stack([(residual(w + e)[0] - r) / 1e-6 for e in np.eye(3) * 1e-6], 1)
-            wt = np.where(np.abs(r) <= REFINE_HUBER_PX, 1.0, REFINE_HUBER_PX / np.maximum(np.abs(r), 1e-9))
-            step = np.linalg.lstsq(J * wt[:, None] ** .5, -r * wt ** .5, rcond=None)[0]; w = w + step; r, z = residual(w)
-            if np.linalg.norm(step) < 1e-7: break
-        if math.degrees(np.linalg.norm(w)) > REFINE_MAX_DEG or (z <= 0).any() or cost(r) >= start: continue
-        R = _rotvec(w) @ R0; out[name] = (xy, ids, C, cid, R, -R @ C)
-    return out
 
 def _candidate_box_iou(a, b):
     """IoU of two detection records that belong to the same source image."""
@@ -562,3 +522,205 @@ def fit_to_detections(c, views, poses, cameras, M, rounds=4, move_centre=True):
         ious.append(inter / (bw * bh + np.prod(hi - lo) - inter))
     c['fit_iou'] = float(np.median(ious)) if ious else 0.0
     return c
+
+# ---------- point voting (cameras from drone metadata + an uploaded point cloud) ----------
+# Each detection says "this class is somewhere inside this rectangle". Every cloud point visible in a photo (z-buffer)
+# collects a vote for each class whose box it falls in. A point that is inside, say, RRU boxes in a good share of the
+# photos that see it belongs to an RRU; connected points of one class are one physical object, so an object seen in 30
+# photos is still one box (no duplicates) and its box is fitted to the real points. All detections count, whatever
+# their confidence: agreement between several photos is what makes a point.
+VOTE_CELL_PX = 8          # z-buffer / box raster cell (full-resolution pixels)
+VOTE_VISIBLE_M = .30      # a point within this distance behind the nearest surface in its cell counts as visible
+VOTE_MIN = 2              # votes (photos) a point needs for a class
+VOTE_RATIO = .35          # ... and this share of the photos that see it
+VOTE_MAX_POINTS = 2_500_000  # voxel-thinned points used for voting (~3 cm apart around a tower)
+VOTE_MIN_OBJECT = 12      # points an object needs (fewer: noise)
+VOTE_SPECIFIC = .8        # classes within this share of a point's best support compete; the most specific one wins
+VOTE_LINK = 1.8           # points closer than this many voxels belong to one object
+
+def _voxel_thin(P, target):
+    import numpy as np
+    size = .02
+    while True:
+        keys = np.floor(P / size).astype(np.int64); _, first = np.unique(keys, axis=0, return_index=True)
+        if len(first) <= target: return P[np.sort(first)], size
+        size *= 1.4
+
+def _vote(V, shots, by_media, poses, cameras, cid, progress=None):
+    """votes (classes, N) and seen (N) counts; on the GPU with PyTorch when available (the worker has it), else numpy."""
+    import numpy as np
+    try:
+        import torch
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    except ImportError: torch = None
+    nc, N = len(cid), len(V)
+    if torch is not None:
+        Vt = torch.as_tensor(V, dtype=torch.float32, device=dev)
+        votes = torch.zeros((nc, N), dtype=torch.int16, device=dev); seen = torch.zeros(N, dtype=torch.int16, device=dev)
+    else: votes = np.zeros((nc, N), np.int16); seen = np.zeros(N, np.int16)
+    for n, (m, name) in enumerate(shots):
+        pose = poses[name]; cam = cameras[pose[3]]; W, H = cam[2], cam[3]
+        cols, rows = int(math.ceil(W / VOTE_CELL_PX)), int(math.ceil(H / VOTE_CELL_PX))
+        lab = np.zeros((rows, cols), np.int64)
+        for d in by_media[m.id]:
+            x1, x2, y1, y2 = _box_px(d, cam)
+            c0, c1 = max(0, int(x1 // VOTE_CELL_PX)), min(cols, int(math.ceil(x2 / VOTE_CELL_PX)))
+            r0, r1 = max(0, int(y1 // VOTE_CELL_PX)), min(rows, int(math.ceil(y2 / VOTE_CELL_PX)))
+            if c1 > c0 and r1 > r0: lab[r0:r1, c0:c1] |= 1 << cid[d.class_name]
+        present = [c for c in range(nc) if (np.bitwise_or.reduce(lab, axis=None) >> c) & 1]
+        if torch is not None:
+            R = torch.as_tensor(pose[4], dtype=torch.float32, device=dev); t = torch.as_tensor(pose[5], dtype=torch.float32, device=dev)
+            uv, z = _project_torch(Vt, R, t, cam)
+            idx = torch.nonzero((z > .5) & (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)).squeeze(1)
+            if not len(idx): continue
+            cu = (uv[idx, 0] // VOTE_CELL_PX).long(); cv = (uv[idx, 1] // VOTE_CELL_PX).long(); cell = cv * cols + cu; zi = z[idx]
+            zmin = torch.full((rows * cols,), float('inf'), device=dev).scatter_reduce_(0, cell, zi, 'amin')
+            vis = zi <= zmin[cell] + VOTE_VISIBLE_M; idx, cu, cv = idx[vis], cu[vis], cv[vis]
+            seen[idx] += 1
+            if present:
+                bits = torch.as_tensor(lab, device=dev)[cv, cu]
+                for c in present: votes[c, idx[(bits >> c) & 1 == 1]] += 1
+        else:
+            uv, z = project(V, pose[4], pose[5], cam)
+            idx = np.flatnonzero((z > .5) & (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H))
+            if not len(idx): continue
+            cu = (uv[idx, 0] // VOTE_CELL_PX).astype(np.int64); cv = (uv[idx, 1] // VOTE_CELL_PX).astype(np.int64); cell = cv * cols + cu
+            zmin = np.full(rows * cols, np.inf); np.minimum.at(zmin, cell, z[idx])
+            vis = z[idx] <= zmin[cell] + VOTE_VISIBLE_M; idx, cu, cv = idx[vis], cu[vis], cv[vis]
+            seen[idx] += 1
+            bits = lab[cv, cu]
+            for c in present: votes[c, idx[(bits >> c) & 1 == 1]] += 1
+        if progress and n % 100 == 0: progress(f'Voting: photo {n + 1}/{len(shots)}')
+    if torch is not None: votes, seen = votes.cpu().numpy(), seen.cpu().numpy()
+    return votes, seen
+
+def _project_torch(X, R, t, cam):
+    """project() on the GPU (same camera models)."""
+    import torch
+    model, p, _, _ = cam
+    Xc = X @ R.T + t; z = Xc[:, 2]; zs = torch.where(z.abs() < 1e-9, torch.full_like(z, 1e-9), z); x, y = Xc[:, 0] / zs, Xc[:, 1] / zs
+    if model in ('SIMPLE_PINHOLE', 'SIMPLE_RADIAL', 'RADIAL', 'SIMPLE_RADIAL_FISHEYE', 'RADIAL_FISHEYE'):
+        fx = fy = p[0]; cx, cy = p[1], p[2]; k1 = p[3] if len(p) > 3 else 0.0; k2 = p[4] if len(p) > 4 else 0.0; p1 = p2 = 0.0
+    elif model == 'PINHOLE': fx, fy, cx, cy = p[:4]; k1 = k2 = p1 = p2 = 0.0
+    else: fx, fy, cx, cy = p[:4]; k1, k2, p1, p2 = (list(p[4:8]) + [0.0] * 4)[:4]
+    r2 = x * x + y * y; radial = 1 + k1 * r2 + k2 * r2 * r2
+    xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x); yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    return torch.stack([fx * xd + cx, fy * yd + cy], 1), z
+
+def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, cameras, progress=None):
+    """Candidates (viewer coordinates) from per-point class votes; see above. dense_model_pts: the structure's points
+    in model (metre) coordinates."""
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+    M = np.asarray(M, float); s = float(np.linalg.norm(M[:3, 0])); Rm, T = M[:3, :3] / s, M[:3, 3]
+    to_view = lambda X: s * (np.atleast_2d(X) @ Rm.T) + T
+    V, voxel = _voxel_thin(np.asarray(dense_model_pts, float), VOTE_MAX_POINTS)
+    classes = sorted({d.class_name for boxes in by_media.values() for d in boxes}); cid = {c: i for i, c in enumerate(classes)}
+    if not classes or len(V) < VOTE_MIN_OBJECT: return []
+    shots = [(m, photo_names[m.id]) for m in photos if m.id in by_media and photo_names.get(m.id) in poses]
+    votes, seen = _vote(V, shots, by_media, poses, cameras, cid, progress)
+    # how specific each class's boxes are: the median share of the photo one box covers (RRU << antenna frame)
+    area = np.array([np.median([(d.x2 - d.x1) * (d.y2 - d.y1) / max(1.0, (d.image_width or 1) * (d.image_height or 1))
+                                for b in by_media.values() for d in b if d.class_name == c]) for c in classes])
+    ratio = votes / np.maximum(seen, 1)
+    ok = (votes >= VOTE_MIN) & (ratio >= VOTE_RATIO)
+    top = np.where(ok, ratio, 0).max(0)
+    # among the classes a point qualifies for with nearly the best support, the most specific one: a big box (an
+    # antenna) usually also covers the RRUs and dishes mounted behind it, and must not swallow them
+    close = ok & (ratio >= VOTE_SPECIFIC * top)
+    best = np.where(close, -area[:, None], -np.inf).argmax(0); labelled = close.any(0)
+    axis = np.median(to_view(V[labelled])[:, [0, 2]], 0) if labelled.any() else np.zeros(2)
+    out = []
+    for c, name in enumerate(classes):
+        sel = np.flatnonzero(labelled & (best == c))
+        if len(sel) < VOTE_MIN_OBJECT: continue
+        pairs = cKDTree(V[sel]).query_pairs(voxel * VOTE_LINK, output_type='ndarray')
+        g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(sel), len(sel)))
+        k, comp = connected_components(g, directed=False)
+        parts = []
+        for j in range(k):
+            pts = sel[comp == j]
+            if len(pts) < VOTE_MIN_OBJECT: continue
+            n_obj = _instances(V[pts], name, shots, by_media, poses, cameras) if len(pts) >= 4 * VOTE_MIN_OBJECT else 1
+            lab = _split(V[pts], n_obj); parts += [pts[lab == i] for i in range(lab.max() + 1)]
+        for pts in parts:
+            if len(pts) < VOTE_MIN_OBJECT: continue
+            box = fit_box(to_view(V[pts]), axis)
+            if box is None: continue
+            out.append({'class_name': name, **box, 'box_method': 'dense', 'box_points': int(len(pts)), 'point_count': int(len(pts)),
+                        'media_count': int(votes[c, pts].max()), 'spread': float(np.median(np.linalg.norm(to_view(V[pts]) - box['position'], axis=1))),
+                        '_centre': np.median(V[pts], 0), '_score': float(ratio[c, pts].mean())})
+    out = _drop_fragments(_drop_overlaps(out), s)
+    _attach_detections(out, shots, by_media, poses, cameras)
+    for c in out: c.pop('_centre', None); c.pop('_score', None)
+    return out
+
+def _instances(P, name, shots, by_media, poses, cameras, step=3):
+    """How many separate objects of this class a cluster of points is: in the photos that frame it, the number of
+    same-class detection boxes whose centre lies inside its outline (upper quartile over the photos that show any:
+    side views and partly hidden objects show fewer)."""
+    import numpy as np
+    S = P if len(P) <= 300 else P[np.random.default_rng(0).choice(len(P), 300, replace=False)]; counts = []
+    for m, pname in shots[::step]:
+        pose = poses[pname]; cam = cameras[pose[3]]; uv, z = project(S, pose[4], pose[5], cam)
+        if (z <= 0).any() or uv[:, 0].max() < 0 or uv[:, 0].min() > cam[2] or uv[:, 1].max() < 0 or uv[:, 1].min() > cam[3]: continue
+        (u0, v0), (u1, v1) = np.percentile(uv, 5, 0), np.percentile(uv, 95, 0)
+        k = 0
+        for d in by_media[m.id]:
+            if d.class_name != name: continue
+            x1, x2, y1, y2 = _box_px(d, cam); cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            if u0 <= cx <= u1 and v0 <= cy <= v1: k += 1
+        if k: counts.append(k)
+    return int(round(float(np.percentile(counts, 75)))) if len(counts) >= 3 else 1
+
+def _split(P, k):
+    """Labels splitting a cluster into k objects (k-means, initialised along its longest horizontal extent)."""
+    import numpy as np
+    from scipy.cluster.vq import kmeans2
+    if k <= 1 or len(P) < 2 * k * VOTE_MIN_OBJECT: return np.zeros(len(P), int)
+    _, labels = kmeans2(P - P.mean(0), k, minit='++', seed=0)
+    return labels
+
+def _drop_fragments(cands, s):
+    """A small piece of one class right next to a bigger box of the same class is part of that object, not another."""
+    keep = []
+    for c in sorted(cands, key=lambda c: -c['point_count']):
+        big = [k for k in keep if k['class_name'] == c['class_name'] and k['point_count'] >= 4 * c['point_count']]
+        near = any(max(abs(c['position'][i] - k['position'][i]) - k[sz] / 2 for i, sz in ((0, 'size_w'), (1, 'size_h'), (2, 'size_d'))) <= .3 * s
+                   for k in big)  # within 30 cm of the bigger box (viewer units: s per metre)
+        if not near: keep.append(c)
+    return keep
+
+def _drop_overlaps(cands):
+    """Two classes voted on one object (e.g. part of an RRU also inside antenna boxes): keep the box with more points
+    when two boxes of different classes share most of their volume."""
+    def overlap(a, b):
+        lo = [max(a['position'][i] - a[k] / 2, b['position'][i] - b[k] / 2) for i, k in ((0, 'size_w'), (1, 'size_h'), (2, 'size_d'))]
+        hi = [min(a['position'][i] + a[k] / 2, b['position'][i] + b[k] / 2) for i, k in ((0, 'size_w'), (1, 'size_h'), (2, 'size_d'))]
+        inter = math.prod(max(0.0, h - l) for l, h in zip(lo, hi)); small = min(a['size_w'] * a['size_h'] * a['size_d'], b['size_w'] * b['size_h'] * b['size_d'])
+        return inter / small if small > 0 else 0.0
+    keep = []
+    for c in sorted(cands, key=lambda c: -c['point_count']):
+        if not any(k['class_name'] != c['class_name'] and overlap(c, k) > .6 for k in keep): keep.append(c)
+    return keep
+
+def _attach_detections(cands, shots, by_media, poses, cameras):
+    """Each box's supporting detections: in every photo, the same-class box that contains the object's centre."""
+    import numpy as np
+    if not cands: return
+    X = np.array([c['_centre'] for c in cands]); hits = [[] for _ in cands]
+    for m, name in shots:
+        pose = poses[name]; cam = cameras[pose[3]]; uv, z = project(X, pose[4], pose[5], cam)
+        for d in by_media[m.id]:
+            x1, x2, y1, y2 = _box_px(d, cam)
+            for i in np.flatnonzero((z > 0) & (uv[:, 0] >= x1) & (uv[:, 0] <= x2) & (uv[:, 1] >= y1) & (uv[:, 1] <= y2)):
+                if cands[i]['class_name'] == d.class_name: hits[i].append((m.id, d))
+    for c, h in zip(cands, hits):
+        best = {}
+        for media_id, d in h:
+            if media_id not in best or (d.confidence or 0) > (best[media_id].confidence or 0): best[media_id] = d
+        ds = list(best.values())
+        c.update(detection_ids=[d.id for d in ds], evidence_count=len(ds), media_count=max(c['media_count'], len(ds)),
+                 confidence=float(min(.99, np.mean([d.confidence or 0 for d in ds]))) if ds else round(c['_score'], 3), fit_iou=None)

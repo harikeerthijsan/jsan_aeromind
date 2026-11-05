@@ -219,17 +219,17 @@ def dense_stage(work, img, best, progress, log, base=50):
     extra = {'dense': True, 'dense_points': int(len(cloud['points'])), 'mesh_faces': int(len(mesh['faces'])) if mesh['faces'] is not None else 0}
     return cloud, mesh, extra, {'dense_ply': 'dense/fused.ply', 'mesh_ply': 'dense/mesh.ply'}
 
-def export_web(work, M, cloud, mesh, cams):
+def export_web(work, M, cloud, mesh, cams, max_points=None):
     """Levelled, centred, thinned copies for the viewer, plus the camera path."""
     import numpy as np
-    web = work / 'web'; web.mkdir(exist_ok=True); P, Cc = cloud['points'], cloud['colors']
-    if len(P) > WEB_POINTS:
-        keep = np.random.default_rng(0).choice(len(P), WEB_POINTS, replace=False); P, Cc = P[keep], (Cc[keep] if Cc is not None else None)
+    web = work / 'web'; web.mkdir(exist_ok=True); P, Cc = cloud['points'], cloud['colors']; max_points = max_points or WEB_POINTS
+    if len(P) > max_points:
+        keep = np.random.default_rng(0).choice(len(P), max_points, replace=False); P, Cc = P[keep], (Cc[keep] if Cc is not None else None)
     write_ply(web / 'points.ply', _apply(M, P).astype(np.float32), Cc)
     if mesh is not None: write_ply(web / 'mesh.ply', _apply(M, mesh['points']).astype(np.float32), mesh['colors'], mesh['faces'])
     (web / 'cameras.json').write_text(json.dumps([{'name': c['name'], 'center': _apply(M, np.array([c['center']]))[0].round(4).tolist(),
                                                     'dir': (np.array(c['dir']) @ M[:3, :3].T / np.linalg.norm(M[:3, 0])).round(4).tolist()} for c in cams]))
-    return {'web_points': 'web/points.ply', 'web_cameras': 'web/cameras.json', **({'web_mesh': 'web/mesh.ply'} if mesh is not None else {})}, int(min(len(cloud['points']), WEB_POINTS))
+    return {'web_points': 'web/points.ply', 'web_cameras': 'web/cameras.json', **({'web_mesh': 'web/mesh.ply'} if mesh is not None else {})}, int(min(len(cloud['points']), max_points))
 
 def run(work, photos, videos, dense, progress):
     """Full pipeline in `work`. progress(stage, percent, detail). Returns a result dict (files are relative to work)."""

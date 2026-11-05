@@ -525,10 +525,9 @@ def build_pointcloud_model(inspection_id:int,background:BackgroundTasks,db:Sessi
     if colmap_state()=='worker_offline':raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
     items=db.scalars(select(Media).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None))).all()
     photos=[m for m in items if m.content_type.startswith('image/')]
-    use=_flight_photos(photos)  # 300 across the whole flight keep the 3D-box step well inside one web request
-    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in use],
-            detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), '
-                   +(f'{len(use)} of {len(photos)} photos spread over the flight' if len(use)<len(photos) else f'{len(photos)} photo(s)'))
+    # every photo: their poses are read from metadata (no COLMAP image limit) and each one adds votes for the 3D boxes
+    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in photos],
+            detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), {len(photos)} photo(s)')
     db.add(job);db.flush();m3=Model3D(inspection_id=inspection_id,job_id=job.id,dense=True,status='queued',quality={'source':'pointcloud'});db.add(m3);db.commit()
     gpu.start(background,'run_pointcloud_model',job_id=job.id,model_id=m3.id);return to_dict(job)|{'model_id':m3.id}
 def _pc_prepare(db,job_id,model_id):
@@ -1005,7 +1004,7 @@ def _register_prepare(db,model_id):
     reviewed=db.scalars(select(ImageReview.media_id).where(ImageReview.inspection_id==inspection.id,ImageReview.status=='approved',ImageReview.frame_index==0)).all()
     # a dense model made from a sparse one has no camera model of its own: use the source build's
     return {'work':quality.get('source_model_dir') or f'{inspection.id}_{model.job_id}','transform':transform,'reviewed':sorted(set(reviewed)),
-            'refine_poses':quality.get('camera_source')=='metadata',
+            'metadata_cameras':quality.get('camera_source')=='metadata',
             'dense':f'{inspection.id}_{model.job_id}/'+(quality.get('files') or {}).get('dense_ply','dense/fused.ply'),
             'media':[{k:getattr(m,k) for k in ('id','parent_media_id','content_type','filename','storage_key')} for m in media],
             'detections':[{k:getattr(d,k) for k in ('id','media_id','class_name','confidence','x1','y1','x2','y2','image_width','image_height')} for d in detections]}

@@ -143,6 +143,11 @@ def _cloud_sources(keys):
             sources.append((p.name, storage.fetch(p))); temp.append(p)
     return sources, temp
 
+FOCUS_RADIUS_M = 12.0              # around the structure the photos look at: every point kept (up to pointcloud.FOCUS_POINTS)
+SURROUNDING_POINTS = 1_500_000     # the rest of the cropped area (ground, trees) for context
+WEB_FOCUS_POINTS = 2_500_000       # viewer: the structure ...
+WEB_SURROUNDING_POINTS = 500_000   # ... and its surroundings
+
 def need_disk(nbytes, why):
     """Stop with a clear message instead of failing half way when the GPU machine's disk is nearly full."""
     free = shutil.disk_usage(ROOT if ROOT.exists() else ROOT.anchor).free
@@ -186,12 +191,14 @@ def _pointcloud_model(payload, progress, work):
             r = float(np.percentile(np.linalg.norm(C[:, :2] - T[:2], axis=1), 95)) + pc.ROI_MARGIN_M / 4  # the structure and its surroundings
             roi = (T[0] - r, T[0] + r, T[1] - r, T[1] + r)
         progress('reading_cloud', 5, 'Reading the point cloud')
-        cloud = pc.read_clouds(sources, pc.MODEL_POINTS, roi, progress=lambda msg: progress('reading_cloud', 10, msg))
+        focus = (T[0], T[1], FOCUS_RADIUS_M) if use_photos else None  # the structure keeps its full detail; surroundings are thinned
+        cloud = pc.read_clouds(sources, SURROUNDING_POINTS if focus else pc.MODEL_POINTS, roi, progress=lambda msg: progress('reading_cloud', 10, msg), focus=focus)
         origin = np.median(cloud['points'], 0); L = cloud['points'] - origin  # local metres (float precision)
         info = {'files': [Path(k).name for k in payload['clouds']], 'points_total': cloud['total'], 'points_used': cloud['kept'],
                 'crs': cloud['crs'].name if cloud['crs'] is not None else None, 'units': cloud['units'], 'origin': [round(float(v), 3) for v in origin],
                 'cropped_to_flight': roi is not None}
-        (work / 'dense').mkdir(exist_ok=True); reconstruct.write_ply(work / 'dense' / 'fused.ply', L.astype(np.float32), cloud['colors'])
+        F = cloud['focus'] if focus else np.ones(len(L), bool)  # the structure: what the 3D-box step works on
+        (work / 'dense').mkdir(exist_ok=True); reconstruct.write_ply(work / 'dense' / 'fused.ply', L[F].astype(np.float32), cloud['colors'][F])
         if use_photos:
             progress('cameras', 80, f'Placing {len(cams)} photos on the point cloud')
             for c in cams: c['C'] = c['C'] - origin
@@ -206,13 +213,15 @@ def _pointcloud_model(payload, progress, work):
             pp.write_text_model(work / 'sparse' / '0', cams, [n for n, _ in posed])
             on_cloud = pp.check(cams, L)
             progress('exporting', 92, 'Preparing the model for the viewer')
-            web_files, n_web = reconstruct.export_web(work, M, {'points': L, 'colors': cloud['colors']}, None,
-                                                      [{'name': n, 'center': c['C'].tolist(), 'dir': c['R'][2].tolist()} for (n, _), c in zip(posed, cams)])
+            rng = np.random.default_rng(0); idx_f, idx_r = np.flatnonzero(F), np.flatnonzero(~F)  # viewer: the structure first
+            web = np.r_[rng.choice(idx_f, min(len(idx_f), WEB_FOCUS_POINTS), replace=False), rng.choice(idx_r, min(len(idx_r), WEB_SURROUNDING_POINTS), replace=False)]
+            web_files, n_web = reconstruct.export_web(work, M, {'points': L[web], 'colors': cloud['colors'][web]}, None,
+                                                      [{'name': n, 'center': c['C'].tolist(), 'dir': c['R'][2].tolist()} for (n, _), c in zip(posed, cams)], max_points=len(web))
             info['cameras'] = {'source': 'photo metadata (RTK position, gimbal angles, lens calibration)', **pinfo, 'photos': len(cams),
                                'rtk_fixed': sum(m['rtk'] for _, m in posed), 'on_cloud_pct': on_cloud,
                                'takeoff_above_ground_m': round(takeoff, 2) if takeoff is not None else None}
             result = {'registered_images': len(cams), 'images_total': len(photos), 'sparse_points': 0, 'mean_reprojection_error_px': None,
-                      'dense': True, 'dense_points': int(len(L)), 'mesh_faces': 0, 'sparse_model': 'sparse/0', 'camera_source': 'metadata',
+                      'dense': True, 'dense_points': int(F.sum()), 'mesh_faces': 0, 'sparse_model': 'sparse/0', 'camera_source': 'metadata',
                       'files': {'dense_ply': 'dense/fused.ply', 'log': 'colmap.log', **web_files}, 'web_points': n_web,
                       'transform': M.round(8).tolist(), 'boxes_available': True,
                       'scale': {'m_per_unit': round(1 / s, 6), 'method': 'pointcloud', 'rtk': all(m['rtk'] for _, m in posed), 'cameras': len(cams),
@@ -295,7 +304,8 @@ def register_assets(payload, progress=None):
     for d in folders: storage.fetch_tree(d, skip=('images',))  # built elsewhere
     try:
         out = registration.build_candidates(work, payload['transform'], [NS(**m) for m in payload['media']], [NS(**d) for d in payload['detections']],
-                                            dense if dense.is_file() else None, set(payload['reviewed']), refine_poses=payload.get('refine_poses', False))
+                                            dense if dense.is_file() else None, set(payload['reviewed']),
+                                            metadata_cameras=payload.get('metadata_cameras', False), progress=lambda msg: progress and progress('registration', 50, msg))
     except Exception as e: raise HTTPException(500, f'2D to 3D registration failed: {e}')
     finally:
         if storage.bucket_only():  # the model stays in the bucket; the copy fetched for this step is not kept

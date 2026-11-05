@@ -94,24 +94,35 @@ def _colours(chunk, names):
     if 'intensity' in names: return np.asarray(chunk.intensity, np.float32)  # greyscale later, once its range is known
     return None
 
-def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None):
+FOCUS_POINTS = 6_000_000     # points kept around the structure itself (focus), on top of max_points for the surroundings
+
+class _Pool:
+    """Points kept from a stream, thinned evenly (progressively, memory stays bounded) to about `budget`."""
+    def __init__(self, budget, rng): self.budget, self.rng, self.p, self.parts, self.cols = budget, rng, 1.0, [], []
+    def add(self, P, C):
+        if self.p < 1.0:
+            m = self.rng.random(len(P)) < self.p; P, C = P[m], (C[m] if C is not None else None)
+        self.parts.append(P); self.cols.append(C)
+        while sum(len(x) for x in self.parts) > 2 * self.budget:
+            for i in range(len(self.parts)):
+                m = self.rng.random(len(self.parts[i])) < .5; self.parts[i] = self.parts[i][m]; self.cols[i] = self.cols[i][m] if self.cols[i] is not None else None
+            self.p *= .5
+
+def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None, focus=None):
     """Points in metres (float64, (N,3)) from all clouds, thinned evenly to about max_points; roi = (xmin, xmax, ymin,
-    ymax) in metres of the CRS keeps only that area. Returns {'points', 'colors' (uint8 or None), 'crs', 'total',
-    'kept', 'units'}."""
+    ymax) in metres of the CRS keeps only that area. focus = (x, y, radius): points that close to the structure are
+    kept at up to FOCUS_POINTS on their own, so the structure keeps its full detail while the surroundings are thinned.
+    Returns {'points', 'colors' (uint8 or None), 'focus' (bool per point), 'crs', 'total', 'kept', 'units'}."""
     import numpy as np
-    rng = np.random.default_rng(0); keep_p = 1.0; parts, cols, total = [], [], 0
+    rng = np.random.default_rng(0); total = 0
     crs = None; units = 'metre'; intensity = False
+    rest, near = _Pool(max_points, rng), _Pool(FOCUS_POINTS, rng)
     def add(P, C):
-        nonlocal keep_p
         if roi is not None:
             m = (P[:, 0] >= roi[0]) & (P[:, 0] <= roi[1]) & (P[:, 1] >= roi[2]) & (P[:, 1] <= roi[3]); P, C = P[m], (C[m] if C is not None else None)
-        if keep_p < 1.0:
-            m = rng.random(len(P)) < keep_p; P, C = P[m], (C[m] if C is not None else None)
-        parts.append(P); cols.append(C)
-        while sum(len(x) for x in parts) > 2 * max_points:  # progressive thinning keeps memory bounded
-            for i in range(len(parts)):
-                m = rng.random(len(parts[i])) < .5; parts[i] = parts[i][m]; cols[i] = cols[i][m] if cols[i] is not None else None
-            keep_p *= .5
+        if focus is None: rest.add(P, C); return
+        m = (P[:, 0] - focus[0]) ** 2 + (P[:, 1] - focus[1]) ** 2 <= focus[2] ** 2
+        near.add(P[m], C[m] if C is not None else None); rest.add(P[~m], C[~m] if C is not None else None)
     clouds = [s for s in map(_source, paths) if Path(s[0]).suffix.lower() in CLOUD_EXT]
     if not clouds: raise CloudError('no point cloud file (.las, .laz, .ply, .xyz, .pts, .txt, .csv)')
     prj = _prj_crs(paths)
@@ -153,18 +164,23 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None):
             _, fh, fv = _crs_parts(prj); crs = crs or prj; total += len(arr)
             C = arr[:, -3:].clip(0, 255).astype(np.uint8) if arr.shape[1] >= 6 else None
             add(arr[:, :3] * [fh, fh, fv], C)
-    P = np.concatenate(parts) if parts else np.zeros((0, 3))
+    def finish(pool):
+        P = np.concatenate(pool.parts) if pool.parts else np.zeros((0, 3))
+        C = np.concatenate([c if c.ndim == 2 else c[:, None] for c in pool.cols]) if pool.cols and all(c is not None for c in pool.cols) else None
+        if len(P) > pool.budget:
+            k = rng.choice(len(P), pool.budget, replace=False); P = P[k]; C = C[k] if C is not None else None
+        return P, C
+    (Pn, Cn), (Pr, Cr) = finish(near), finish(rest)
+    P = np.concatenate([Pn, Pr]); in_focus = np.r_[np.ones(len(Pn), bool), np.zeros(len(Pr), bool)]
     if len(P) == 0: raise CloudError('the point cloud has no points' + (' near the drone photos (it may cover a different area)' if roi else ''))
-    has_c = all(c is not None for c in cols)
-    C = np.concatenate([c if c.ndim == 2 else c[:, None] for c in cols]) if has_c else None
-    if len(P) > max_points:
-        k = rng.choice(len(P), max_points, replace=False); P = P[k]; C = C[k] if C is not None else None
+    filled = [(p, c) for p, c in ((Pn, Cn), (Pr, Cr)) if len(p)]
+    C = np.concatenate([c for _, c in filled]) if all(c is not None for _, c in filled) else None
     if C is not None and C.shape[1] == 1:  # intensity -> grey
         lo, hi = np.percentile(C[:, 0], [2, 98]); g = ((C[:, 0] - lo) / max(hi - lo, 1e-9) * 200 + 40).clip(0, 255).astype(np.uint8); C = np.c_[g, g, g]
     if C is None: C = height_colours(P[:, 2])
     if crs is not None:
         h, _, _ = _crs_parts(crs); units = h.axis_info[0].unit_name if h and h.axis_info else 'metre'
-    return {'points': P, 'colors': C, 'crs': crs, 'total': int(total), 'kept': int(len(P)), 'units': units}
+    return {'points': P, 'colors': C, 'focus': in_focus, 'crs': crs, 'total': int(total), 'kept': int(len(P)), 'units': units}
 
 def height_colours(z):
     """Blue -> green -> yellow by height, for clouds without colour or intensity."""

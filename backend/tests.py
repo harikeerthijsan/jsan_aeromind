@@ -1235,3 +1235,30 @@ def test_remote_file_reads_ranges_across_blocks(monkeypatch, tmp_path):
     assert storage.read_head(root / 'big.las', 16) == data[:16] and storage.read_bytes(root / 'big.las') == data
     assert not (root / 'big.las').exists()  # nothing was saved locally
     assert storage.open_remote(root / 'missing.las') is None
+
+def test_vote_boxes_one_per_object_any_confidence():
+    """Point voting (point cloud models): an RRU and an antenna seen by 8 photos give exactly one box each, from
+    low-confidence detections too, with the class that covers their points."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('scipy')
+    from types import SimpleNamespace as NS
+    from app import registration as R
+    rng = np.random.default_rng(0)
+    def block(c, size, n): return c + (rng.random((n, 3)) - .5) * size
+    rru, ant = block(np.array([0, 0, 0.0]), [.4, .4, .5], 3000), block(np.array([1.5, 0, .3]), [.4, .15, 1.6], 6000)
+    P = np.r_[rru, ant]; W, H, f = 2000, 1500, 1500.0; cam = ('PINHOLE', [f, f, W / 2, H / 2], W, H)
+    poses, photos, by_media, names = {}, [], {}, {}
+    for i, a in enumerate(np.linspace(0, 2 * np.pi, 8, endpoint=False)):
+        C = np.array([.75 + 8 * np.cos(a), 8 * np.sin(a), 1.0]); fwd = np.array([.75, 0, 0]) - C; fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, [0, 0, 1.0]); right /= np.linalg.norm(right); down = np.cross(fwd, right); Rw = np.vstack([right, down, fwd])
+        name = f'photos/{i:05d}.jpg'; poses[name] = (None, None, C, 1, Rw, -Rw @ C); m = NS(id=i + 1); photos.append(m); names[m.id] = name
+        dets = []
+        for k, (pts, cls) in enumerate(((rru, 'rru'), (ant, 'sector_antenna'))):
+            uv, _ = R.project(pts, Rw, -Rw @ C, cam); (x1, y1), (x2, y2) = uv.min(0), uv.max(0)
+            dets.append(NS(id=i * 10 + k, media_id=m.id, class_name=cls, confidence=.12, x1=x1, y1=y1, x2=x2, y2=y2, image_width=W, image_height=H))
+        by_media[m.id] = dets
+    Mz = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1.0]])  # model Z up -> viewer Y up, as in the app
+    out = R.vote_candidates(P, Mz, photos, names, by_media, poses, {1: cam})
+    assert sorted(c['class_name'] for c in out) == ['rru', 'sector_antenna'], [(c['class_name'], c['point_count']) for c in out]
+    a = next(c for c in out if c['class_name'] == 'sector_antenna')
+    assert abs(a['size_h'] - 1.6) < .3 and np.allclose(a['position'], [1.5, .3, 0], atol=.15)
+    assert all(c['media_count'] >= 4 and len(c['detection_ids']) >= 4 for c in out)
