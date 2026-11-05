@@ -30,6 +30,12 @@ _frames_lock = threading.Lock()
 
 PREFETCH = max(1, int(os.getenv('DETECT_PREFETCH', '8')))  # photos downloaded in parallel ahead of the detector
 
+def fetch_all(keys):
+    """Local paths of stored files, in order, downloaded PREFETCH at a time (one download ~1.8 s; a build needs hundreds)."""
+    if not storage.enabled() or len(keys) < 2: return [storage.fetch(ROOT / k) for k in keys]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(PREFETCH, thread_name_prefix='fetch') as pool: return list(pool.map(lambda k: storage.fetch(ROOT / k), keys))
+
 class _Prefetch:
     """Downloads the next photos from the bucket while YOLO works on the current one (YOLO needs ~0.04 s per photo
     on the GPU, one download ~1.8 s), keeping at most `window` files ahead. In bucket mode a photo this job had to
@@ -110,7 +116,7 @@ def reconstruct_model(payload, progress):
                 r = reconstruct.densify(src, work, progress, payload['source']['quality'] or {})
             else:
                 if storage.enabled(): progress('downloading', 1, f"Fetching {len(payload['photos']) + len(payload['videos'])} file(s) from storage")
-                photos = [storage.fetch(ROOT / k) for k in payload['photos']]; videos = [storage.fetch(ROOT / k) for k in payload['videos']]
+                photos = fetch_all(payload['photos']); videos = [storage.fetch(ROOT / k) for k in payload['videos']]
                 r = reconstruct.run(work, photos, videos, payload['dense'], progress)
             src_scale = (payload.get('source') or {}).get('quality', {}).get('scale')
             if src_scale: r['scale'] = src_scale  # a dense model keeps its sparse model's viewer frame, so the same scale
@@ -134,7 +140,7 @@ def pointcloud_model(payload, progress):
     with _recon_lock, storage.in_use(work):
         try:
             progress('downloading', 1, f"Fetching {len(payload['clouds'])} point cloud file(s) and {len(payload['photos'])} photo(s)")
-            clouds = [storage.fetch(ROOT / k) for k in payload['clouds']]; photos = [storage.fetch(ROOT / k) for k in payload['photos']]
+            clouds = [storage.fetch(ROOT / k) for k in payload['clouds']]; photos = fetch_all(payload['photos'])
             crs = pc.peek_crs(clouds)
             names = [f'photos/{i:05d}{Path(p).suffix.lower()}' for i, p in enumerate(photos[:reconstruct.MAX_IMAGES])]
             gps = {n: sc.read_position(p) for n, p in zip(names, photos)}; gps = {n: g for n, g in gps.items() if g and g.get('alt') is not None}

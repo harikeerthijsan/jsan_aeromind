@@ -526,8 +526,10 @@ def build_pointcloud_model(inspection_id:int,background:BackgroundTasks,db:Sessi
     items=db.scalars(select(Media).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None))).all()
     photos=[m for m in items if m.content_type.startswith('image/')]
     if len(photos)>=3 and s!='ready':raise HTTPException(503,f'COLMAP {s.replace("_"," ")}: needed to place the photos on the point cloud')
-    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in photos],
-            detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), {len(photos)} photo(s)')
+    use=_flight_photos(photos)
+    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in use],
+            detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), '
+                   +(f'{len(use)} of {len(photos)} photos spread over the flight' if len(use)<len(photos) else f'{len(photos)} photo(s)'))
     db.add(job);db.flush();m3=Model3D(inspection_id=inspection_id,job_id=job.id,dense=True,status='queued',quality={'source':'pointcloud'});db.add(m3);db.commit()
     gpu.start(background,'run_pointcloud_model',job_id=job.id,model_id=m3.id);return to_dict(job)|{'model_id':m3.id}
 def _pc_prepare(db,job_id,model_id):
@@ -861,6 +863,12 @@ def site_inventory(site_id:int,inspection_id:int|None=None,db:Session=Depends(ge
         'images_total':len(images),'images_approved':sum(i['status']=='approved' for i in images),'items':sum(len(i['items']) for i in images),
         'items_with_defects':issues,'grades':dict(grades),'manufacturers':dict(makers.most_common()),'defect_types':dict(defect_types.most_common()),'verified':dict(verified),
         'by_class':sorted(({**c,'manufacturers':dict(c['manufacturers'].most_common()),'grades':dict(c['grades'])} for c in by_class.values()),key=lambda c:-c['count'])}}
+def _flight_photos(photos):
+    """At most RECON_MAX_IMAGES photos, spread evenly over the whole flight (file-name order = capture order), so a long
+    flight is not cut to its first part. Stored as the build job's media_ids, which every later step (build, scale,
+    registration) reads back through _photo_keys."""
+    ordered=sorted(photos,key=lambda m:(m.filename.lower(),m.id));n=reconstruct.MAX_IMAGES
+    return ordered if len(ordered)<=n else [ordered[round(i*(len(ordered)-1)/(n-1))] for i in range(n)]
 def _photo_keys(items):
     """Photos of a build in the order the build used them (reconstruct.prepare_images names them photos/00000 ... by this order)."""
     return [m.storage_key for m in sorted(items,key=lambda m:(m.filename.lower(),m.id)) if m.content_type.startswith('image/') and m.parent_media_id is None]
@@ -1018,8 +1026,10 @@ def start_reconstruction(inspection_id:int,background:BackgroundTasks,dense:bool
     items=db.scalars(q if not media_ids else q.where(Media.id.in_(media_ids))).all()
     photos=[m for m in items if m.content_type.startswith('image/')];videos=[m for m in items if m.content_type.startswith('video/')]
     if len(photos)<3 and not videos:raise HTTPException(409,'Need at least 3 overlapping photos or a video')
-    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in items],
-            detail=f'Queued 3D reconstruction ({"dense" if dense else "sparse"}) · {len(photos)} photo(s), {len(videos)} video(s)')
+    use=_flight_photos(photos)
+    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in use+videos],
+            detail=f'Queued 3D reconstruction ({"dense" if dense else "sparse"}) · '
+                   +(f'{len(use)} of {len(photos)} photos spread over the flight' if len(use)<len(photos) else f'{len(photos)} photo(s)')+f', {len(videos)} video(s)')
     db.add(job);db.flush();m3=Model3D(inspection_id=inspection_id,job_id=job.id,dense=dense,status='queued',quality={});db.add(m3);db.commit()
     gpu.start(background,'run_reconstruction',job_id=job.id,model_id=m3.id,dense=dense);return to_dict(job)|{'model_id':m3.id}
 @app.post('/api/v1/models/{model_id}/densify',status_code=202)

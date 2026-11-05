@@ -1137,3 +1137,12 @@ def test_cancel_queued_job_only(monkeypatch):
         with SessionLocal() as db:
             assert db.get(WorkerTask, tids[1]).status == 'failed' and db.get(WorkerTask, tids[0]).status == 'running'
             assert db.query(Model3D).filter_by(job_id=ids[1]).one().status == 'cancelled'
+
+def test_build_photos_spread_over_the_whole_flight(monkeypatch):
+    """A long flight is not cut to its first RECON_MAX_IMAGES photos: the build takes them evenly from start to end."""
+    from types import SimpleNamespace
+    from app import main, reconstruct
+    monkeypatch.setattr(reconstruct, 'MAX_IMAGES', 5)
+    photos = [SimpleNamespace(id=i, filename=f'DJI_{i:04d}.JPG') for i in range(100, 0, -1)]  # any upload order
+    assert [m.id for m in main._flight_photos(photos)] == [1, 26, 51, 75, 100]
+    assert [m.id for m in main._flight_photos(photos[-3:])] == [1, 2, 3]  # few photos: all, in flight order
