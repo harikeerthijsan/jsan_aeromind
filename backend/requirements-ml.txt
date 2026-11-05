@@ -6,3 +6,4 @@ ultralytics==8.4.192
 laspy[lazrs]>=2.5,<3
 pyproj>=3.6,<4
 scipy>=1.11,<2
+pye57>=0.4,<1  # E57 point clouds

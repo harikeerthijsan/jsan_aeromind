@@ -50,3 +50,31 @@ The migration performs these operations in order:
 The command is safe to rerun. It refuses to start while detection or reconstruction jobs are queued or running.
 
 For production, run it inside the deployed backend environment so `DATABASE_URL` and the `S3_*`/Railway bucket variables point to production. New uploads use the structured layout automatically without running the migration.
+
+## Whole bucket
+
+```text
+<bucket>/
+├── uploads/
+│   └── sites/<TOWER>/inspections/INS-000004/
+│       ├── images/        MEDIA-000005_Model_001.jpg …   photos
+│       ├── videos/        <token>_<name>.mp4             videos
+│       ├── frames/        MEDIA-<video id>/000030.jpg    frames extracted from videos
+│       └── pointclouds/   <token>_<name>.laz|.e57|.las|.ply|.xyz (+ .lax/.prj sidecars)
+├── reconstructions/<inspection>_<job>/   3D builds: sparse/, dense/fused.ply, web/points.ply, web/cameras.json, colmap.log
+├── vendor_refs/<class>/<Manufacturer>/   manufacturer reference photos (+ references.csv)
+├── backups/db/                           database snapshots
+└── dev/                                  local development copy's own files (same structure below it)
+```
+
+## Where each installation reads and writes
+
+| Installation | Writes to | Reads from | Local disk |
+|---|---|---|---|
+| Railway server (`STORAGE_MODE=bucket`) | `uploads/`, `reconstructions/` … | same | streams files, small cache |
+| GPU worker (`run-worker.ps1`, `STORAGE_MODE=bucket`) | production keys | production keys | cache ≤ `STORAGE_CACHE_GB`, least recently used trimmed |
+| Local development copy (`backend/storage.env`: `S3_PREFIX=dev/`) | `dev/…` | `dev/…`, then production keys | cache in `backend/storage-cache/dev/` |
+
+The local copy has its own database whose inspection, job and media ids overlap production's, so its new files go to `dev/` (3D build folders are named `<inspection>_<job>`). Everything both databases know about (data that existed when production was set up) is read from the one shared copy.
+
+`python -m app.migrate free-local [--apply]` deletes local files whose identical copy (same size) is in the bucket.

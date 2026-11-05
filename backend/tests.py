@@ -981,3 +981,72 @@ def test_pointcloud_upload_and_cloud_only_model(monkeypatch):
         assert abs(q['scale']['m_per_unit'] * 10 - 30.0) < 3  # ~10 viewer units across a ~30 m tall cloud
         assert client.get(m['urls']['web_points']).status_code == 200
         assert client.delete(f"/api/v1/pointclouds/{up.json()['id']}").status_code == 204
+
+def test_pointcloud_e57_scans_in_global_frame(tmp_path):
+    pye57 = pytest.importorskip('pye57'); np = pytest.importorskip('numpy')
+    from app import pointcloud as pc
+    n = 2000; rng = np.random.default_rng(4)
+    with pye57.E57(str(tmp_path / 'scan.e57'), mode='w') as f:
+        for shift in (0.0, 100.0):  # two scans; the second placed 100 m east by its pose
+            f.write_scan_raw({'cartesianX': rng.uniform(0, 10, n), 'cartesianY': rng.uniform(0, 10, n), 'cartesianZ': rng.uniform(0, 30, n),
+                              'intensity': rng.uniform(0, 1, n).astype(np.float32)}, name=f's{shift}', translation=np.array([shift, 0.0, 0.0]), rotation=np.array([1.0, 0, 0, 0]))
+    d = pc.read_clouds([tmp_path / 'scan.e57'], max_points=10_000)
+    assert d['total'] == 2 * n and d['colors'].shape == (2 * n, 3)
+    x = d['points'][:, 0]; assert x.min() >= -.01 and 99 < x.max() <= 110.01  # both scans, poses applied
+
+class _FakeS3:
+    """Just enough of boto3's S3 client for app/storage.py."""
+    def __init__(self): self.o = {}
+    def _miss(self):
+        from botocore.exceptions import ClientError
+        return ClientError({'Error': {'Code': '404'}}, 'op')
+    def head_object(self, Bucket, Key):
+        if Key not in self.o: raise self._miss()
+        return {'ContentLength': len(self.o[Key])}
+    def upload_file(self, f, Bucket, Key): self.o[Key] = open(f, 'rb').read()
+    def download_file(self, Bucket, Key, f):
+        if Key not in self.o: raise self._miss()
+        open(f, 'wb').write(self.o[Key])
+    def copy(self, src, Bucket, Key): self.o[Key] = self.o[src['Key']]
+    def delete_object(self, Bucket, Key): self.o.pop(Key, None)
+    def get_object(self, Bucket, Key, Range=None):
+        import io
+        if Key not in self.o: raise self._miss()
+        data = self.o[Key]; extra = {}
+        if Range:
+            a, b = Range[6:].split('-'); a, b = int(a), int(b or len(data) - 1); extra = {'ContentRange': f'bytes {a}-{b}/{len(data)}'}; data = data[a:b + 1]
+        class Body(io.BytesIO):
+            def iter_chunks(self, n): yield self.read()
+        return {'Body': Body(data), 'ContentLength': len(data), **extra}
+    def get_paginator(self, name):
+        o = self.o
+        class P:
+            def paginate(self, Bucket, Prefix): yield {'Contents': [{'Key': k, 'Size': len(v)} for k, v in o.items() if k.startswith(Prefix)]}
+        return P()
+
+def test_storage_namespace_bucket_mode_stream_and_trim(monkeypatch, tmp_path):
+    import os, time
+    from app import storage
+    fake = _FakeS3(); root = tmp_path / 'uploads'; root.mkdir()
+    monkeypatch.setattr(storage, '_client', fake); monkeypatch.setattr(storage, 'BUCKET', 'b'); monkeypatch.setattr(storage, 'ACCESS_KEY', 'k'); monkeypatch.setattr(storage, 'SECRET_KEY', 's')
+    monkeypatch.setattr(storage, '_roots', {'uploads': root.resolve()}); monkeypatch.setattr(storage, 'PREFIX', 'dev/'); monkeypatch.setattr(storage, 'MODE', 'bucket')
+    fake.o['uploads/shared.jpg'] = b'production'                          # written by production
+    assert storage.fetch(root / 'shared.jpg').read_bytes() == b'production'  # readable from the namespaced copy
+    (root / 'new.jpg').write_bytes(b'0123456789'); storage.push(root / 'new.jpg')
+    assert 'dev/uploads/new.jpg' in fake.o and 'uploads/new.jpg' not in fake.o  # own writes stay in the namespace
+    storage.release(root / 'new.jpg'); assert not (root / 'new.jpg').exists()      # bucket mode: no local copy kept
+    body, status, headers = storage.stream(root / 'new.jpg', 'bytes=2-5')
+    assert status == 206 and b''.join(body) == b'2345' and headers['Content-Range'] == 'bytes 2-5/10'
+    assert storage.stream(root / 'missing.jpg') is None
+    storage.delete(root / 'shared.jpg'); assert 'uploads/shared.jpg' in fake.o     # a namespaced copy never deletes production keys
+    assert storage.copy(root / 'shared.jpg', root / 'sites' / 'moved.jpg') and fake.o['dev/uploads/sites/moved.jpg'] == b'production'
+    # trim: least recently used first, never recent files or folders in use, never the only copy
+    old = time.time() - 3 * 3600
+    for name in ('a.bin', 'b.bin'):
+        p = root / name; p.write_bytes(b'x' * 1000); storage.push(p); os.utime(p, (old, old))
+    busy = root / 'build'; busy.mkdir(); (busy / 'big.bin').write_bytes(b'x' * 5000); os.utime(busy / 'big.bin', (old, old))
+    (root / 'local-only.bin').write_bytes(b'y' * 1000); os.utime(root / 'local-only.bin', (old, old))
+    with storage.in_use(busy):
+        freed = storage.trim_cache(max_bytes=1500)  # in-use folders do not count
+    assert (busy / 'big.bin').exists() and freed >= 1000
+    assert fake.o.get('dev/uploads/local-only.bin') == b'y' * 1000 or (root / 'local-only.bin').exists()  # pushed before removal

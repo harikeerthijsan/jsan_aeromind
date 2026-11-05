@@ -7,7 +7,7 @@ import './pointcloud.css';
  * cloud" uses it as the 3D model instead of COLMAP's dense reconstruction; photos (with GPS) are only aligned to it so
  * the 3D equipment boxes still work. */
 export type PointCloudFile={id:number;inspection_id:number;filename:string;file_format:string;size_bytes:number;created_at:string;role:'cloud'|'sidecar'};
-const ACCEPT='.las,.laz,.lax,.ply,.xyz,.pts,.txt,.csv,.prj';
+const ACCEPT='.las,.laz,.lax,.e57,.ply,.xyz,.pts,.txt,.csv,.prj';
 const mb=(n:number)=>n>=1e9?`${(n/1e9).toFixed(2)} GB`:`${(n/1e6).toFixed(1)} MB`;
 
 /** XHR rather than fetch: uploads of several GB need a progress bar. */
@@ -34,8 +34,8 @@ export default function PointCloudPanel({inspectionId,inspectionLabel,onBuilt,co
  const clouds=files.filter(f=>f.role==='cloud');
  if(!inspectionId)return <div className="pc-panel"><p className="muted">Create an inspection for this tower first.</p></div>;
  return <div className={'pc-panel'+(compact?' compact':'')}>
-  <div className="pc-head"><FileBox size={18}/><div><b>Point cloud <em>optional</em></b><small>{inspectionLabel?`${inspectionLabel} · `:''}LAS, LAZ, PLY, XYZ / PTS / TXT / CSV · sidecars .lax, .prj</small></div></div>
-  {!compact&&<p className="pc-explain">Have a LiDAR scan or a point cloud from other software? Upload it and the 3D model is built from it instead of the slow photo reconstruction.{photoCount>=3?` The ${photoCount} photos are still used, only to place them on the cloud (a few minutes), so the 3D equipment boxes work as usual.`:' Without photos you get the 3D view; equipment boxes need the photos.'} Clouds need a coordinate system (LAS header or .prj) to line up with the photos' GPS.</p>}
+  <div className="pc-head"><FileBox size={18}/><div><b>Point cloud <em>optional</em></b><small>{inspectionLabel?`${inspectionLabel} · `:''}LAS, LAZ, E57, PLY, XYZ / PTS / TXT / CSV · sidecars .lax, .prj</small></div></div>
+  {!compact&&<p className="pc-explain">Have a LiDAR scan or a point cloud from other software? Upload it and the 3D model is built from it instead of the slow photo reconstruction.{photoCount>=3?` The ${photoCount} photos are still used, only to place them on the cloud (a few minutes), so the 3D equipment boxes work as usual.`:' Without photos you get the 3D view; equipment boxes need the photos.'} Clouds need a coordinate system (LAS header, E57 metadata or a .prj) to line up with the photos' GPS.</p>}
   <label className={'pc-drop'+(busy?' disabled':'')}><UploadCloud size={20}/><span><b>Choose point cloud files</b><small>Several tiles of one survey are combined; large surveys are cropped to the area around the drone flight</small></span>
    <input type="file" multiple accept={ACCEPT} disabled={!!busy} onChange={e=>{choose(e.target.files);e.target.value=''}}/></label>
   {progress&&<div className="pc-progress"><div><span>{progress.name}</span><b>{mb(progress.loaded)} / {mb(progress.total)}</b></div><i><s style={{width:`${progress.total?progress.loaded/progress.total*100:0}%`}}/></i></div>}

@@ -78,6 +78,10 @@ def lane_loop(lane, http=None):
         for attempt in range(30):  # the result is the expensive part: keep trying through a short outage
             try: http.post(f'/api/v1/worker/tasks/{tid}/finish', json=outcome, timeout=300).raise_for_status(); break
             except Exception as e: log(f'[{lane}] could not report task {tid}: {e}'); _stop.wait(10)
+        try:
+            freed = storage.trim_cache()  # bucket mode: keep the local cache under STORAGE_CACHE_GB
+            if freed: log(f'[{lane}] cache trimmed: {freed / 1e9:.2f} GB freed')
+        except Exception as e: log(f'[{lane}] cache trim failed: {e}')
 
 def main():
     if not SERVER or not TOKEN: sys.exit('Set AEROMIND_SERVER and WORKER_TOKEN (backend/worker.env)')

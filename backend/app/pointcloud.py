@@ -1,6 +1,7 @@
 """Uploaded point clouds (LiDAR or photogrammetry exports) as an inspection's 3D model.
 
-Formats: LAS / LAZ (laspy + lazrs, read in chunks), PLY, and text clouds (XYZ / PTS / TXT / CSV: x y z [r g b]).
+Formats: LAS / LAZ (laspy + lazrs, read in chunks), E57 (pye57: every scan, in the file's global frame, metres),
+PLY, and text clouds (XYZ / PTS / TXT / CSV: x y z [r g b]).
 Sidecars are kept with the cloud: .lax (LAStools spatial index, not needed here) and .prj (coordinate system for
 clouds whose format cannot carry one).
 
@@ -18,7 +19,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-CLOUD_EXT = {'.las', '.laz', '.ply', '.xyz', '.pts', '.txt', '.csv'}
+CLOUD_EXT = {'.las', '.laz', '.e57', '.ply', '.xyz', '.pts', '.txt', '.csv'}
 SIDECAR_EXT = {'.lax', '.prj'}
 MODEL_POINTS = 4_000_000      # cloud points kept for registration (written as dense/fused.ply)
 ROI_MARGIN_M = 60.0           # around the drone's flight: towers sit in large survey tiles
@@ -44,10 +45,20 @@ def _prj_crs(paths):
             except Exception: pass
     return None
 
+def _e57_crs(path):
+    """E57 may name its coordinate system in root/coordinateMetadata (WKT, EPSG code or similar)."""
+    try:
+        import pye57
+        from pyproj import CRS
+        root = pye57.E57(str(path)).root
+        return CRS.from_user_input(root['coordinateMetadata'].value()) if root.isDefined('coordinateMetadata') and root['coordinateMetadata'].value().strip() else None
+    except Exception: return None
+
 def peek_crs(paths):
-    """The coordinate system of the first cloud that has one (LAS header, else a .prj sidecar)."""
+    """The coordinate system of the first cloud that has one (LAS header or E57 metadata, else a .prj sidecar)."""
     import laspy
     for p in paths:
+        if Path(p).suffix.lower() == '.e57' and (c := _e57_crs(p)) is not None: return c
         if Path(p).suffix.lower() in ('.las', '.laz'):
             with laspy.open(p) as r:
                 try:
@@ -109,6 +120,19 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None):
                     P = np.c_[np.asarray(chunk.x) * fh, np.asarray(chunk.y) * fh, np.asarray(chunk.z) * fv]; total += len(P)
                     C = _colours(chunk, names); intensity = intensity or (C is not None and C.ndim == 1)
                     add(P, C if C is None or C.ndim == 2 else C)
+        elif ext == '.e57':  # E57 is always metres; scans are placed in the file's global frame (transform=True)
+            import pye57
+            f = pye57.E57(str(p)); crs = crs or _e57_crs(p) or prj
+            for i in range(f.scan_count):
+                if progress and f.scan_count > 1: progress(f'Reading {p.name}: scan {i + 1}/{f.scan_count}')
+                d = f.read_scan(i, intensity=True, colors=True, ignore_missing_fields=True)
+                P = np.c_[d['cartesianX'], d['cartesianY'], d['cartesianZ']].astype(np.float64); total += len(P)
+                C = None
+                if 'colorRed' in d:
+                    rgb = np.c_[d['colorRed'], d['colorGreen'], d['colorBlue']].astype(np.float32)
+                    if rgb.max() > 0: C = (rgb / (257.0 if rgb.max() > 255 else 1.0)).clip(0, 255).astype(np.uint8)
+                if C is None and 'intensity' in d: C = np.asarray(d['intensity'], np.float32); intensity = True
+                for s0 in range(0, len(P), CHUNK): add(P[s0:s0 + CHUNK], None if C is None else C[s0:s0 + CHUNK])
         elif ext == '.ply':
             from . import reconstruct
             d = reconstruct.read_ply(p); P = np.asarray(d['points'], float); total += len(P); crs = crs or prj

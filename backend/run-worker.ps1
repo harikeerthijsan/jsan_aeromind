@@ -3,6 +3,7 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 if (-not (Test-Path worker.env)) { throw 'backend/worker.env is missing: copy worker.env.example and fill it in' }
+$env:AEROMIND_ROLE = 'worker'   # writes production storage keys; backend/storage.env (local dev namespace) is not loaded
 foreach ($line in Get-Content worker.env) {
     if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2].Trim().Trim('"') }
 }

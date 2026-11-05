@@ -64,7 +64,7 @@ _recon_lock = threading.Lock()  # one reconstruction at a time: dense stereo use
 def reconstruct_model(payload, progress):
     """payload: {'work', 'photos': [keys], 'videos': [keys], 'dense', 'source': {'dir', 'quality'} | None} -> result dict"""
     work = reconstruct.RECON_DIR / payload['work']
-    with _recon_lock:
+    with _recon_lock, storage.in_use(work):
         try:
             if payload.get('source'):  # densify an existing sparse build
                 src = reconstruct.RECON_DIR / payload['source']['dir']; storage.fetch_tree(src, skip=('images',))
@@ -92,7 +92,7 @@ def pointcloud_model(payload, progress):
     import numpy as np
     from . import pointcloud as pc, scale as sc
     work = reconstruct.RECON_DIR / payload['work']; work.mkdir(parents=True, exist_ok=True); log = work / 'colmap.log'; t0 = time.time()
-    with _recon_lock:
+    with _recon_lock, storage.in_use(work):
         try:
             progress('downloading', 1, f"Fetching {len(payload['clouds'])} point cloud file(s) and {len(payload['photos'])} photo(s)")
             clouds = [storage.fetch(ROOT / k) for k in payload['clouds']]; photos = [storage.fetch(ROOT / k) for k in payload['photos']]

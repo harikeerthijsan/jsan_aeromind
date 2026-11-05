@@ -1,4 +1,4 @@
-import os, uuid, hashlib, shutil, csv, io, tempfile, zipfile, threading, math
+import os, uuid, hashlib, shutil, csv, io, tempfile, zipfile, threading, math, time
 from urllib.parse import quote
 from collections import Counter
 from pathlib import Path
@@ -72,6 +72,19 @@ async def lifespan(app):
         auth.seed_users(db)
     if storage.enabled():  # the reference library is small and listed (not just opened), so keep a full copy
         threading.Thread(target=lambda:storage.fetch_tree(vendor.VENDOR_REFERENCE_DIR),daemon=True).start()
+    if os.getenv('MEDIA_LAYOUT_MIGRATION','').lower()=='apply':  # one-time: legacy flat media keys -> sites/<tower>/inspections/...
+        def relayout():
+            from . import migrate
+            try:print('media layout migration:',migrate.media_layout(apply=True,delete_old=True),flush=True)
+            except BaseException as e:print('media layout migration failed:',repr(e),flush=True)
+        threading.Thread(target=relayout,daemon=True).start()
+    if storage.bucket_only():  # bucket mode: local files are a cache, trimmed to STORAGE_CACHE_GB every 10 minutes
+        def trimmer():
+            while True:
+                try:storage.trim_cache()
+                except Exception as e:print('cache trim failed:',e,flush=True)
+                time.sleep(600)
+        threading.Thread(target=trimmer,daemon=True).start()
     yield
 
 app=FastAPI(title='AeroMind API',version='0.1.0',lifespan=lifespan)
@@ -94,10 +107,19 @@ async def authentication_gate(request,call_next):
     request.state.auth_user=user
     return await call_next(request)
 class SyncedFiles(StaticFiles):
-    """Static files that are downloaded from the bucket on first request when they aren't on this machine yet."""
+    """Static files backed by the bucket: a file missing on this machine is streamed from the bucket (bucket mode, no
+    local copy) or downloaded once and served (cache mode)."""
     async def get_response(self,path,scope):
         full,_=self.lookup_path(path)
-        if not full and storage.enabled() and '..' not in path:await run_in_threadpool(storage.fetch,Path(self.directory)/path)
+        if not full and storage.enabled() and '..' not in path:
+            target=Path(self.directory)/path
+            if storage.bucket_only():
+                rng=next((v.decode() for k,v in scope.get('headers',[]) if k==b'range'),None)
+                got=await run_in_threadpool(storage.stream,target,rng)
+                if got:
+                    body,status,headers=got;import mimetypes
+                    return StreamingResponse(body,status_code=status,headers=headers,media_type=mimetypes.guess_type(path)[0] or 'application/octet-stream')
+            else:await run_in_threadpool(storage.fetch,target)
         return await super().get_response(path,scope)
 app.include_router(auth.router)
 app.include_router(gpu.router)
@@ -389,7 +411,7 @@ async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends
                 size+=len(chunk)
                 if size>MAX_SIZE:raise HTTPException(413,'File too large')
                 sha.update(chunk);out.write(chunk)
-        await run_in_threadpool(storage.push,target)
+        await run_in_threadpool(storage.push,target);await run_in_threadpool(storage.release,target)
         x=Media(inspection_id=inspection_id,filename=name,storage_key=key,content_type=file.content_type,sha256=sha.hexdigest(),size_bytes=size)
         db.add(x);db.commit();db.refresh(x);return to_dict(x)
     except Exception:
@@ -404,7 +426,7 @@ async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Sessi
     inspection=db.get(Inspection,inspection_id)
     if not inspection:raise HTTPException(404,'Inspection not found')
     site=db.get(Site,inspection.site_id);name=Path(file.filename or 'cloud').name[:255];ext=Path(name).suffix.lower()
-    if ext not in pointcloud_mod.CLOUD_EXT|pointcloud_mod.SIDECAR_EXT:raise HTTPException(415,'Point clouds: .las .laz .ply .xyz .pts .txt .csv (sidecars .lax .prj)')
+    if ext not in pointcloud_mod.CLOUD_EXT|pointcloud_mod.SIDECAR_EXT:raise HTTPException(415,'Point clouds: .las .laz .e57 .ply .xyz .pts .txt .csv (sidecars .lax .prj)')
     key=(media_paths.inspection_root(site.code if site else 'SITE',inspection.id)/'pointclouds'/f'{uuid.uuid4().hex[:12]}_{media_paths._segment(Path(name).stem,"cloud",70)}{ext}').as_posix()
     target=ROOT/key;target.parent.mkdir(parents=True,exist_ok=True);size=0;sha=hashlib.sha256()
     try:
@@ -413,7 +435,7 @@ async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Sessi
                 size+=len(chunk)
                 if size>POINTCLOUD_MAX:raise HTTPException(413,f'Point cloud larger than {POINTCLOUD_MAX//1024**3} GB')
                 sha.update(chunk);out.write(chunk)
-        await run_in_threadpool(storage.push,target)
+        await run_in_threadpool(storage.push,target);await run_in_threadpool(storage.release,target)
         x=PointCloudFile(inspection_id=inspection_id,filename=name,storage_key=key,file_format=ext[1:],size_bytes=size,sha256=sha.hexdigest())
         db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
     except Exception:

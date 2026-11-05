@@ -99,11 +99,16 @@ def media_layout(apply=False,delete_old=False):
         copied=[];missing=[]
         try:
             for n,(_,old,new) in enumerate(moves,1):
-                src=storage.fetch(ROOT/old);dst=ROOT/new
-                if not dst.is_file():
-                    if not src.is_file():missing.append(old);continue
-                    dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src,dst);copied.append(dst)
-                storage.push(dst)
+                dst=ROOT/new
+                if storage.enabled():  # server-side copy: nothing is downloaded (the bucket is the store)
+                    if not storage.head(dst) and not storage.copy(ROOT/old,dst):
+                        if not (ROOT/old).is_file():missing.append(old);continue
+                        storage.push(ROOT/old);storage.copy(ROOT/old,dst)
+                    if (ROOT/old).is_file() and not dst.is_file():dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/old,dst);copied.append(dst)
+                else:
+                    if not dst.is_file():
+                        if not (ROOT/old).is_file():missing.append(old);continue
+                        dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/old,dst);copied.append(dst)
                 if n%25==0 or n==len(moves):print(f'  stored {n}/{len(moves)}',flush=True)
             if missing:raise RuntimeError(f'{len(missing)} source file(s) are missing locally and in the bucket; first: {missing[0]}')
             for m,_,new in moves:m.storage_key=new
@@ -126,15 +131,36 @@ def media_layout(apply=False,delete_old=False):
         print(f'Media layout complete: {len(moves)} database key(s) updated, {deleted} old object(s) removed.')
         return {'migrated':len(moves),'deleted':deleted,'total':len(rows)}
 
+def free_local(apply=False):
+    """Delete local files that the bucket holds with the same size (uploads/, reconstructions/; never the database).
+    Without --apply only reports. Files missing in the bucket or of a different size are kept."""
+    from . import storage, reconstruct, vendor
+    from .tasks import ROOT
+    if not storage.enabled():sys.exit('No bucket configured')
+    keep=free=n=0;kept=[]
+    for folder in (ROOT,reconstruct.RECON_DIR):
+        for p in sorted(folder.rglob('*')) if folder.is_dir() else []:
+            if not p.is_file() or p.name==storage.IN_USE or any(m.name==storage.IN_USE for m in p.parent.glob(storage.IN_USE)):continue
+            size=p.stat().st_size;h=None if '.thumbs' in p.parts else storage.head(p)
+            if '.thumbs' in p.parts or (h and h[1]==size):
+                n+=1;free+=size
+                if apply:p.unlink(missing_ok=True)
+            else:keep+=size;kept.append(p)
+    print(f'{"Deleted" if apply else "Would delete"} {n} local file(s), {free/1e9:.2f} GB stored in the bucket; kept {len(kept)} ({keep/1e6:.1f} MB) not in the bucket')
+    for p in kept[:10]:print('   kept',p)
+    return {'deleted' if apply else 'deletable':n,'bytes':free,'kept':len(kept)}
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('db'); d.add_argument('--source', default='sqlite:///tower_vision.db'); d.add_argument('--target', required=True); d.add_argument('--replace', action='store_true')
     f = sub.add_parser('files'); f.add_argument('--workers', type=int, default=8)
     m = sub.add_parser('media-layout');m.add_argument('--apply',action='store_true');m.add_argument('--delete-old',action='store_true')
+    fl = sub.add_parser('free-local');fl.add_argument('--apply',action='store_true')
     a = ap.parse_args()
     if a.cmd == 'db': copy_db(a.source, a.target, a.replace)
     elif a.cmd == 'files': copy_files(a.workers)
+    elif a.cmd == 'free-local': free_local(a.apply)
     else: media_layout(a.apply,a.delete_old)
 
 if __name__ == '__main__':
