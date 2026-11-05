@@ -2,3 +2,7 @@
 # Matches the training env (yolo-gpu): Python 3.12, torch 2.14.1+cu130.
 # Install CUDA torch first: pip install torch --index-url https://download.pytorch.org/whl/cu130
 ultralytics==8.4.192
+# point clouds (GPU worker): LAS/LAZ reading, coordinate systems, alignment (app/pointcloud.py)
+laspy[lazrs]>=2.5,<3
+pyproj>=3.6,<4
+scipy>=1.11,<2

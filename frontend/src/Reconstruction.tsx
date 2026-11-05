@@ -1,13 +1,15 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,ThreeEvent,useFrame,useThree} from '@react-three/fiber';import {OrbitControls,Grid,TransformControls} from '@react-three/drei';import {LabelAnchor} from './Label3D';
+import PointCloudPanel from './PointCloudPanel';
 import * as THREE from 'three';import {PLYLoader} from 'three/examples/jsm/loaders/PLYLoader.js';
 import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize,X} from 'lucide-react';
-import {API,request,Inspection,Job,Media,RegistrationCandidate} from './api';
+import {API,request,Inspection,Job,Media,RegistrationCandidate,getAuthToken} from './api';
 
 // 3D models built by COLMAP photogrammetry (backend app/reconstruct.py)
 type ReconInfo={status:string;colmap:string|null;colmap_path_env:string|null;video_stride:number;max_images:number;dense_max_size:number};
 export type Model3D={id:number;inspection_id:number;job_id:number;status:string;dense:boolean;created_at:string|null;urls:Record<string,string>;
- quality:{registered_images?:number;images_total?:number;sparse_points?:number;dense_points?:number;mesh_faces?:number;mean_reprojection_error_px?:number|null;mean_track_length?:number|null;models_found?:number;seconds?:number;error?:string;source_model?:number;scale?:ModelScale|null}};
+ quality:{registered_images?:number;images_total?:number;sparse_points?:number;dense_points?:number;mesh_faces?:number;mean_reprojection_error_px?:number|null;mean_track_length?:number|null;models_found?:number;seconds?:number;error?:string;source_model?:number;scale?:ModelScale|null;
+  source?:'pointcloud'|string;pointcloud?:{files:string[];points_total:number;points_used:number;crs:string|null;units:string;cropped_to_flight:boolean;alignment?:{gps_residual_m:number;vertical_shift_m:number;icp_rms_m:number|null;inliers_pct:number}};boxes_available?:boolean;boxes_note?:string;warning?:string}};
 /** Metres per model unit (app/scale.py): from the drone's GPS / RTK positions, or calibrated by a reviewer. */
 export type ModelScale={m_per_unit:number;method:'gps_rtk'|'gps'|'manual'|string;cameras?:number;rtk?:boolean;residual_median_m?:number;uncertainty_pct?:number|null;reference_m?:number;note?:string};
 type Cam={name:string;center:[number,number,number];dir:[number,number,number]};
@@ -17,15 +19,17 @@ const insCode=(id:number)=>'INS-'+String(id).padStart(4,'0');
 const fmt=(n?:number|null)=>n==null?'—':n.toLocaleString();
 const running=(j:Job)=>['queued','running'].includes(j.status);
 
+/** 3D files need the signed-in user too: send the token header and, across ports in local dev, the session cookie. */
+function authLoader<L extends THREE.Loader>(l:L):L{l.setWithCredentials(true);const t=getAuthToken();if(t)l.setRequestHeader({Authorization:`Bearer ${t}`});return l}
 function usePly(url?:string){
  const [geo,setGeo]=useState<THREE.BufferGeometry|null>(null),[err,setErr]=useState('');
- useEffect(()=>{setGeo(null);setErr('');if(!url)return;let live=true;new PLYLoader().load(API+url,g=>{if(live)setGeo(g)},undefined,e=>live&&setErr(String((e as Error)?.message||e)));return()=>{live=false}},[url]);
+ useEffect(()=>{setGeo(null);setErr('');if(!url)return;let live=true;authLoader(new PLYLoader()).load(API+url,g=>{if(live)setGeo(g)},undefined,e=>live&&setErr(String((e as Error)?.message||e)));return()=>{live=false}},[url]);
  return {geo,err};
 }
 function Cameras({url,selected,onPick}:{url?:string;selected?:string|null;onPick:(cam:Cam)=>void}){
  const [cams,setCams]=useState<Cam[]>([]);
  const hits=useRef<THREE.InstancedMesh>(null!);
- useEffect(()=>{if(!url)return;fetch(API+url).then(r=>r.json()).then(setCams).catch(()=>setCams([]))},[url]);
+ useEffect(()=>{if(!url)return;const t=getAuthToken();fetch(API+url,{credentials:'include',headers:t?{Authorization:`Bearer ${t}`}:{}}).then(r=>r.json()).then(setCams).catch(()=>setCams([]))},[url]);
  useEffect(()=>{if(!hits.current)return;const matrix=new THREE.Matrix4();cams.forEach((c,i)=>{matrix.makeTranslation(...c.center);hits.current.setMatrixAt(i,matrix)});hits.current.instanceMatrix.needsUpdate=true},[cams]);
  // dots stay a few pixels on screen at any zoom; direction ticks scale with the spacing between shots so they never pile up
  const objs=useMemo(()=>{if(!cams.length)return null;const P=cams.map(c=>new THREE.Vector3(...c.center));
@@ -193,7 +197,7 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
    <select className="det-select" aria-label="Inspection" value={inspection?.id} onChange={e=>{setInspectionId(+e.target.value);setSelected(null)}}>{inspections.map(i=><option key={i.id} value={i.id}>{insCode(i.id)} · {i.label}</option>)}</select>
    <div className="recon-inputs"><span><ImageIcon size={14}/>{photos} photo{photos===1?'':'s'}</span><span><Film size={14}/>{videos} video{videos===1?'':'s'}</span></div>
    {info&&!ready&&<div className="notice"><AlertTriangle size={16}/><span>{info.status==='missing'?<>COLMAP_PATH in <b>backend/.env</b> points to <code>{info.colmap}</code>, which doesn't exist. Fix the path (e.g. <code>D:/tools/colmap/bin/colmap.exe</code>) and restart the backend.</>
-    :<>COLMAP wasn't found. Unzip the COLMAP Windows CUDA build to <code>D:	ools\colmap</code> (found automatically) or set <b>COLMAP_PATH</b> in <b>backend/.env</b> (not frontend/.env), then restart the backend.</>}</span></div>}
+    :<>COLMAP wasn't found. Unzip the COLMAP Windows CUDA build to <code>{'D:\\tools\\colmap'}</code> (found automatically) or set <b>COLMAP_PATH</b> in <b>backend/.env</b> (not frontend/.env), then restart the backend.</>}</span></div>}
    {!info&&<div className="notice"><AlertTriangle size={16}/><span>Can't reach the backend to check COLMAP. Is it running?</span></div>}
    {ready&&<small className="muted recon-colmap" title={info?.colmap||''}>COLMAP: {info?.colmap}</small>}
    <h4>Quality</h4>
@@ -206,8 +210,10 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
    <h4>Models ({models.length})</h4>
    {models.map(m=><button key={m.id} className={'tree-asset '+(model?.id===m.id?'chosen':'')} disabled={m.status!=='completed'} onClick={()=>setSelected(m.id)} title={m.quality.error||''}>
     {m.status==='completed'?<CheckCircle2 size={15} className="ok"/>:m.status==='failed'?<AlertTriangle size={15}/>:<Box size={15}/>}
-    <div><b>#{m.id} · {m.dense?'dense':'sparse'}{m.quality.source_model?` (from #${m.quality.source_model})`:''}</b><small>{m.status==='completed'?`${m.quality.registered_images}/${m.quality.images_total} images · ${fmt(m.dense?m.quality.dense_points:m.quality.sparse_points)} pts`:m.status==='failed'?(m.quality.error||'failed').slice(0,60):m.status}</small></div></button>)}
+    <div><b>#{m.id} · {m.quality.source==='pointcloud'?'point cloud':m.dense?'dense':'sparse'}{m.quality.source_model?` (from #${m.quality.source_model})`:''}</b><small>{m.status==='completed'?(m.quality.source==='pointcloud'?`${fmt(m.quality.dense_points)} pts · ${m.quality.registered_images?`${m.quality.registered_images} photos aligned`:'no photos aligned'}`:`${m.quality.registered_images}/${m.quality.images_total} images · ${fmt(m.dense?m.quality.dense_points:m.quality.sparse_points)} pts`):m.status==='failed'?(m.quality.error||'failed').slice(0,60):m.status}</small></div></button>)}
    {!models.length&&<p className="muted">No 3D models yet for this inspection.</p>}
+   <h4>Point cloud</h4>
+   <PointCloudPanel compact inspectionId={inspection?.id??null} inspectionLabel={inspection?.label} onBuilt={onChanged}/>
   </div>
   <div className="viewer-middle"><div className="viewer-toolbar ann-toolbar">
     <div className="ann-tools ann-title"><b>{model?`Model #${model.id} · ${insCode(model.inspection_id)}`:'3D model'}</b></div>
@@ -220,7 +226,7 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
    <div className="recon-stage">{model?<ModelView key={model.id} model={model} mode={mode} pointSize={pointSize} showCams={showCams}/>
     :<div className="det-empty"><Box size={46}/><p>{active?'Building the model… it appears here when done.':'Build a 3D model from this inspection’s photos or video.'}</p></div>}
     {model&&<div className="ann-hint">Drag to orbit · right-drag to pan · wheel to zoom · camera button = show positions · click a yellow point = source image</div>}</div></div>
-  <div className="viewer-right"><div className="panel-head"><h2>Model quality</h2>{model&&<span className={'badge '+(placed!=null&&placed>=.8?'good':placed!=null&&placed>=.5?'fair':'poor')}>{placed!=null?`${Math.round(placed*100)}% placed`:'—'}</span>}</div>
+  <div className="viewer-right"><div className="panel-head"><h2>Model quality</h2>{model&&(q.source==='pointcloud'&&!q.registered_images?<span className="badge neutral">Point cloud</span>:<span className={'badge '+(placed!=null&&placed>=.8?'good':placed!=null&&placed>=.5?'fair':'poor')}>{placed!=null?`${Math.round(placed*100)}% placed`:'—'}</span>)}</div>
    {model?<>
     <div className="info"><small>Images placed</small><b>{q.registered_images} / {q.images_total}</b></div>
     <div className="info"><small>Sparse points</small><b>{fmt(q.sparse_points)}</b></div>
@@ -229,11 +235,19 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
     <div className="info"><small>Mean track length</small><b>{q.mean_track_length!=null?q.mean_track_length.toFixed(1):'—'}</b></div>
     <div className="info"><small>Build time</small><b>{q.seconds!=null?`${Math.round(q.seconds/60)} min ${q.seconds%60}s`:'—'}</b></div>
     {(q.models_found||1)>1&&<div className="notice"><AlertTriangle size={16}/>The images formed {q.models_found} separate groups; the largest is shown. Add images that bridge the gaps.</div>}
+    {q.source==='pointcloud'&&q.pointcloud&&<><h4 className="det-sub">Point cloud</h4>
+     <div className="info"><small>Points in file(s)</small><b>{fmt(q.pointcloud.points_total)}</b></div>
+     <div className="info"><small>Used{q.pointcloud.cropped_to_flight?' (around the flight)':''}</small><b>{fmt(q.pointcloud.points_used)}</b></div>
+     <div className="info"><small>Coordinate system</small><b title={q.pointcloud.crs||''}>{q.pointcloud.crs?q.pointcloud.crs.slice(0,34):'none'}</b></div>
+     {q.pointcloud.alignment&&<><div className="info"><small>Photos to cloud fit (ICP)</small><b>{q.pointcloud.alignment.icp_rms_m!=null?`${(q.pointcloud.alignment.icp_rms_m*100).toFixed(1)} cm`:'—'} · {q.pointcloud.alignment.inliers_pct}% on surface</b></div>
+      <div className="info"><small>Height datum shift</small><b>{q.pointcloud.alignment.vertical_shift_m.toFixed(2)} m</b></div></>}
+     {q.warning&&<div className="notice"><AlertTriangle size={16}/>{q.warning}</div>}
+     {q.boxes_note&&<div className="notice"><AlertTriangle size={16}/>{q.boxes_note}</div>}</>}
     {!model.dense&&<div className="recon-densify"><button className="btn primary" disabled={!ready||!!active} onClick={()=>densify(model)} title="Reuses this model's camera positions, so it skips feature matching"><Layers size={14}/>Make dense model from this</button>
      <small className="muted">{active?'Another build is running.':'Detailed points and a surface mesh from this sparse model. Roughly 15–40 min for 100 images.'}</small></div>}
     <h4 className="det-sub">Downloads</h4>
     <div className="recon-downloads">{[['dense_ply','Dense point cloud (PLY)'],['mesh_ply','Mesh (PLY)'],['sparse_ply','Sparse point cloud (PLY)'],['log','COLMAP log']].filter(([k])=>model.urls[k]).map(([k,l])=><a key={k} className="text-btn" href={API+model.urls[k]} download><Download size={13}/>{l}</a>)}</div>
-    <div className="notice"><AlertTriangle size={16}/>Built from photos alone, so the model has no real-world scale or GPS position yet. Error under ~1 px and most images placed means a reliable model.</div>
+    {q.source!=='pointcloud'&&<div className="notice"><AlertTriangle size={16}/>Built from photos{q.scale?`, scaled from the drone's GPS (1 unit = ${q.scale.m_per_unit.toFixed(3)} m)`:' alone, so it has no real-world scale yet'}. Error under ~1 px and most images placed means a reliable model.</div>}
    </>:<p className="muted">Quality figures appear once a model is built. Tips: fly an orbit around the tower at 2–3 heights with 70–80% overlap between shots; avoid motion blur.</p>}
    {models.find(m=>m.status==='failed'&&m.id===models[0]?.id)&&<div className="notice"><AlertTriangle size={16}/><span>Latest build failed: {models[0].quality.error} {models[0].urls.log&&<a className="text-btn" href={API+models[0].urls.log}>log</a>}</span></div>}
   </div></div>;

@@ -62,6 +62,12 @@ UI: http://localhost:5173
 
 Use `ENABLE_DEMO_SEED=false` for an initially empty local database. In production, replace SQLite with Postgres/PostGIS and implement Alembic migrations and authentication before accepting real customer data.
 
+## Point clouds (optional)
+An inspection can carry a point cloud from a LiDAR survey or other photogrammetry software: **Media Upload → Point cloud** or **3D Reconstruction → Point cloud** (`POST /api/v1/inspections/{id}/pointclouds`). Formats: LAS, LAZ, PLY, XYZ / PTS / TXT / CSV; sidecars `.lax` (index, ignored) and `.prj` (coordinate system for formats without one). **Build 3D model from point cloud** (`POST /api/v1/inspections/{id}/pointcloud-model`) uses the cloud as the 3D model, so COLMAP's dense reconstruction (the slow part) is skipped:
+- with 3+ photos that have GPS and a cloud with a coordinate system (LAS header or `.prj`), a COLMAP *sparse* camera solve (minutes) is aligned to the cloud (GPS/RTK similarity, automatic height-datum search, ICP); the cloud is cropped to the area around the flight. 3D equipment boxes and measurements then work as usual;
+- otherwise the cloud is shown on its own (Z-up converted, real-world scale from its units) and 3D boxes are not available.
+Units are converted from the CRS (e.g. US survey feet). The GPU worker needs `pip install -r requirements-ml.txt` (laspy+lazrs, pyproj, scipy). `POINTCLOUD_MAX_BYTES` caps one upload (default 10 GB).
+
 ## Deployment (Railway + local GPU worker)
 ```
  browser ──HTTPS──► Railway: aeromind (FastAPI + built frontend, Dockerfile)

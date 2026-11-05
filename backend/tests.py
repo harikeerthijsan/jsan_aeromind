@@ -914,3 +914,70 @@ def test_session_cookie_for_files_and_reads_only(monkeypatch):
         assert client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'header'}, headers=h).status_code == 201
         assert client.post('/api/v1/auth/logout', headers=h).status_code == 204
         assert client.get('/uploads/cookie-check.txt').status_code == 401
+
+def _write_las(path, xyz, crs=None, rgb=None):
+    import laspy, numpy as np
+    h = laspy.LasHeader(point_format=7 if rgb is not None else 6, version='1.4'); h.scales = [.001] * 3; h.offsets = np.floor(xyz.min(0))
+    if crs is not None: h.add_crs(crs)
+    las = laspy.LasData(h); las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    if rgb is not None: las.red, las.green, las.blue = (rgb.astype('uint16') * 257).T
+    las.write(path)
+
+def test_pointcloud_reading_units_and_crop(tmp_path):
+    pytest.importorskip('laspy'); np = pytest.importorskip('numpy')
+    from pyproj import CRS
+    from app import pointcloud as pc
+    pts = np.c_[np.linspace(0, 1000, 5000), np.linspace(0, 500, 5000), np.full(5000, 100.0)] + [6_224_000, 2_001_000, 0]
+    _write_las(tmp_path / 'feet.laz', pts, CRS.from_epsg(2229))  # NAD83 / California zone 5 (US survey feet)
+    d = pc.read_clouds([tmp_path / 'feet.laz'], max_points=10_000)
+    assert d['total'] == 5000 and 'foot' in d['units'].lower()
+    ft = 1200 / 3937  # US survey foot in metres
+    assert abs(np.ptp(d['points'][:, 0]) - 1000 * ft) < .01 and abs(d['points'][0, 2] - 100 * ft) < .01  # converted to metres
+    x0 = 6_224_000 * ft; roi = (x0, x0 + 100, -1e12, 1e12)  # crop: first 100 m only
+    assert 1500 < pc.read_clouds([tmp_path / 'feet.laz'], max_points=10_000, roi=roi)['kept'] < 1800  # 100 m of a 305 m line
+    assert pc.peek_crs([tmp_path / 'feet.laz']).to_epsg() == 2229
+    (tmp_path / 'a.xyz').write_text('# x y z r g b\n' + '\n'.join(f'{i} {2*i} {3} 255 0 0' for i in range(10)))
+    t = pc.read_clouds([tmp_path / 'a.xyz']); assert t['kept'] == 10 and tuple(t['colors'][0]) == (255, 0, 0)
+    with pytest.raises(pc.CloudError): pc.read_clouds([tmp_path / 'a.lax'])
+
+def test_pointcloud_alignment_recovers_pose_and_height_datum():
+    np = pytest.importorskip('numpy'); pytest.importorskip('scipy')
+    import math
+    from app import pointcloud as pc
+    rng = np.random.default_rng(5)
+    # a "tower": vertical poles and platforms (surfaces the sparse points lie on), in local metres
+    poles = np.vstack([np.c_[np.full(3000, x) + rng.normal(0, .02, 3000), np.full(3000, y) + rng.normal(0, .02, 3000), rng.uniform(0, 30, 3000)] for x, y in ((0, 0), (3, 0), (0, 3), (3, 3))])
+    deck = np.vstack([np.c_[rng.uniform(-1, 4, 4000), rng.uniform(-1, 4, 4000), np.full(4000, z)] for z in (10, 20, 30)])
+    ground = np.c_[rng.uniform(-30, 30, 20000), rng.uniform(-30, 30, 20000), rng.normal(0, .03, 20000)]
+    cloud = np.vstack([poles, deck, ground])
+    # the camera model's frame: arbitrary scale, rotation and offset; GPS heights 40 m above the cloud's datum
+    s, a = 0.25, .8; R = np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]]) @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    to_model = lambda X: (X @ R) / s + [5, -2, 1]
+    cams = np.c_[20 * np.cos(np.linspace(0, 6, 30)), 20 * np.sin(np.linspace(0, 6, 30)), np.full(30, 25.0)]
+    gps = cams + [0, 0, 40] + rng.normal(0, .02, (30, 3))
+    sparse = to_model(cloud[rng.choice(len(cloud), 3000, replace=False)] + rng.normal(0, .01, (3000, 3)))
+    r = pc.align(to_model(cams), gps, sparse, cloud)
+    back = r['s'] * to_model(cams) @ r['R'].T + r['t']
+    assert abs(r['vertical_shift_m'] + 40) < .1 and np.abs(back - cams).max() < .1 and r['inliers_pct'] > 80
+
+def test_pointcloud_upload_and_cloud_only_model(monkeypatch):
+    pytest.importorskip('laspy'); np = pytest.importorskip('numpy')
+    import io, os, tempfile
+    from pathlib import Path
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'scan only'}).json()
+        assert client.post(f"/api/v1/inspections/{ins['id']}/pointclouds", files={'file': ('x.exe', b'MZ', 'application/octet-stream')}).status_code == 415
+        assert client.post(f"/api/v1/inspections/{ins['id']}/pointcloud-model").status_code == 409  # nothing uploaded yet
+        tmp = Path(tempfile.mkdtemp()) / 'tower.las'
+        z = np.linspace(0, 30, 4000); _write_las(tmp, np.c_[np.cos(z) * 2, np.sin(z) * 2, z] + [500_000, 200_000, 50])
+        up = client.post(f"/api/v1/inspections/{ins['id']}/pointclouds", files={'file': ('tower.las', tmp.read_bytes(), 'application/octet-stream')})
+        assert up.status_code == 201 and up.json()['file_format'] == 'las' and up.json()['role'] == 'cloud'
+        assert client.post(f"/api/v1/inspections/{ins['id']}/pointclouds", files={'file': ('tower.lax', b'LASX', 'application/octet-stream')}).json()['role'] == 'sidecar'
+        job = client.post(f"/api/v1/inspections/{ins['id']}/pointcloud-model")
+        assert job.status_code == 202, job.text
+        m = client.get(f"/api/v1/inspections/{ins['id']}/models").json()[0]
+        assert m['status'] == 'completed', m['quality'] and m['quality']['source'] == 'pointcloud'
+        q = m['quality']; assert q['boxes_available'] is False and 'no photos' in q['boxes_note'] and q['pointcloud']['points_total'] == 4000
+        assert abs(q['scale']['m_per_unit'] * 10 - 30.0) < 3  # ~10 viewer units across a ~30 m tall cloud
+        assert client.get(m['urls']['web_points']).status_code == 200
+        assert client.delete(f"/api/v1/pointclouds/{up.json()['id']}").status_code == 204

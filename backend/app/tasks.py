@@ -83,6 +83,81 @@ def reconstruct_model(payload, progress):
         except Exception:
             storage.push(work / 'colmap.log'); raise
 
+def pointcloud_model(payload, progress):
+    """payload: {'work', 'clouds': [keys incl. .lax/.prj sidecars], 'photos': [keys in build order]} -> model result.
+    The uploaded cloud is the 3D model (no dense photogrammetry). With photos, a COLMAP sparse camera solve is aligned to
+    it (GPS/RTK + height search + ICP, app/pointcloud.py) so 3D equipment boxes can be placed; without photos, or
+    when the cloud has no coordinate system, the cloud is shown on its own and boxes are not available."""
+    import json, time
+    import numpy as np
+    from . import pointcloud as pc, scale as sc
+    work = reconstruct.RECON_DIR / payload['work']; work.mkdir(parents=True, exist_ok=True); log = work / 'colmap.log'; t0 = time.time()
+    with _recon_lock:
+        try:
+            progress('downloading', 1, f"Fetching {len(payload['clouds'])} point cloud file(s) and {len(payload['photos'])} photo(s)")
+            clouds = [storage.fetch(ROOT / k) for k in payload['clouds']]; photos = [storage.fetch(ROOT / k) for k in payload['photos']]
+            crs = pc.peek_crs(clouds)
+            names = [f'photos/{i:05d}{Path(p).suffix.lower()}' for i, p in enumerate(photos[:reconstruct.MAX_IMAGES])]
+            gps = {n: sc.read_position(p) for n, p in zip(names, photos)}; gps = {n: g for n, g in gps.items() if g and g.get('alt') is not None}
+            use_photos = len(photos) >= 3 and crs is not None and len(gps) >= 4
+            roi = None
+            if use_photos:  # survey tiles are large: keep the area around the flight
+                G = pc.gps_to_cloud(list(gps.values()), crs); r = max(float(np.ptp(G[:, :2], axis=0).max()) / 2, 10) + pc.ROI_MARGIN_M; c = G[:, :2].mean(0)
+                roi = (c[0] - r, c[0] + r, c[1] - r, c[1] + r)
+            progress('reading_cloud', 4, 'Reading the point cloud')
+            cloud = pc.read_clouds(clouds, pc.MODEL_POINTS, roi, progress=lambda msg: progress('reading_cloud', 6, msg))
+            origin = np.median(cloud['points'], 0); L = cloud['points'] - origin  # local metres (float precision)
+            info = {'files': [Path(k).name for k in payload['clouds']], 'points_total': cloud['total'], 'points_used': cloud['kept'],
+                    'crs': cloud['crs'].name if cloud['crs'] is not None else None, 'units': cloud['units'], 'origin': [round(float(v), 3) for v in origin],
+                    'cropped_to_flight': roi is not None}
+            if use_photos:
+                span = lambda a, b: (lambda stage, pct, detail: progress(stage, int(a + (b - a) * pct / 100), detail))
+                stats, img, best, cams, sparse = reconstruct.sparse_stage(work, photos, [], span(15, 70), log)  # cameras only: no dense stereo
+                progress('aligning', 72, 'Aligning the photos to the point cloud (GPS + ICP)')
+                Gl = {n: v - origin for n, v in zip(gps, pc.gps_to_cloud(list(gps.values()), crs))}
+                pairs = [(np.asarray(c['center'], float), Gl[c['name']]) for c in cams if c['name'] in Gl]
+                if len(pairs) < 4: raise pc.CloudError('too few solved photos have GPS positions to align them with the point cloud')
+                a = pc.align(np.array([p[0] for p in pairs]), np.array([p[1] for p in pairs]), np.asarray(sparse['points'], float), L,
+                             progress=lambda msg: progress('aligning', 78, msg))
+                model_pts = ((L - a['t']) @ a['R']) / a['s']  # cloud in the camera model's frame: registration works unchanged
+                (work / 'dense').mkdir(exist_ok=True); reconstruct.write_ply(work / 'dense' / 'fused.ply', model_pts.astype(np.float32), cloud['colors'])
+                M = reconstruct.normalising_transform(sparse['points'], cams)
+                progress('exporting', 92, 'Preparing the model for the viewer')
+                web_files, n_web = reconstruct.export_web(work, M, {'points': model_pts, 'colors': cloud['colors']}, None, cams)
+                m_per_unit = a['s'] / float(np.linalg.norm(M[:3, 0]))  # viewer = |M| R (L - t) / s  ->  metres per viewer unit
+                info['alignment'] = {k: a[k] for k in ('gps_residual_m', 'vertical_shift_m', 'icp_rms_m', 'inliers_pct')}
+                ok = (a['inliers_pct'] or 0) >= 30
+                result = {**stats, 'dense': True, 'dense_points': int(len(model_pts)), 'mesh_faces': 0,
+                          'files': {'sparse_ply': 'sparse.ply', 'log': 'colmap.log', 'dense_ply': 'dense/fused.ply', **web_files},
+                          'web_points': n_web, 'transform': M.round(8).tolist(), 'boxes_available': True}
+                if not ok: result['warning'] = f"Only {a['inliers_pct']}% of the photo points touch the point cloud: the cloud may not show this tower, and 3D boxes may be misplaced"
+                result['scale'] = {'m_per_unit': round(m_per_unit, 6), 'method': 'pointcloud', 'rtk': all(g.get('rtk') for g in gps.values()), 'cameras': len(pairs),
+                                   'residual_median_m': a['gps_residual_m'], 'note': f"from the uploaded point cloud ({cloud['units']})"}
+            else:
+                M, s = pc.viewer_transform(L)
+                web = work / 'web'; web.mkdir(exist_ok=True); k = min(len(L), reconstruct.WEB_POINTS)
+                sel = np.random.default_rng(0).choice(len(L), k, replace=False) if len(L) > k else slice(None)
+                reconstruct.write_ply(web / 'points.ply', reconstruct._apply(M, L[sel]).astype(np.float32), cloud['colors'][sel])
+                (work / 'dense').mkdir(exist_ok=True); reconstruct.write_ply(work / 'dense' / 'fused.ply', L.astype(np.float32), cloud['colors'])
+                (web / 'cameras.json').write_text('[]')
+                why = ('no photos to place the 3D boxes' if len(photos) < 3 else 'the point cloud has no coordinate system' if crs is None
+                       else 'the photos have no GPS positions')
+                result = {'registered_images': 0, 'images_total': len(photos), 'sparse_points': 0, 'dense': True, 'dense_points': int(len(L)), 'mesh_faces': 0,
+                          'files': {'web_points': 'web/points.ply', 'web_cameras': 'web/cameras.json', 'dense_ply': 'dense/fused.ply', 'log': 'colmap.log'},
+                          'web_points': int(k), 'transform': M.round(8).tolist(), 'boxes_available': False, 'boxes_note': f'3D boxes are not available: {why}',
+                          'scale': {'m_per_unit': round(1 / s, 6), 'method': 'pointcloud', 'note': f"from the uploaded point cloud ({cloud['units']})"}}
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, 'a', encoding='utf-8') as f: f.write('point cloud import: ' + json.dumps(info) + chr(10))
+            result.update(source='pointcloud', pointcloud=info, seconds=round(time.time() - t0))
+            if storage.enabled(): progress('uploading', 99, 'Saving the model to storage'); storage.push_tree(work, skip=('images',))
+            return result
+        except pc.CloudError as e:
+            storage.push(log); raise HTTPException(422, str(e))
+        except Exception:
+            storage.push(log); raise
+        finally:
+            reconstruct.cleanup(work)
+
 def scale_of(work, photo_keys):
     """Metres per viewer unit of a built model: its cameras (web/cameras.json) fitted to the photos' GPS positions."""
     import json
@@ -144,5 +219,5 @@ def plain(v):
     if isinstance(v, (list, tuple)): return [plain(x) for x in v]
     return v.tolist() if hasattr(v, 'tolist') else v
 
-COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'model_scale': model_scale, 'vendor_suggestion': vendor_suggestion,
+COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'run_pointcloud_model': pointcloud_model, 'model_scale': model_scale, 'vendor_suggestion': vendor_suggestion,
            'condition_assessment': condition_assessment, 'register_assets': register_assets}

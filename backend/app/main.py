@@ -14,10 +14,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, update, delete, inspect, text, and_, or_
 from .database import Base, engine, SessionLocal
-from .models import Site, Inspection, Media, Asset, Defect, Job, Model3D, RegistrationCandidate, Detection, ImageReview, Annotation, now
+from .models import PointCloudFile, Site, Inspection, Media, Asset, Defect, Job, Model3D, RegistrationCandidate, Detection, ImageReview, Annotation, now
 from . import detector, vendor, condition, frames, reconstruct, registration, storage, gpu, media_paths
 from .tasks import ROOT  # uploads folder; it and the 3D/reference folders are backed by the bucket when one is configured
 from . import auth
+from . import pointcloud as pointcloud_mod
 MAX_SIZE = int(os.getenv('MAX_UPLOAD_BYTES', str(500 * 1024 * 1024)))
 ALLOWED = {'image/jpeg':'.jpg','image/png':'.png','image/tiff':'.tif','video/mp4':'.mp4','video/quicktime':'.mov'}  # stored extension comes from the checked type, never the client's filename
 WORKFLOWS = {'ai_detection','manual_qc'}
@@ -394,6 +395,67 @@ async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends
     except Exception:
         target.unlink(missing_ok=True)
         raise
+# ---------- uploaded point clouds (optional; replace COLMAP's dense reconstruction) ----------
+POINTCLOUD_MAX=int(os.getenv('POINTCLOUD_MAX_BYTES',str(10*1024**3)))
+def _pc_dict(x):return to_dict(x)|{'role':'sidecar' if '.'+x.file_format in pointcloud_mod.SIDECAR_EXT else 'cloud'}
+@app.post('/api/v1/inspections/{inspection_id}/pointclouds',status_code=201)
+async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Session=Depends(get_db)):
+    """A point cloud for this inspection (.las .laz .ply .xyz .pts .txt .csv) or its sidecar (.lax index, .prj coordinate system)."""
+    inspection=db.get(Inspection,inspection_id)
+    if not inspection:raise HTTPException(404,'Inspection not found')
+    site=db.get(Site,inspection.site_id);name=Path(file.filename or 'cloud').name[:255];ext=Path(name).suffix.lower()
+    if ext not in pointcloud_mod.CLOUD_EXT|pointcloud_mod.SIDECAR_EXT:raise HTTPException(415,'Point clouds: .las .laz .ply .xyz .pts .txt .csv (sidecars .lax .prj)')
+    key=(media_paths.inspection_root(site.code if site else 'SITE',inspection.id)/'pointclouds'/f'{uuid.uuid4().hex[:12]}_{media_paths._segment(Path(name).stem,"cloud",70)}{ext}').as_posix()
+    target=ROOT/key;target.parent.mkdir(parents=True,exist_ok=True);size=0;sha=hashlib.sha256()
+    try:
+        with target.open('wb') as out:
+            while chunk:=await file.read(4*1024*1024):
+                size+=len(chunk)
+                if size>POINTCLOUD_MAX:raise HTTPException(413,f'Point cloud larger than {POINTCLOUD_MAX//1024**3} GB')
+                sha.update(chunk);out.write(chunk)
+        await run_in_threadpool(storage.push,target)
+        x=PointCloudFile(inspection_id=inspection_id,filename=name,storage_key=key,file_format=ext[1:],size_bytes=size,sha256=sha.hexdigest())
+        db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
+    except Exception:
+        target.unlink(missing_ok=True);raise
+@app.get('/api/v1/inspections/{inspection_id}/pointclouds')
+def pointclouds(inspection_id:int,db:Session=Depends(get_db)):
+    return [_pc_dict(x) for x in db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==inspection_id).order_by(PointCloudFile.id)).all()]
+@app.delete('/api/v1/pointclouds/{file_id}',status_code=204)
+def delete_pointcloud(file_id:int,db:Session=Depends(get_db)):
+    x=db.get(PointCloudFile,file_id)
+    if not x:raise HTTPException(404,'Point cloud not found')
+    (ROOT/x.storage_key).unlink(missing_ok=True);storage.delete(ROOT/x.storage_key);db.delete(x);db.commit();return Response(status_code=204)
+@app.post('/api/v1/inspections/{inspection_id}/pointcloud-model',status_code=202)
+def build_pointcloud_model(inspection_id:int,background:BackgroundTasks,db:Session=Depends(get_db)):
+    """3D model from the uploaded point cloud(s): no dense photogrammetry. With >=3 photos (GPS) their cameras are solved
+    and aligned to the cloud so the 3D equipment boxes work as usual."""
+    if not db.get(Inspection,inspection_id):raise HTTPException(404,'Inspection not found')
+    files=db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==inspection_id)).all()
+    if not any('.'+f.file_format in pointcloud_mod.CLOUD_EXT for f in files):raise HTTPException(409,'Upload a point cloud (.las, .laz, .ply, .xyz ...) first')
+    if (s:=colmap_state())=='worker_offline':raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
+    items=db.scalars(select(Media).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None))).all()
+    photos=[m for m in items if m.content_type.startswith('image/')]
+    if len(photos)>=3 and s!='ready':raise HTTPException(503,f'COLMAP {s.replace("_"," ")}: needed to place the photos on the point cloud')
+    job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in photos],
+            detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), {len(photos)} photo(s)')
+    db.add(job);db.flush();m3=Model3D(inspection_id=inspection_id,job_id=job.id,dense=True,status='queued',quality={'source':'pointcloud'});db.add(m3);db.commit()
+    gpu.start(background,'run_pointcloud_model',job_id=job.id,model_id=m3.id);return to_dict(job)|{'model_id':m3.id}
+def _pc_prepare(db,job_id,model_id):
+    job,m3=db.get(Job,job_id),db.get(Model3D,model_id);job.status=m3.status='running';db.commit()
+    files=db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==job.inspection_id).order_by(PointCloudFile.id)).all()
+    items=db.scalars(select(Media).where(Media.id.in_(job.media_ids or []))).all()
+    return {'work':f'{job.inspection_id}_{job.id}','clouds':[f.storage_key for f in files],'photos':_photo_keys(items)}
+def _pc_apply(db,r,job_id,model_id):
+    job,m3=db.get(Job,job_id),db.get(Model3D,model_id)
+    m3.quality=r;m3.status='completed';m3.url=f'/recon/{job.inspection_id}_{job.id}/'+r['files']['web_points']
+    job.status='completed';job.progress=100;job.stage='done';info=r.get('pointcloud') or {};al=info.get('alignment')
+    job.detail=(f"3D model from point cloud: {info.get('points_total',0):,} points ({info.get('points_used',0):,} used)"
+                +(f" · {r['registered_images']}/{r['images_total']} photos aligned (ICP {al['icp_rms_m']} m, {al['inliers_pct']}% on the cloud)" if al else f" · {r.get('boxes_note','')}")
+                +(f" · {r['warning']}" if r.get('warning') else '')+f" · {r['seconds']}s")[:2000]
+    db.commit();return {'model_id':m3.id,'status':m3.status}
+def _pc_fail(db,error,job_id,model_id):_recon_fail(db,error,job_id,model_id,True)
+gpu.register('run_pointcloud_model',prepare=_pc_prepare,apply=_pc_apply,fail=_pc_fail,progress=lambda *a,**k:_job_progress(*a,**k))  # defined further down
 @app.get('/api/v1/inspections/{inspection_id}/media')
 def media(inspection_id:int,db:Session=Depends(get_db)):
     return [to_dict(m)|{'url':f'/uploads/{m.storage_key}'} for m in db.scalars(select(Media).where(Media.inspection_id==inspection_id)).all()]

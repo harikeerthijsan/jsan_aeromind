@@ -219,3 +219,16 @@ class WorkerState(Base):
     name: Mapped[str] = mapped_column(String(80))
     info: Mapped[dict] = mapped_column(JSON, default=dict)
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class PointCloudFile(Base):
+    # An uploaded point cloud (LAS/LAZ/PLY/XYZ...) or its sidecar (.lax index, .prj coordinate system) for an inspection.
+    # Building from it replaces COLMAP's dense reconstruction (see app/pointcloud.py).
+    __tablename__ = 'point_cloud_files'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inspection_id: Mapped[int] = mapped_column(ForeignKey('inspections.id'), index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(500))
+    file_format: Mapped[str] = mapped_column(String(16))  # extension without the dot: las, laz, ply, xyz, pts, txt, csv, lax, prj
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

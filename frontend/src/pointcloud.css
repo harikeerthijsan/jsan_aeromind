@@ -1,0 +1,30 @@
+/* Optional point cloud upload (PointCloudPanel.tsx). pc- = point cloud. */
+.pc-panel{margin-top:18px;border:1px solid #e1e9f0;border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:12px;background:#fbfcfe}
+.pc-panel.compact{margin-top:0}
+.pc-head{display:flex;gap:10px;align-items:flex-start;color:#1769aa}
+.pc-head b{display:block;color:#172c46;font-size:13px}
+.pc-head em{font-style:normal;font-size:10px;font-weight:700;color:#5f7287;background:#eef2f5;border-radius:4px;padding:2px 6px;margin-left:6px;vertical-align:1px}
+.pc-head small{display:block;color:#8b9aaa;font-size:11px;margin-top:2px}
+.pc-explain{margin:0;font-size:11.5px;line-height:1.55;color:#5f7287}
+.pc-drop{position:relative;display:flex;gap:10px;align-items:center;border:1.5px dashed #b9cde0;border-radius:10px;padding:12px 14px;color:#1769aa;cursor:pointer;background:#fff}
+.pc-drop:hover{border-color:#1769aa;background:#f3f8fd}
+.pc-drop.disabled{opacity:.6;cursor:wait}
+.pc-drop b{display:block;font-size:12.5px;color:#172c46}
+.pc-drop small{display:block;font-size:10.5px;color:#8b9aaa}
+.pc-drop input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.pc-progress div{display:flex;justify-content:space-between;font-size:11px;color:#5f7287;margin-bottom:5px;gap:10px}
+.pc-progress div span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pc-progress i{display:block;height:6px;border-radius:4px;background:#dce8f5;overflow:hidden}
+.pc-progress s{display:block;height:100%;background:#1769aa;transition:width .3s}
+.pc-files{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.pc-files li{display:flex;align-items:center;gap:9px;background:#fff;border:1px solid #edf1f5;border-radius:8px;padding:7px 9px;font-size:12px}
+.pc-files li b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;color:#172c46}
+.pc-files li small{color:#8b9aaa;font-size:11px;white-space:nowrap}
+.pc-files li button{border:0;background:none;color:#8b9aaa;padding:3px;border-radius:5px;display:grid;place-items:center}
+.pc-files li button:hover{background:#ffeee9;color:#c6463b}
+.pc-fmt{font-size:9.5px;font-weight:800;text-transform:uppercase;border-radius:4px;padding:3px 6px;background:#e9f3fb;color:#1769aa}
+.pc-fmt.sidecar{background:#eef2f5;color:#65788c}
+.pc-build{align-self:flex-start}
+.pc-note,.pc-error{display:flex;gap:7px;align-items:flex-start;font-size:11.5px;border-radius:8px;padding:8px 10px}
+.pc-note{background:#e6f7ef;color:#16835a}.pc-error{background:#fee9e4;color:#a93d31}
+.pc-note svg,.pc-error svg{flex-shrink:0;margin-top:1px}
