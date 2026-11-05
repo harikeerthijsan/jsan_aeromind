@@ -46,9 +46,15 @@ def class_names():
     return {int(k): v for k, v in _model.names.items()} if _model is not None else {}
 
 def detect(path, video=False):
-    """Yield (frame_index, width, height, boxes) per image or sampled video frame. Boxes are pixel xyxy."""
+    """Yield (frame_index, width, height, boxes) per image or sampled video frame. Boxes are pixel xyxy.
+    path may also be an encoded image in memory (bytes): photos read straight from the bucket never touch the disk."""
+    if isinstance(path, (bytes, bytearray, memoryview)):
+        import cv2, numpy as np
+        source = cv2.imdecode(np.frombuffer(path, np.uint8), cv2.IMREAD_COLOR)
+        if source is None: raise ValueError('not a readable image')
+    else: source = str(path)
     with _lock:
-        results = _load().predict(source=str(path), imgsz=IMGSZ, conf=CONF, iou=IOU, max_det=MAX_DET, device=DEVICE, vid_stride=VID_STRIDE, stream=True, verbose=False)
+        results = _load().predict(source=source, imgsz=IMGSZ, conf=CONF, iou=IOU, max_det=MAX_DET, device=DEVICE, vid_stride=VID_STRIDE, stream=True, verbose=False)
         for i, r in enumerate(results):
             h, w = r.orig_shape
             # ultralytics grabs vid_stride frames before each retrieve, so sample i is source frame (i+1)*stride-1

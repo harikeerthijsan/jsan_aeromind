@@ -37,11 +37,21 @@ def _crs_parts(crs):
           crs.axis_info[2].unit_conversion_factor if len(crs.axis_info) > 2 else fh)
     return horiz, float(fh or 1.0), float(fv or 1.0)
 
+def _source(p):
+    """(file name, source): a cloud is a path, or a (name, source) pair where source is an open seekable stream (LAS/LAZ
+    read straight from the bucket) or, for a .prj sidecar, its bytes."""
+    return (p[0], p[1]) if isinstance(p, tuple) else (Path(p).name, Path(p))
+
+def _las(src):
+    import laspy
+    if isinstance(src, Path): return laspy.open(src)
+    src.seek(0); return laspy.open(src, closefd=False)
+
 def _prj_crs(paths):
     from pyproj import CRS
-    for p in paths:
-        if Path(p).suffix.lower() == '.prj':
-            try: return CRS.from_wkt(Path(p).read_text(encoding='utf-8', errors='replace'))
+    for name, src in map(_source, paths):
+        if Path(name).suffix.lower() == '.prj':
+            try: return CRS.from_wkt(src.decode('utf-8', 'replace') if isinstance(src, bytes) else Path(src).read_text(encoding='utf-8', errors='replace'))
             except Exception: pass
     return None
 
@@ -56,11 +66,10 @@ def _e57_crs(path):
 
 def peek_crs(paths):
     """The coordinate system of the first cloud that has one (LAS header or E57 metadata, else a .prj sidecar)."""
-    import laspy
-    for p in paths:
-        if Path(p).suffix.lower() == '.e57' and (c := _e57_crs(p)) is not None: return c
-        if Path(p).suffix.lower() in ('.las', '.laz'):
-            with laspy.open(p) as r:
+    for name, p in map(_source, paths):
+        if Path(name).suffix.lower() == '.e57' and (c := _e57_crs(p)) is not None: return c
+        if Path(name).suffix.lower() in ('.las', '.laz'):
+            with _las(p) as r:
                 try:
                     if (c := r.header.parse_crs()) is not None: return c
                 except Exception: pass
@@ -103,15 +112,14 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None):
             for i in range(len(parts)):
                 m = rng.random(len(parts[i])) < .5; parts[i] = parts[i][m]; cols[i] = cols[i][m] if cols[i] is not None else None
             keep_p *= .5
-    clouds = [Path(p) for p in paths if Path(p).suffix.lower() in CLOUD_EXT]
+    clouds = [s for s in map(_source, paths) if Path(s[0]).suffix.lower() in CLOUD_EXT]
     if not clouds: raise CloudError('no point cloud file (.las, .laz, .ply, .xyz, .pts, .txt, .csv)')
     prj = _prj_crs(paths)
-    for n, p in enumerate(clouds, 1):
-        ext = p.suffix.lower()
-        if progress: progress(f'Reading {p.name} ({n}/{len(clouds)})')
+    for n, (name, p) in enumerate(clouds, 1):
+        ext = Path(name).suffix.lower()
+        if progress: progress(f'Reading {name} ({n}/{len(clouds)})')
         if ext in ('.las', '.laz'):
-            import laspy
-            with laspy.open(p) as r:
+            with _las(p) as r:
                 try: c = r.header.parse_crs()
                 except Exception: c = None
                 crs = crs or c or prj; _, fh, fv = _crs_parts(c or prj)
@@ -120,11 +128,12 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None):
                     P = np.c_[np.asarray(chunk.x) * fh, np.asarray(chunk.y) * fh, np.asarray(chunk.z) * fv]; total += len(P)
                     C = _colours(chunk, names); intensity = intensity or (C is not None and C.ndim == 1)
                     add(P, C if C is None or C.ndim == 2 else C)
+                    if progress: progress(f'Reading {name}: {total / 1e6:.0f} of {r.header.point_count / 1e6:.0f} M points')
         elif ext == '.e57':  # E57 is always metres; scans are placed in the file's global frame (transform=True)
             import pye57
             f = pye57.E57(str(p)); crs = crs or _e57_crs(p) or prj
             for i in range(f.scan_count):
-                if progress and f.scan_count > 1: progress(f'Reading {p.name}: scan {i + 1}/{f.scan_count}')
+                if progress and f.scan_count > 1: progress(f'Reading {name}: scan {i + 1}/{f.scan_count}')
                 d = f.read_scan(i, intensity=True, colors=True, ignore_missing_fields=True)
                 P = np.c_[d['cartesianX'], d['cartesianY'], d['cartesianZ']].astype(np.float64); total += len(P)
                 C = None

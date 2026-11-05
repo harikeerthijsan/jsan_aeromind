@@ -152,9 +152,11 @@ def _clusters(rows, radius):
                        'detection_ids': [rows[i]['detection_id'] for i in members]})
     return result
 
-def build_candidates(work: Path, transform, media, detections, dense_path: Path | None = None, reviewed_media=()):
+def build_candidates(work: Path, transform, media, detections, dense_path: Path | None = None, reviewed_media=(), refine_poses=False):
     """Return reviewable candidate dicts in the same coordinate frame as web/*.ply.
-    Detections on photos a reviewer approved are used whatever their confidence (the class floor is for raw YOLO output)."""
+    Detections on photos a reviewer approved are used whatever their confidence (the class floor is for raw YOLO output).
+    refine_poses: the camera poses come from drone metadata (no COLMAP solve): they are corrected from a first pass
+    before the boxes are placed (see refine_rotations)."""
     import numpy as np
     work = Path(work); sparse = work/'sparse'/'0'
     if not sparse.is_dir():
@@ -205,7 +207,11 @@ def build_candidates(work: Path, transform, media, detections, dense_path: Path 
             for c in _clusters(rows, rule_for(class_name)['radius']): out.append({'class_name':class_name,**c})
         out = add_boxes(out)
         if dense_path and Path(dense_path).is_file():  # place, group and size everything from the dense cloud instead
-            out = dense_candidates(reconstruct.read_ply(dense_path)['points'], M, photos, photo_names, by_media, observations, _read_camera_models(txt/'cameras.txt'))
+            dense_pts, cams = reconstruct.read_ply(dense_path)['points'], _read_camera_models(txt/'cameras.txt')
+            if refine_poses:
+                groups = []; dense_candidates(dense_pts, M, photos, photo_names, by_media, observations, cams, groups_out=groups)
+                observations = refine_rotations(observations, cams, groups)
+            out = dense_candidates(dense_pts, M, photos, photo_names, by_media, observations, cams)
         return sorted(out,key=lambda c:(c['class_name'],-c['confidence'],-c['media_count']))
     finally:
         try: converter.close()
@@ -334,8 +340,9 @@ def _group(rows, radius_of):
         if len(set(media[members].tolist())) >= 2: groups.append(members.tolist())
     return groups
 
-def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, cameras):
-    """Candidates (viewer coordinates, with fitted boxes) from the dense cloud; see the comment above."""
+def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, cameras, groups_out=None):
+    """Candidates (viewer coordinates, with fitted boxes) from the dense cloud; see the comment above.
+    groups_out: filled with (model-space centre, [(photo name, detection)]) of every group, for refine_rotations."""
     import numpy as np
     M = np.asarray(M, float); s = float(np.linalg.norm(M[:3, 0])); Rm, T = M[:3, :3] / s, M[:3, 3]
     to_view = lambda X: s * (np.atleast_2d(X) @ Rm.T) + T
@@ -370,12 +377,56 @@ def dense_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, c
         obj = c.pop('_obj'); box = fit_box(obj, axis) if obj is not None else None
         if box: c.update(box, box_method='dense', box_points=int(len(obj)))
         fit_to_detections(c, c['_views'], poses, cameras, M, move_centre=c['class_name'] not in SURFACE_ANCHORED_CLASSES)
+    if groups_out is not None:
+        groups_out.extend((((np.asarray(c['position']) - T) @ Rm) / s, c['_views']) for c in out if len(c['_views']) >= 3)
+        return []
     out = merge_duplicate_candidates(out, poses, cameras, M)
     clean = []
     for c in out:
         c.pop('_views', None)
         if candidate_is_valid(c): clean.append(c)
     return clean
+
+# ---------- camera rotations from drone metadata ----------
+# Gimbal angles are good to about a degree: tens of pixels at 20-30 m, enough to split one antenna's detections into
+# several groups. Each photo's rotation is corrected (camera centre kept: RTK positions are cm-accurate) so the
+# first-pass group centres project onto that photo's detection boxes, like a bundle adjustment on the equipment.
+REFINE_MAX_DEG = 3.0
+REFINE_HUBER_PX = 25.0
+
+def _rotvec(w):
+    import numpy as np
+    a = float(np.linalg.norm(w))
+    if a < 1e-12: return np.eye(3)
+    k = w / a; K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(a) * K + (1 - math.cos(a)) * K @ K
+
+def refine_rotations(poses, cameras, groups, min_matches=3):
+    """poses: name -> (xy, ids, centre, camera id, R, t) -> the same with each photo's R, t corrected (small rotation,
+    robust least squares on detection-box centres). Photos with too few matched groups keep their metadata pose."""
+    import numpy as np
+    obs = defaultdict(list)
+    for X, views in groups:
+        for name, det in views: obs[name].append((X, ((det.x1 + det.x2) / 2, (det.y1 + det.y2) / 2)))
+    out = dict(poses)
+    for name, pairs in obs.items():
+        if len(pairs) < min_matches or name not in poses: continue
+        xy, ids, C, cid, R0, _ = poses[name]; cam = cameras[cid]
+        X = np.array([p[0] for p in pairs]); u = np.array([p[1] for p in pairs], float)
+        def residual(w):
+            R = _rotvec(w) @ R0; uv, z = project(X, R, -R @ C, cam); return (uv - u).ravel(), z
+        def cost(r): a = np.abs(r); return float(np.sum(np.where(a <= REFINE_HUBER_PX, .5 * a * a, REFINE_HUBER_PX * (a - .5 * REFINE_HUBER_PX))))
+        w = np.zeros(3); r, z = residual(w)
+        if (z <= 0).any(): continue
+        start = cost(r)
+        for _ in range(8):  # Gauss-Newton with Huber weights; numeric Jacobian (3 unknowns)
+            J = np.stack([(residual(w + e)[0] - r) / 1e-6 for e in np.eye(3) * 1e-6], 1)
+            wt = np.where(np.abs(r) <= REFINE_HUBER_PX, 1.0, REFINE_HUBER_PX / np.maximum(np.abs(r), 1e-9))
+            step = np.linalg.lstsq(J * wt[:, None] ** .5, -r * wt ** .5, rcond=None)[0]; w = w + step; r, z = residual(w)
+            if np.linalg.norm(step) < 1e-7: break
+        if math.degrees(np.linalg.norm(w)) > REFINE_MAX_DEG or (z <= 0).any() or cost(r) >= start: continue
+        R = _rotvec(w) @ R0; out[name] = (xy, ids, C, cid, R, -R @ C)
+    return out
 
 def _candidate_box_iou(a, b):
     """IoU of two detection records that belong to the same source image."""

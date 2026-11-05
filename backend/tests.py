@@ -1146,3 +1146,92 @@ def test_build_photos_spread_over_the_whole_flight(monkeypatch):
     photos = [SimpleNamespace(id=i, filename=f'DJI_{i:04d}.JPG') for i in range(100, 0, -1)]  # any upload order
     assert [m.id for m in main._flight_photos(photos)] == [1, 26, 51, 75, 100]
     assert [m.id for m in main._flight_photos(photos[-3:])] == [1, 2, 3]  # few photos: all, in flight order
+
+def _dji_head(lat, lon, alt, rel, yaw, pitch, roll=0.0, w=4000, h=3000, f=3000.0):
+    """First bytes of a DJI photo: XMP (RTK position, gimbal angles, lens calibration) and the JPEG frame header."""
+    xmp = (f'<x:xmpmeta><rdf:Description drone-dji:GpsLatitude="{lat}" drone-dji:GpsLongitude="{lon}" drone-dji:AbsoluteAltitude="{alt}" '
+           f'drone-dji:RelativeAltitude="{rel}" drone-dji:RtkFlag="50" drone-dji:GimbalYawDegree="{yaw}" drone-dji:GimbalPitchDegree="{pitch}" '
+           f'drone-dji:GimbalRollDegree="{roll}" drone-dji:DewarpData="2022-01-01;{f},{f},0,0,0,0,0,0,0"/></x:xmpmeta>').encode()
+    app1 = b'http://ns.adobe.com/xap/1.0/\x00' + xmp
+    sof = bytes([8]) + h.to_bytes(2, 'big') + w.to_bytes(2, 'big') + bytes([3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1])
+    return b'\xff\xd8\xff\xe1' + (len(app1) + 2).to_bytes(2, 'big') + app1 + b'\xff\xc0' + (len(sof) + 2).to_bytes(2, 'big') + sof
+
+def test_photo_pose_from_drone_metadata():
+    """A camera's metadata pose: the point it aims at projects to the image centre, a point to its right right of it."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('pyproj')
+    from pyproj import CRS
+    from app import photo_pose as pp
+    m = pp.read(_dji_head(53.5, -3.0, 150.0, 30.0, yaw=90.0, pitch=-30.0))  # facing east, 30 degrees down, on UTM 30N's central meridian
+    assert (m['w'], m['h'], m['fx'], m['cx'], m['rtk']) == (4000, 3000, 3000.0, 2000.0, True)
+    cams, info = pp.poses([m], CRS.from_epsg(32630), np.zeros(3)); c = cams[0]
+    d = np.array([np.cos(np.radians(30)), 0, -np.sin(np.radians(30))])  # east and down
+    uv, z = pp.project(c, np.array([c['C'] + 20 * d, c['C'] + 20 * d + [0, -1, 0], c['C'] + 20 * d + [0, 0, 1]]))
+    assert np.allclose(uv[0], [2000, 1500], atol=1) and z[0] > 0
+    assert uv[1][0] > 2000 + 100   # one metre south = to the camera's right
+    assert uv[2][1] < 1500 - 100   # one metre up = higher in the image
+    assert pp.read(b'\xff\xd8 no metadata') is None
+    T = pp.target([{'C': np.array([10.0, 0, 5]), 'R': np.vstack([[0, 1, 0], [0, 0, -1], [-1, 0, 0]])},
+                   {'C': np.array([0.0, 10, 5]), 'R': np.vstack([[1, 0, 0], [0, 0, -1], [0, -1, 0]])}])
+    assert np.allclose(T[:2], [0, 0], atol=1e-6)  # two cameras looking at the origin from the east and the north
+
+def test_las_header_crs_resolves_to_epsg_for_the_national_grids():
+    """LAS WKT1 'OSGB36 / BNG + ODN height' with a geoid EXTENSION is not matched by PROJ on its own (it then used a
+    ballpark transformation: 49 m off in height); it must resolve to EPSG:27700+5701 = 7405."""
+    pytest.importorskip('pyproj')
+    from pyproj import CRS
+    from app import photo_pose as pp
+    wkt = ('COMPD_CS["OSGB36 / British National Grid + ODN height",PROJCS["OSGB36 / British National Grid",GEOGCS["OSGB36",DATUM["Ordnance_Survey_of_Great_Britain_1936",'
+           'SPHEROID["Airy 1830",6377563.396,299.3249646,AUTHORITY["EPSG","7001"]],AUTHORITY["EPSG","6277"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],'
+           'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4277"]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",49],'
+           'PARAMETER["central_meridian",-2],PARAMETER["scale_factor",0.9996012717],PARAMETER["false_easting",400000],PARAMETER["false_northing",-100000],'
+           'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","27700"]],VERT_CS["ODN height",'
+           'VERT_DATUM["Ordnance Datum Newlyn",2005,EXTENSION["PROJ4_GRIDS","uk_os_OSGM15_GB.tif"],AUTHORITY["EPSG","5101"]],UNIT["metre",1,AUTHORITY["EPSG","9001"]],'
+           'AXIS["Gravity-related height",UP],AUTHORITY["EPSG","5701"]]]')
+    assert pp.authority_crs(CRS.from_wkt(wkt)).to_epsg() == 7405
+    assert pp.has_vertical(CRS.from_wkt(wkt)) and not pp.has_vertical(CRS.from_epsg(32630))
+
+def test_pointcloud_model_uses_photo_metadata_not_colmap(monkeypatch, tmp_path):
+    """Photos + LAS: cameras from metadata only (COLMAP is never called, no photo is downloaded); the model gets a
+    camera model for the 3D-box step, and heights in a CRS without a vertical datum are fixed from the take-off height."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('laspy'); pytest.importorskip('scipy')
+    from pyproj import CRS, Transformer
+    from app import tasks, reconstruct, photo_pose as pp
+    monkeypatch.setattr(reconstruct, 'RECON_DIR', tmp_path / 'recon')
+    monkeypatch.setattr(reconstruct, 'colmap', lambda *a, **k: (_ for _ in ()).throw(AssertionError('COLMAP must not run')))
+    crs = CRS.from_epsg(32630); lat0, lon0 = 53.5, -3.0
+    E0, N0 = Transformer.from_crs('EPSG:4326', crs, always_xy=True).transform(lon0, lat0)
+    rng = np.random.default_rng(1); ground = np.c_[rng.uniform(-40, 40, (20000, 2)), np.zeros(20000)]
+    a = rng.uniform(0, 2 * np.pi, 30000); tower = np.c_[1.5 * np.cos(a), 1.5 * np.sin(a), rng.uniform(0, 30, 30000)]
+    root = tasks.ROOT / 'test_meta_pose'; (root / 'photos').mkdir(parents=True, exist_ok=True)
+    try:
+        _write_las(root / 'site.las', np.r_[ground, tower] + [E0, N0, 0], crs=crs)
+        to_ll = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True); keys = []
+        for i, ang in enumerate(np.linspace(0, 2 * np.pi, 12, endpoint=False)):  # an orbit at 20 m, 20 m up, looking at the tower
+            x, y = E0 + 20 * np.cos(ang), N0 + 20 * np.sin(ang); lon, lat = to_ll.transform(x, y)
+            yaw = np.degrees(np.arctan2(-np.cos(ang), -np.sin(ang)))  # towards the tower (bearing from north)
+            p = root / 'photos' / f'DJI_{i:04d}.JPG'; p.write_bytes(_dji_head(lat, lon, 520.0, 20.0, yaw, -20.0)); keys.append(p.relative_to(tasks.ROOT).as_posix())
+        r = tasks.pointcloud_model({'work': 'meta_test', 'clouds': [(root / 'site.las').relative_to(tasks.ROOT).as_posix()], 'photos': keys}, lambda *a: None)
+        cams = r['pointcloud']['cameras']
+        assert r['boxes_available'] and r['camera_source'] == 'metadata' and r['registered_images'] == 12, r
+        assert abs(cams['height_corrected_m'] + 500) < 2  # 520 m ellipsoidal take-off height vs ground at 0: corrected by -500
+        assert cams['on_cloud_pct'] >= 90, cams
+        model = reconstruct.RECON_DIR / 'meta_test' / 'sparse' / '0'
+        assert (model / 'images.txt').is_file() and (model / 'cameras.txt').read_text().split()[1] == 'OPENCV'
+        assert len(__import__('json').loads((reconstruct.RECON_DIR / 'meta_test' / 'web' / 'cameras.json').read_text())) == 12
+    finally:
+        import shutil; shutil.rmtree(root, ignore_errors=True)
+
+def test_remote_file_reads_ranges_across_blocks(monkeypatch, tmp_path):
+    """Large files are read from the bucket by range (no local copy): seeks and reads across block boundaries."""
+    from app import storage
+    fake = _FakeS3(); root = tmp_path / 'uploads'; root.mkdir()
+    monkeypatch.setattr(storage, '_client', fake); monkeypatch.setattr(storage, 'BUCKET', 'b'); monkeypatch.setattr(storage, 'ACCESS_KEY', 'k'); monkeypatch.setattr(storage, 'SECRET_KEY', 's')
+    monkeypatch.setattr(storage, '_roots', {'uploads': root.resolve()}); monkeypatch.setattr(storage, 'PREFIX', ''); monkeypatch.setattr(storage.RemoteFile, 'BLOCK', 10)
+    data = bytes(range(256)) * 4; fake.o['uploads/big.las'] = data
+    f = storage.open_remote(root / 'big.las')
+    assert f.read(25) == data[:25] and f.read(30) == data[25:55]
+    f.seek(1000); assert f.read(100) == data[1000:]
+    f.seek(7); assert f.read(4) == data[7:11]; f.close()
+    assert storage.read_head(root / 'big.las', 16) == data[:16] and storage.read_bytes(root / 'big.las') == data
+    assert not (root / 'big.las').exists()  # nothing was saved locally
+    assert storage.open_remote(root / 'missing.las') is None

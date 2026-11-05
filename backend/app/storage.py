@@ -21,7 +21,7 @@ build in progress) are never trimmed. STORAGE_MODE=cache (default) keeps local c
 """
 from __future__ import annotations
 
-import os, threading, time, uuid
+import io, os, threading, time, uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -146,6 +146,71 @@ def copy(src_path, dst_path) -> bool:
     """Server-side copy inside the bucket (no download); False when the source does not exist."""
     if not enabled() or not (src := head(src_path)) or not (dst := key_for(dst_path)): return False
     client().copy({'Bucket': BUCKET, 'Key': src[0]}, BUCKET, dst); return True
+
+class RemoteFile(io.RawIOBase):
+    """Read-only, seekable view of a stored object through HTTP range requests, so a large file (a 4 GB LAS) is read
+    straight from the bucket instead of being copied to the local disk first. Reads are fetched in BLOCK-sized
+    ranges, AHEAD blocks in parallel ahead of the reader (one connection alone gets a fraction of the bandwidth);
+    at most (AHEAD + 1) x BLOCK bytes are held in memory."""
+    BLOCK = 16 * 1024 * 1024
+    AHEAD = 8
+    def __init__(self, key: str, size: int):
+        from concurrent.futures import ThreadPoolExecutor
+        self.key, self.size, self.pos = key, size, 0
+        self._pool = ThreadPoolExecutor(self.AHEAD, thread_name_prefix='range'); self._blocks: dict = {}
+    def _get(self, start):
+        end = min(self.size, start + self.BLOCK) - 1
+        return client().get_object(Bucket=BUCKET, Key=self.key, Range=f'bytes={start}-{end}')['Body'].read()
+    def _block(self, index):
+        fut = self._blocks.pop(index, None) or self._pool.submit(self._get, index * self.BLOCK)
+        for k in [k for k in self._blocks if k < index or k > index + self.AHEAD]: self._blocks.pop(k).cancel()  # a seek elsewhere
+        for k in range(index + 1, index + 1 + self.AHEAD):
+            if k * self.BLOCK < self.size and k not in self._blocks: self._blocks[k] = self._pool.submit(self._get, k * self.BLOCK)
+        self._current = (index, fut.result()); return self._current[1]
+    def readable(self): return True
+    def seekable(self): return True
+    def tell(self): return self.pos
+    def seek(self, offset, whence=0):
+        self.pos = offset if whence == 0 else self.pos + offset if whence == 1 else self.size + offset
+        return self.pos
+    def readinto(self, b):
+        n = 0; view = memoryview(b)
+        while n < len(view) and self.pos < self.size:
+            index, off = divmod(self.pos, self.BLOCK)
+            data = self._current[1] if getattr(self, '_current', (None,))[0] == index else self._block(index)
+            k = min(len(view) - n, len(data) - off); view[n:n + k] = data[off:off + k]; n += k; self.pos += k
+        return n
+    def close(self):
+        for f in self._blocks.values(): f.cancel()
+        self._pool.shutdown(wait=False); self._blocks.clear(); self._current = (None, b''); super().close()
+
+def open_remote(path):
+    """A buffered, seekable reader over the stored copy of a local path (None when it is not in the bucket)."""
+    found = head(path)
+    return io.BufferedReader(RemoteFile(found[0], found[1]), buffer_size=1024 * 1024) if found else None
+
+def read_bytes(path) -> bytes:
+    """A whole file in memory: the local copy if there is one, else straight from the bucket (never saved locally)."""
+    p = Path(path)
+    if p.is_file(): return p.read_bytes()
+    if enabled():
+        for key in read_keys(p):
+            try: return client().get_object(Bucket=BUCKET, Key=key)['Body'].read()
+            except Exception as e:
+                if not _is_missing(e): raise
+    raise FileNotFoundError(p.name)
+
+def read_head(path, n=512 * 1024) -> bytes:
+    """The first n bytes of a file: the local copy if there is one, else a range request (photo metadata, no download)."""
+    p = Path(path)
+    if p.is_file():
+        with open(p, 'rb') as f: return f.read(n)
+    if not enabled(): return b''
+    for key in read_keys(p):
+        try: return client().get_object(Bucket=BUCKET, Key=key, Range=f'bytes=0-{n - 1}')['Body'].read()
+        except Exception as e:
+            if not _is_missing(e): raise
+    return b''
 
 def multipart_start(path) -> tuple[str, str]:
     """Start a multipart upload for a local path's key: (key, upload id). Large browser uploads arrive in parts so no

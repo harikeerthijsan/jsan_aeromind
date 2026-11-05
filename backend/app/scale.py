@@ -22,9 +22,12 @@ def _ratio(v):
 
 def read_position(path) -> dict | None:
     """{'lat', 'lon', 'alt', 'rtk'} of one photo, or None without a position. DJI XMP first (more digits, RTK status), then EXIF GPS."""
-    p = Path(path)
-    if not p.is_file(): return None
-    with open(p, 'rb') as f: head = f.read(512 * 1024)  # EXIF and XMP sit in the first APP segments
+    if isinstance(path, (bytes, bytearray)): head = bytes(path)  # the file's first bytes (storage.read_head)
+    else:
+        p = Path(path)
+        if not p.is_file(): return None
+        with open(p, 'rb') as f: head = f.read(512 * 1024)  # EXIF and XMP sit in the first APP segments
+    if not head: return None
     x = {k.decode(): v.decode() for k, v in _XMP.findall(head)}
     try:
         if 'GpsLatitude' in x and 'GpsLongitude' in x:
@@ -34,8 +37,9 @@ def read_position(path) -> dict | None:
             if (lat, lon) != (0.0, 0.0): return {'lat': lat, 'lon': lon, 'alt': float(alt) if alt else None, 'rtk': rtk}
     except ValueError: pass
     try:
+        import io
         from PIL import Image
-        with Image.open(p) as im: g = im.getexif().get_ifd(0x8825)
+        with Image.open(io.BytesIO(head)) as im: g = im.getexif().get_ifd(0x8825)
         if 2 in g and 4 in g:
             dms = lambda v: _ratio(v[0]) + _ratio(v[1]) / 60 + _ratio(v[2]) / 3600
             lat = dms(g[2]) * (-1 if g.get(1) == 'S' else 1); lon = dms(g[4]) * (-1 if g.get(3) == 'W' else 1)

@@ -517,16 +517,15 @@ def delete_pointcloud(file_id:int,db:Session=Depends(get_db)):
     (ROOT/x.storage_key).unlink(missing_ok=True);storage.delete(ROOT/x.storage_key);db.delete(x);db.commit();return Response(status_code=204)
 @app.post('/api/v1/inspections/{inspection_id}/pointcloud-model',status_code=202)
 def build_pointcloud_model(inspection_id:int,background:BackgroundTasks,db:Session=Depends(get_db)):
-    """3D model from the uploaded point cloud(s): no dense photogrammetry. With >=3 photos (GPS) their cameras are solved
-    and aligned to the cloud so the 3D equipment boxes work as usual."""
+    """3D model from the uploaded point cloud(s): no photogrammetry (COLMAP is not used). The photos' camera positions and
+    directions are read from their drone metadata, so the 3D equipment boxes work as usual."""
     if not db.get(Inspection,inspection_id):raise HTTPException(404,'Inspection not found')
     files=db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==inspection_id)).all()
     if not any('.'+f.file_format in pointcloud_mod.CLOUD_EXT for f in files):raise HTTPException(409,'Upload a point cloud (.las, .laz, .ply, .xyz ...) first')
-    if (s:=colmap_state())=='worker_offline':raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
+    if colmap_state()=='worker_offline':raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
     items=db.scalars(select(Media).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None))).all()
     photos=[m for m in items if m.content_type.startswith('image/')]
-    if len(photos)>=3 and s!='ready':raise HTTPException(503,f'COLMAP {s.replace("_"," ")}: needed to place the photos on the point cloud')
-    use=_flight_photos(photos)
+    use=_flight_photos(photos)  # 300 across the whole flight keep the 3D-box step well inside one web request
     job=Job(inspection_id=inspection_id,kind='reconstruction',status='queued',stage='reconstruction',media_ids=[m.id for m in use],
             detail=f'Queued 3D model from point cloud · {sum(1 for f in files if "."+f.file_format in pointcloud_mod.CLOUD_EXT)} cloud file(s), '
                    +(f'{len(use)} of {len(photos)} photos spread over the flight' if len(use)<len(photos) else f'{len(photos)} photo(s)'))
@@ -1000,10 +999,13 @@ def _register_prepare(db,model_id):
     quality=model.quality or {};transform=quality.get('transform')
     if not transform:raise HTTPException(409,'This model has no viewer coordinate transform')
     media=db.scalars(select(Media).where(Media.inspection_id==inspection.id)).all()
+    job=db.get(Job,model.job_id);built=set(job.media_ids) if job and job.media_ids else None
+    if built is not None:media=[m for m in media if m.id in built or m.parent_media_id in built]  # the build named exactly these photos photos/00000 ...
     detections=db.scalars(select(Detection).where(Detection.inspection_id==inspection.id,Detection.review_status!='rejected')).all()
     reviewed=db.scalars(select(ImageReview.media_id).where(ImageReview.inspection_id==inspection.id,ImageReview.status=='approved',ImageReview.frame_index==0)).all()
     # a dense model made from a sparse one has no camera model of its own: use the source build's
     return {'work':quality.get('source_model_dir') or f'{inspection.id}_{model.job_id}','transform':transform,'reviewed':sorted(set(reviewed)),
+            'refine_poses':quality.get('camera_source')=='metadata',
             'dense':f'{inspection.id}_{model.job_id}/'+(quality.get('files') or {}).get('dense_ply','dense/fused.ply'),
             'media':[{k:getattr(m,k) for k in ('id','parent_media_id','content_type','filename','storage_key')} for m in media],
             'detections':[{k:getattr(d,k) for k in ('id','media_id','class_name','confidence','x1','y1','x2','y2','image_width','image_height')} for d in detections]}
