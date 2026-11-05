@@ -27,6 +27,18 @@
 .ov-activity{display:flex;flex-direction:column;min-height:240px}
 .ov-chart{flex:1;min-height:170px;background:#fafbfd;border-radius:12px;padding:8px 6px 0}
 
+/* live tower locations map */
+.ov-map-card{padding:0;overflow:hidden}
+.ov-map-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:17px 20px 15px}
+.ov-map-head>div{display:flex;align-items:center;gap:11px;min-width:0}
+.ov-map-head h3{font-size:15px}.ov-map-head small{display:block;color:#8b9aaa;font-size:11.5px;margin-top:2px}
+.ov-map-icon{width:36px;height:36px;border-radius:10px;background:#e9f3fb;color:#1769aa;display:grid;place-items:center;flex:none}
+.ov-map-head button{border:0;background:#f3f6fa;color:#1769aa;border-radius:8px;padding:7px 10px;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}
+.ov-map-head button:hover{background:#e9f3fb}
+.ov-map-card .st-map-wrap{border:0;border-top:1px solid #edf1f6;border-radius:0}
+.ov-map-card .st-map{height:340px}
+.ov-map-empty{padding:10px 20px;background:#fff8e8;color:#8b6817;font-size:11.5px;border-top:1px solid #f3e6c0}
+
 /* section headers with arrows / search */
 .ov-section{display:flex;flex-direction:column;gap:14px;min-width:0}
 .ov-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px}
@@ -118,5 +130,5 @@
 
 @media(max-width:1400px){.ov-grid{grid-template-columns:minmax(0,1fr) 300px}.ov-top{grid-template-columns:230px minmax(0,1fr)}}
 @media(max-width:1150px){.ov-grid{grid-template-columns:1fr}.ov-rail{position:static;display:grid;grid-template-columns:1fr 1fr}}
-@media(max-width:800px){.ov-top,.ov-rail{grid-template-columns:1fr}.ov-tower-row{grid-auto-columns:85%}.ov-search input{width:120px}}
+@media(max-width:800px){.ov-top,.ov-rail{grid-template-columns:1fr}.ov-tower-row{grid-auto-columns:85%}.ov-search input{width:120px}.ov-map-card .st-map{height:300px}.ov-map-head{align-items:flex-start}.ov-map-head button{white-space:nowrap}}
 @media(max-width:900px){.sidebar .ov-worker:not(.mini){display:none}}  /* the sidebar shrinks to icons: no room for the card */

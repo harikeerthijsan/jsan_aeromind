@@ -1,6 +1,6 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
 import {MousePointer2,Square,ZoomIn,ZoomOut,Maximize,Minimize,Undo2,Redo2,Trash2,Tag,ChevronLeft,ChevronRight,CheckCircle2,RotateCcw,ScanEye,Eraser,Plus,Download,Sparkles} from 'lucide-react';
-import {API,request,json,Media,Detection,ClassInfo,Review,Annotation,MediaAnnotations,VendorInfo,VendorSuggestion,VendorRef,VendorCandidate,ConditionDefect,ConditionResult} from './api';
+import {API,getAuthToken,request,json,Media,Detection,ClassInfo,Review,Annotation,MediaAnnotations,VendorInfo,VendorSuggestion,VendorRef,VendorCandidate,ConditionDefect,ConditionResult} from './api';
 const palette=['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4','#469990','#dcbeff','#9a6324','#fffac8','#800000','#aaffc3'];
 export const colorOf=(id:number)=>palette[(id%palette.length+palette.length)%palette.length];export const isVideo=(m:Media)=>m.content_type.startsWith('video/');
 export type Workflow='ai_detection'|'manual_qc';
@@ -43,7 +43,7 @@ export function useReviewData(inspectionId:number|undefined,refresh:unknown){
 export function useDirtyGuard(){const dirty=useRef(false);return {onDirty:(d:boolean)=>{dirty.current=d},guard:(fn:()=>void)=>{if(!dirty.current||confirm('Discard unsaved box changes on this image?')){dirty.current=false;fn()}}}}
 
 export default function AnnotationEditor({media,workflow,detections,jobId,classes,minConf,onMinConf,hidden,onToggleClass,shell,nav,onSaved,onDirty,notice,vendors,focusKey}:{focusKey?:string;vendors:VendorInfo|null;media:Media;workflow:Workflow;detections:Detection[];jobId:number|null;classes:ClassInfo[];minConf:number;onMinConf:(v:number)=>void;hidden:Set<string>;onToggleClass:(name:string)=>void;shell:React.RefObject<HTMLDivElement|null>;nav?:{position:string;prev?:()=>void;next?:()=>void};onSaved:(r:Review)=>void;onDirty:(dirty:boolean)=>void;notice?:React.ReactNode}){
- const [natural,setNatural]=useState<{w:number;h:number}|null>(null),[loaded,setLoaded]=useState<MediaAnnotations|null>(null),[error,setError]=useState(''),[saving,setSaving]=useState(false),[notes,setNotes]=useState('');
+ const [natural,setNatural]=useState<{w:number;h:number}|null>(null),[imageUrl,setImageUrl]=useState(''),[loaded,setLoaded]=useState<MediaAnnotations|null>(null),[error,setError]=useState(''),[saving,setSaving]=useState(false),[notes,setNotes]=useState('');
  const [hist,setHist]=useState<{past:Box[][];present:Box[];future:Box[][]}>({past:[],present:[],future:[]}),[baseline,setBaseline]=useState<Box[]>([]);
  const [view,setView]=useState<View>({x:0,y:0,w:1,h:1}),[size,setSize]=useState({w:1,h:1}),[full,setFull]=useState(false),[panning,setPanning]=useState(false);
  const [tool,setTool]=useState<'select'|'draw'>('select'),[selected,setSelected]=useState<string|null>(null),[hover,setHover]=useState<string|null>(null),[labels,setLabels]=useState(false),[cursor,setCursor]=useState<{x:number;y:number}|null>(null),[draft,setDraft]=useState<Box|null>(null),[drawClass,setDrawClass]=useState(''),[extra,setExtra]=useState<string[]>([]),[newClass,setNewClass]=useState('');
@@ -51,8 +51,11 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
  svg=useRef<SVGSVGElement>(null),stage=useRef<HTMLDivElement>(null),list=useRef<HTMLDivElement>(null),drag=useRef<Drag|null>(null),spaceHeld=useRef(false),seq=useRef(0);
  const boxes=hist.present,review=loaded?.review||null;
  // the editor is keyed by media + detection run, so this runs once per image
- useEffect(()=>{let live=true;const img=new Image();img.onload=()=>live&&setNatural({w:img.naturalWidth,h:img.naturalHeight});img.onerror=()=>live&&setError('Could not load the image.');img.src=API+media.url;
-  request<MediaAnnotations>(`/api/v1/media/${media.id}/annotations`).then(r=>{if(!live)return;const init=r.review?r.annotations.map(fromAnn):detections.map(fromDet);jobRef.current=r.review?r.review.job_id:jobId;setLoaded(r);setHist({past:[],present:init,future:[]});setBaseline(init);setNotes(r.review?.notes||'')}).catch(e=>live&&setError(String(e)));return()=>{live=false}},[]);
+ useEffect(()=>{let live=true,objectUrl='';const abort=new AbortController(),token=getAuthToken();
+  // Protected media cannot rely on the session cookie when local development mixes localhost and 127.0.0.1.
+  // Fetch it with the same bearer token as API requests, then let the SVG render the authenticated blob.
+  fetch(API+media.url,{credentials:'include',headers:token?{Authorization:`Bearer ${token}`}:{},signal:abort.signal}).then(async r=>{if(!r.ok)throw Error(`Could not load the image (${r.status}).`);return r.blob()}).then(blob=>{if(!live)return;objectUrl=URL.createObjectURL(blob);const img=new Image();img.onload=()=>{if(live){setNatural({w:img.naturalWidth,h:img.naturalHeight});setImageUrl(objectUrl)}};img.onerror=()=>live&&setError('Could not decode the image.');img.src=objectUrl}).catch(e=>{if(live&&e?.name!=='AbortError')setError(String(e?.message||e))});
+  request<MediaAnnotations>(`/api/v1/media/${media.id}/annotations`).then(r=>{if(!live)return;const init=r.review?r.annotations.map(fromAnn):detections.map(fromDet);jobRef.current=r.review?r.review.job_id:jobId;setLoaded(r);setHist({past:[],present:init,future:[]});setBaseline(init);setNotes(r.review?.notes||'')}).catch(e=>live&&setError(String(e)));return()=>{live=false;abort.abort();if(objectUrl)URL.revokeObjectURL(objectUrl)}},[]);
  // boxes are in the detector's pixel space; fall back to the browser's decoded size for images without any
  const ref=detections[0]||loaded?.annotations[0];const space=ref?{w:ref.image_width,h:ref.image_height}:natural;
  useEffect(()=>{if(space)setView({x:0,y:0,w:space.w,h:space.h})},[space?.w,space?.h]);
@@ -183,9 +186,9 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
      <a className={dirty?'warn':''} title={`Download image with ${review?'approved':'AI'} boxes drawn, original metadata kept${dirty?' — unsaved edits are not included':''}`} aria-label="Download annotated image" href={`${API}/api/v1/media/${media.id}/annotated?source=${review?'approved':'model'}&min_conf=${review?0:minConf}`}><Download size={15}/></a>
      <T title={full?'Exit full screen (F)':'Full screen (F)'} on={full} onClick={toggleFull}>{full?<Minimize size={15}/>:<Maximize size={15}/>}</T></div></div>
    <div className="ann-stage" ref={stage}>
-    {!space?<div className="det-empty"><ScanEye size={40}/><p>{error||'Loading image…'}</p></div>
+    {!space||!imageUrl?<div className="det-empty"><ScanEye size={40}/><p>{error||'Loading image…'}</p></div>
     :<svg ref={svg} viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`} preserveAspectRatio="xMidYMid meet" style={{cursor:panning?'grabbing':tool==='draw'?'crosshair':'grab'}} onPointerDown={onStageDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onPointerLeave={()=>setCursor(null)} onDoubleClick={e=>{if(e.target===e.currentTarget||e.target instanceof SVGImageElement)fit()}}>
-     <image href={API+media.url} width={space.w} height={space.h}/>
+     <image href={imageUrl} width={space.w} height={space.h}/>
      {ordered.map(b=>{const c=colorOf(catalog.get(b.class_name)??b.class_id),isSel=b.key===selected,on=isSel||b.key===hover;return <g key={b.key} className="det-box" style={{pointerEvents:tool==='draw'?'none':undefined}} onPointerDown={e=>onBoxDown(e,b)} onDoubleClick={e=>{e.stopPropagation();focus(b)}} onMouseEnter={()=>setHover(b.key)} onMouseLeave={()=>setHover(null)}>
       <rect x={b.x1} y={b.y1} width={b.x2-b.x1} height={b.y2-b.y1} fill={on?c+'40':'transparent'} stroke={c} strokeWidth={isSel?3:on?2.5:1.5} vectorEffect="non-scaling-stroke" style={{cursor:tool==='select'?'move':undefined}}/>
       {(on||labels)&&label(b,c)}
@@ -262,7 +265,7 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
    {hiddenCount>0&&<small className="ann-warn">{hiddenCount} box{hiddenCount>1?'es':''} hidden by the filters above won't be saved.</small>}
    {error&&<small className="det-error">{error}</small>}
    <input aria-label="Review note" placeholder="Review note (optional)" value={notes} onChange={e=>setNotes(e.target.value)}/>
-   <div className="ann-row"><button className="btn primary" onClick={()=>approve(false)} disabled={saving||!space||!loaded}><CheckCircle2 size={15}/>{saving?'Saving…':`${review?'Re-approve':'Approve'} · ${shown.length} box${shown.length===1?'':'es'}`}</button>{nav?.next&&<button className="btn outline" title="Approve and open the next image" onClick={()=>approve(true)} disabled={saving||!space||!loaded}>& next<ChevronRight size={14}/></button>}</div>
+   <div className="ann-row"><button className="btn primary" onClick={()=>approve(false)} disabled={saving||!space||!imageUrl||!loaded}><CheckCircle2 size={15}/>{saving?'Saving…':`${review?'Re-approve':'Approve'} · ${shown.length} box${shown.length===1?'':'es'}`}</button>{nav?.next&&<button className="btn outline" title="Approve and open the next image" onClick={()=>approve(true)} disabled={saving||!space||!imageUrl||!loaded}>& next<ChevronRight size={14}/></button>}</div>
    <div className="ann-row ann-links">{dirty&&<button className="text-btn" onClick={()=>push(baseline)}><RotateCcw size={13}/>Discard changes</button>}{review&&detections.length>0&&!newerRun&&<button className="text-btn" onClick={loadAI}><ScanEye size={13}/>Load AI output</button>}{boxes.length>0&&<button className="text-btn" onClick={()=>{push([]);setSelected(null)}}><Eraser size={13}/>Clear all</button>}</div>
   </div></div></>;
 }

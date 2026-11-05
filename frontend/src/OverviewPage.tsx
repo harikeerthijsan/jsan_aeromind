@@ -1,7 +1,8 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Area,AreaChart,CartesianGrid,ResponsiveContainer,Tooltip,XAxis,YAxis} from 'recharts';
-import {Box,Check,ChevronLeft,ChevronRight,Clock,Cpu,Layers,RadioTower,Search,ShieldAlert} from 'lucide-react';
+import {Box,Check,ChevronLeft,ChevronRight,Clock,Cpu,Layers,MapPin,RadioTower,Search,ShieldAlert} from 'lucide-react';
 import {API,request,Site} from './api';
+import {SitesMap} from './SiteMap';
 import './overview.css';
 
 /** Overview dashboard (layout inspired by the DNX admin template: dark highlight card, activity chart, card carousel,
@@ -69,6 +70,15 @@ function LatestInspection({latest,go,selectSite}:{latest:NonNullable<Overview['l
  </section>;
 }
 
+function TowerLocations({sites,go,selectSite}:{sites:OvSite[];go:(p:string)=>void;selectSite:(id:number)=>void}){
+ const located=sites.filter(s=>s.latitude!=null&&s.longitude!=null).length;
+ return <section className="ov-card ov-map-card"><div className="ov-map-head"><div><span className="ov-map-icon"><MapPin size={17}/></span><div><h3>Tower Sites Locations</h3><small>{located} of {sites.length} tower site{sites.length===1?'':'s'} mapped</small></div></div>
+  <button type="button" onClick={()=>go('projects')}>Manage locations</button></div>
+  <SitesMap sites={sites} selectedId={null} onSelect={id=>{selectSite(id);go('tower')}}/>
+  {!located&&<div className="ov-map-empty">Add latitude and longitude under Projects &amp; Sites to place towers on the map.</div>}
+ </section>;
+}
+
 function TowerCards({sites,go,selectSite}:{sites:OvSite[];go:(p:string)=>void;selectSite:(id:number)=>void}){
  const row=useRef<HTMLDivElement>(null),scroll=(dir:number)=>row.current?.scrollBy({left:dir*(row.current.clientWidth*.8),behavior:'smooth'});
  return <section className="ov-section"><div className="ov-section-head"><h2>Tower sites</h2><div className="ov-arrows"><button onClick={()=>scroll(-1)} aria-label="Scroll left"><ChevronLeft size={18}/></button><button onClick={()=>scroll(1)} aria-label="Scroll right"><ChevronRight size={18}/></button></div></div>
@@ -125,6 +135,7 @@ export default function OverviewPage({go,selectSite}:{go:(page:string)=>void;sel
      <div className="ov-hero-foot"><span><RadioTower size={13}/>{t.sites} towers</span><span><Layers size={13}/>{t.models} 3D models</span><span className={t.items_with_defects?'warn':''}><ShieldAlert size={13}/>{t.items_with_defects} defects</span></div></section>
     <Activity data={data.activity}/>
    </div>
+   <TowerLocations sites={data.sites} go={go} selectSite={selectSite}/>
    <TowerCards sites={data.sites} go={go} selectSite={selectSite}/>
    <JobsTable jobs={data.jobs} go={go}/>
   </div>

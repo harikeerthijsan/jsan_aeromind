@@ -95,6 +95,8 @@ class UserUpdateIn(BaseModel):
     role:str|None=None
     active:bool|None=None
     password:str|None=Field(None,min_length=10,max_length=256)
+class ProfileUpdateIn(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
 
 router=APIRouter(prefix='/api/v1',tags=['authentication'])
 
@@ -122,6 +124,15 @@ def me(request:Request,response:Response):
         row=db.scalar(select(AuthSession).where(AuthSession.token_hash==hashlib.sha256(token.encode()).hexdigest())) if token else None
     if row:set_cookie(response,request,token,row.expires_at)
     return public_user(user)
+
+@router.patch('/auth/me')
+def update_me(data:ProfileUpdateIn,request:Request):
+    actor=current_user(request);name=data.name.strip()
+    if len(name)<2:raise HTTPException(422,'Display name must contain at least 2 characters')
+    with SessionLocal() as db:
+        user=db.get(User,actor.id)
+        if not user:raise HTTPException(404,'User not found')
+        user.name=name;db.commit();db.refresh(user);return public_user(user)
 
 @router.post('/auth/logout',status_code=204)
 def logout(request:Request,response:Response):
