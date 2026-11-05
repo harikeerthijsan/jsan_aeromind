@@ -291,11 +291,16 @@ def register_assets(payload, progress=None):
     """payload: {'work', 'dense', 'transform', 'media': [...], 'detections': [...], 'reviewed': [...]} -> candidate dicts"""
     from . import registration
     work = reconstruct.RECON_DIR / payload['work']; dense = reconstruct.RECON_DIR / payload['dense']
-    for d in {work, dense.parent.parent if dense.parent.name == 'dense' else dense.parent}: storage.fetch_tree(d, skip=('images',))  # built elsewhere
+    folders = {work, dense.parent.parent if dense.parent.name == 'dense' else dense.parent}
+    for d in folders: storage.fetch_tree(d, skip=('images',))  # built elsewhere
     try:
         out = registration.build_candidates(work, payload['transform'], [NS(**m) for m in payload['media']], [NS(**d) for d in payload['detections']],
                                             dense if dense.is_file() else None, set(payload['reviewed']), refine_poses=payload.get('refine_poses', False))
     except Exception as e: raise HTTPException(500, f'2D to 3D registration failed: {e}')
+    finally:
+        if storage.bucket_only():  # the model stays in the bucket; the copy fetched for this step is not kept
+            for d in folders:
+                if not (d / storage.IN_USE).exists(): shutil.rmtree(d, ignore_errors=True)
     return [plain(c) for c in out]
 
 def plain(v):
