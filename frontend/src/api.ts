@@ -37,12 +37,30 @@ export const json=(method:string,body:unknown):RequestInit=>({method,headers:{'C
 export async function download(path:string,filename:string){const headers=new Headers();const token=getAuthToken();if(token)headers.set('Authorization',`Bearer ${token}`);const r=await fetch(API+path,{headers,credentials:'include'});if(!r.ok)throw Error((await r.text()).slice(0,250));const url=URL.createObjectURL(await r.blob());const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;document.body.appendChild(anchor);anchor.click();anchor.remove();URL.revokeObjectURL(url)}
 /** Upload one file with byte progress and a way to cancel it (fetch has neither). Rejects with name 'AbortError' when cancelled. */
 export function uploadFile<T>(path:string,file:File,onProgress:(loaded:number,total:number)=>void,signal?:AbortSignal):Promise<T>{
- return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST',API+path);x.withCredentials=true;
+ const body=new FormData();body.append('file',file);return send<T>('POST',path,body,file.name,l=>onProgress(l,file.size),signal)}
+function send<T>(method:string,path:string,body:XMLHttpRequestBodyInit,label:string,onProgress:(loaded:number)=>void,signal?:AbortSignal):Promise<T>{
+ return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open(method,API+path);x.withCredentials=true;
   const t=getAuthToken();if(t)x.setRequestHeader('Authorization',`Bearer ${t}`);
+  if(signal?.aborted){reject(Object.assign(Error('Upload cancelled'),{name:'AbortError'}));return}
   const abort=()=>x.abort();signal?.addEventListener('abort',abort,{once:true});
-  x.upload.onprogress=e=>onProgress(e.loaded,e.total||file.size);
+  x.upload.onprogress=e=>onProgress(e.loaded);
   x.onabort=()=>reject(Object.assign(Error('Upload cancelled'),{name:'AbortError'}));
-  x.onerror=()=>reject(Error(`Network error while uploading ${file.name}`));
+  x.onerror=()=>{signal?.removeEventListener('abort',abort);reject(Object.assign(Error(`Network error while uploading ${label}`),{status:0}))};
   x.onload=()=>{signal?.removeEventListener('abort',abort);if(x.status>=200&&x.status<300)resolve(JSON.parse(x.responseText));
-   else{let d=x.responseText;try{d=JSON.parse(d).detail}catch{/* plain text */}if(x.status===401)window.dispatchEvent(new Event('aeromind-auth-expired'));reject(Error(`${file.name}: ${d||x.status}`))}};
-  const body=new FormData();body.append('file',file);x.send(body)})}
+   else{let d=x.responseText;try{d=JSON.parse(d).detail}catch{/* plain text */}if(x.status===401)window.dispatchEvent(new Event('aeromind-auth-expired'));reject(Object.assign(Error(`${label}: ${d||x.status}`),{status:x.status}))}};
+  x.send(body)})}
+/** Large file in 32 MB parts (3 at a time, each retried): no single request comes near the hosting proxy's 5-minute
+ * limit. kind 'media' (photo/video) or 'pointcloud'; resolves with the stored Media / PointCloudFile row. */
+export async function uploadChunked<T>(inspectionId:number,kind:'media'|'pointcloud',file:File,onProgress:(loaded:number,total:number)=>void,signal?:AbortSignal):Promise<T>{
+ const s=await request<{upload_id:string;part_size:number;parts:number}>(`/api/v1/inspections/${inspectionId}/chunked-uploads`,{...json('POST',{kind,filename:file.name,size:file.size,content_type:file.type}),signal});
+ const sent=new Map<number,number>(),report=()=>onProgress([...sent.values()].reduce((a,b)=>a+b,0),file.size);
+ let next=1,failed=false;
+ const worker=async()=>{while(next<=s.parts&&!failed){const n=next++,blob=file.slice((n-1)*s.part_size,Math.min(file.size,n*s.part_size));
+  for(let attempt=1;;attempt++){
+   try{await send('PUT',`/api/v1/chunked-uploads/${s.upload_id}/parts/${n}`,blob,file.name,l=>{sent.set(n,l);report()},signal);sent.set(n,blob.size);report();break}
+   catch(e){const st=(e as {status?:number}).status??0;sent.set(n,0);report();
+    if((e as Error).name==='AbortError'||attempt>=5||(st>=400&&st<500&&st!==408&&st!==429)){failed=true;throw e}
+    await new Promise(r=>setTimeout(r,1500*attempt*attempt))}}}};
+ try{await Promise.all(Array.from({length:Math.min(3,s.parts)},worker));
+  return await request<T>(`/api/v1/chunked-uploads/${s.upload_id}/complete`,{method:'POST'})}
+ catch(e){request(`/api/v1/chunked-uploads/${s.upload_id}`,{method:'DELETE'}).catch(()=>{});throw e}}

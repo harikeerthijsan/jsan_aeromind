@@ -1,6 +1,6 @@
 import {useEffect,useRef,useState} from 'react';
 import {AlertTriangle,Box,CheckCircle2,FileBox,Trash2,UploadCloud,X} from 'lucide-react';
-import {request,uploadFile} from './api';
+import {request,uploadChunked} from './api';
 import './pointcloud.css';
 
 /** Optional point cloud for an inspection (LiDAR / photogrammetry export). When present, "Build 3D model from point
@@ -22,7 +22,7 @@ export default function PointCloudPanel({inspectionId,inspectionLabel,onBuilt,on
  async function choose(list:FileList|File[]|null){if(!list||!list.length||!inspectionId)return;const chosen=Array.from(list);setError('');setNote('');setBusy('upload');
   const ctl=new AbortController();abort.current=ctl;const done:PointCloudFile[]=[];
   try{for(const [i,f] of chosen.entries()){setProgress({name:f.name,loaded:0,total:f.size,n:i+1,of:chosen.length});
-    done.push(await uploadFile<PointCloudFile>(`/api/v1/inspections/${inspectionId}/pointclouds`,f,(loaded,total)=>setProgress({name:f.name,loaded,total,n:i+1,of:chosen.length}),ctl.signal))}
+    done.push(await uploadChunked<PointCloudFile>(inspectionId,'pointcloud',f,(loaded,total)=>setProgress({name:f.name,loaded,total,n:i+1,of:chosen.length}),ctl.signal))}
    setNote(`${done.length} file${done.length===1?'':'s'} uploaded.${hideBuild?'':' Build the 3D model when all tiles are in.'}`)}
   catch(e){if((e as Error).name==='AbortError'){  // cancelled: remove what this batch already stored
      await Promise.all(done.map(f=>request(`/api/v1/pointclouds/${f.id}`,{method:'DELETE'}).catch(()=>{})));

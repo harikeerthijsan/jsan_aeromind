@@ -3,7 +3,7 @@ from urllib.parse import quote
 from collections import Counter
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, FileResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
@@ -440,6 +440,68 @@ async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Sessi
         db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
     except Exception:
         target.unlink(missing_ok=True);raise
+# ---------- chunked uploads: large files arrive in parts so every request stays far below the proxy's 300 s limit ----------
+UPLOAD_PART=int(os.getenv('UPLOAD_PART_BYTES',str(32*1024*1024)))
+_chunked:dict[str,dict]={}
+class ChunkedStartIn(BaseModel):
+    kind:str=Field(pattern='^(media|pointcloud)$');filename:str=Field(min_length=1,max_length=255);size:int=Field(gt=0);content_type:str=''
+@app.post('/api/v1/inspections/{inspection_id}/chunked-uploads',status_code=201)
+def start_chunked(inspection_id:int,body:ChunkedStartIn,db:Session=Depends(get_db)):
+    inspection=db.get(Inspection,inspection_id)
+    if not inspection:raise HTTPException(404,'Inspection not found')
+    site=db.get(Site,inspection.site_id);code=site.code if site else 'SITE';name=Path(body.filename).name[:255];ext=Path(name).suffix.lower()
+    if body.kind=='pointcloud':
+        if ext not in pointcloud_mod.CLOUD_EXT|pointcloud_mod.SIDECAR_EXT:raise HTTPException(415,'Point clouds: .las .laz .e57 .ply .xyz .pts .txt .csv (sidecars .lax .prj)')
+        if body.size>POINTCLOUD_MAX:raise HTTPException(413,f'Point cloud larger than {POINTCLOUD_MAX//1024**3} GB')
+        key=(media_paths.inspection_root(code,inspection.id)/'pointclouds'/f'{uuid.uuid4().hex[:12]}_{media_paths._segment(Path(name).stem,"cloud",70)}{ext}').as_posix()
+    else:
+        if body.content_type not in ALLOWED:raise HTTPException(415,'Unsupported image/video type')
+        if body.size>MAX_SIZE:raise HTTPException(413,'File too large')
+        key=media_paths.upload_key(code,inspection.id,name,body.content_type,ALLOWED[body.content_type])
+    for uid,s in list(_chunked.items()):  # forget sessions abandoned for a day
+        if time.time()-s['started']>86400:_abort_chunked(_chunked.pop(uid))
+    target=ROOT/key;target.parent.mkdir(parents=True,exist_ok=True)
+    s3=storage.multipart_start(target) if storage.enabled() else (None,None)
+    if not s3[0]:target.write_bytes(b'')
+    uid=uuid.uuid4().hex;parts=math.ceil(body.size/UPLOAD_PART)
+    _chunked[uid]=dict(inspection_id=inspection_id,kind=body.kind,name=name,ext=ext,key=key,size=body.size,content_type=body.content_type,
+                       s3_key=s3[0],s3_id=s3[1],parts=parts,etags={},digests={},started=time.time())
+    return {'upload_id':uid,'part_size':UPLOAD_PART,'parts':parts}
+def _abort_chunked(s):
+    if s['s3_id']:storage.multipart_abort(s['s3_key'],s['s3_id'])
+    (ROOT/s['key']).unlink(missing_ok=True)
+@app.put('/api/v1/chunked-uploads/{upload_id}/parts/{number}')
+async def chunked_part(upload_id:str,number:int,request:Request):
+    s=_chunked.get(upload_id)
+    if not s:raise HTTPException(404,'Upload session not found (the server may have restarted); start the upload again')
+    if not 1<=number<=s['parts']:raise HTTPException(400,'Bad part number')
+    data=await request.body();expect=min(UPLOAD_PART,s['size']-(number-1)*UPLOAD_PART)
+    if len(data)!=expect:raise HTTPException(400,f'Part {number} should be {expect} bytes, got {len(data)}')
+    if s['s3_id']:s['etags'][number]=await run_in_threadpool(storage.multipart_part,s['s3_key'],s['s3_id'],number,data)
+    else:
+        def write():
+            with (ROOT/s['key']).open('r+b') as out:out.seek((number-1)*UPLOAD_PART);out.write(data)
+        await run_in_threadpool(write)
+    s['digests'][number]=hashlib.sha256(data).digest();return {'part':number,'bytes':len(data)}
+@app.post('/api/v1/chunked-uploads/{upload_id}/complete',status_code=201)
+async def chunked_complete(upload_id:str,db:Session=Depends(get_db)):
+    s=_chunked.get(upload_id)
+    if not s:raise HTTPException(404,'Upload session not found (the server may have restarted); start the upload again')
+    missing=[n for n in range(1,s['parts']+1) if n not in s['digests']]
+    if missing:raise HTTPException(409,f'{len(missing)} part(s) missing, first {missing[0]}')
+    if s['s3_id']:await run_in_threadpool(storage.multipart_complete,s['s3_key'],s['s3_id'],s['etags'])
+    _chunked.pop(upload_id,None)
+    sha=hashlib.sha256(b''.join(s['digests'][n] for n in range(1,s['parts']+1))).hexdigest()  # digest of the 32 MB part digests
+    if s['kind']=='pointcloud':
+        x=PointCloudFile(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],file_format=s['ext'][1:],size_bytes=s['size'],sha256=sha)
+        db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
+    x=Media(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],content_type=s['content_type'],sha256=sha,size_bytes=s['size'])
+    db.add(x);db.commit();db.refresh(x);return to_dict(x)
+@app.delete('/api/v1/chunked-uploads/{upload_id}',status_code=204)
+def chunked_cancel(upload_id:str):
+    s=_chunked.pop(upload_id,None)
+    if s:_abort_chunked(s)
+    return Response(status_code=204)
 @app.get('/api/v1/inspections/{inspection_id}/pointclouds')
 def pointclouds(inspection_id:int,db:Session=Depends(get_db)):
     return [_pc_dict(x) for x in db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==inspection_id).order_by(PointCloudFile.id)).all()]

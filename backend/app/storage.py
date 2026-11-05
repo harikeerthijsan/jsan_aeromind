@@ -147,6 +147,23 @@ def copy(src_path, dst_path) -> bool:
     if not enabled() or not (src := head(src_path)) or not (dst := key_for(dst_path)): return False
     client().copy({'Bucket': BUCKET, 'Key': src[0]}, BUCKET, dst); return True
 
+def multipart_start(path) -> tuple[str, str]:
+    """Start a multipart upload for a local path's key: (key, upload id). Large browser uploads arrive in parts so no
+    single request runs into the hosting proxy's time limit."""
+    key = key_for(path)
+    return key, client().create_multipart_upload(Bucket=BUCKET, Key=key)['UploadId']
+
+def multipart_part(key, upload_id, number: int, data: bytes) -> str:
+    return client().upload_part(Bucket=BUCKET, Key=key, UploadId=upload_id, PartNumber=number, Body=data)['ETag']
+
+def multipart_complete(key, upload_id, etags: dict[int, str]):
+    client().complete_multipart_upload(Bucket=BUCKET, Key=key, UploadId=upload_id,
+                                       MultipartUpload={'Parts': [{'PartNumber': n, 'ETag': e} for n, e in sorted(etags.items())]})
+
+def multipart_abort(key, upload_id):
+    try: client().abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=upload_id)
+    except Exception: pass
+
 def stream(path, range_header: str | None = None):
     """Open a stored file for streaming to a browser without saving it locally.
     Returns (iterator of bytes, status, headers) or None when the file does not exist. Supports single byte ranges

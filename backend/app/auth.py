@@ -77,7 +77,7 @@ def minimum_role(path:str,method:str)->str:
     if path.startswith('/api/v1/users'):return 'admin'
     if path=='/api/v1/inspections' and method=='POST':return 'manager'
     if path.startswith('/api/v1/sites'):return 'manager'
-    if method=='DELETE' and path.startswith(('/api/v1/media/','/api/v1/pointclouds/')):return 'inspector'  # cancelling own uploads; the endpoint refuses processed files
+    if method=='DELETE' and path.startswith(('/api/v1/media/','/api/v1/pointclouds/','/api/v1/chunked-uploads/')):return 'inspector'  # cancelling own uploads; the endpoint refuses processed files
     if method=='DELETE':return 'manager'
     return 'inspector'
 

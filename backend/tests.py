@@ -1018,6 +1018,12 @@ class _FakeS3:
         class Body(io.BytesIO):
             def iter_chunks(self, n): yield self.read()
         return {'Body': Body(data), 'ContentLength': len(data), **extra}
+    def create_multipart_upload(self, Bucket, Key): self.mp = getattr(self, 'mp', {}); self.mp['u1'] = {}; return {'UploadId': 'u1'}
+    def upload_part(self, Bucket, Key, UploadId, PartNumber, Body): self.mp[UploadId][PartNumber] = Body; return {'ETag': f'"e{PartNumber}"'}
+    def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+        assert [x['ETag'] for x in MultipartUpload['Parts']] == [f'"e{n}"' for n in sorted(self.mp[UploadId])]
+        self.o[Key] = b''.join(v for _, v in sorted(self.mp.pop(UploadId).items()))
+    def abort_multipart_upload(self, Bucket, Key, UploadId): self.mp.pop(UploadId, None)
     def get_paginator(self, name):
         o = self.o
         class P:
@@ -1070,3 +1076,34 @@ def test_cancel_upload_deletes_unprocessed_media_only():
             db.add(Detection(job_id=j.id, inspection_id=ins['id'], media_id=done['id'], frame_index=0, class_id=0, class_name='rru', confidence=.9,
                              x1=0, y1=0, x2=1, y2=1, image_width=2, image_height=2, model_name='t')); db.commit()
         r = client.delete(f"/api/v1/media/{done['id']}"); assert r.status_code == 409 and 'detections' in r.json()['detail']  # processed: kept
+
+def test_chunked_upload_local_and_bucket(monkeypatch):
+    """Large files arrive in parts (each request far below the proxy's 300 s limit); parts may come in any order."""
+    from app import main, storage
+    from app.tasks import ROOT
+    monkeypatch.setattr(main, 'UPLOAD_PART', 4)
+    data = b'0123456789'  # 3 parts: 4 + 4 + 2 bytes
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'chunked'}).json()
+        start = lambda **k: client.post(f"/api/v1/inspections/{ins['id']}/chunked-uploads", json={'kind': 'pointcloud', 'filename': 'scan.laz', 'size': len(data), **k})
+        assert start(filename='x.exe').status_code == 415 and start(kind='media', content_type='text/html').status_code == 415
+        s = start().json(); assert s['parts'] == 3 and s['part_size'] == 4
+        put = lambda uid, n, b: client.put(f'/api/v1/chunked-uploads/{uid}/parts/{n}', content=b)
+        assert put(s['upload_id'], 1, b'012').status_code == 400               # wrong part length
+        assert put(s['upload_id'], 3, b'89').status_code == 200 and put(s['upload_id'], 1, b'0123').status_code == 200
+        assert client.post(f"/api/v1/chunked-uploads/{s['upload_id']}/complete").status_code == 409  # part 2 missing
+        assert put(s['upload_id'], 2, b'4567').status_code == 200
+        x = client.post(f"/api/v1/chunked-uploads/{s['upload_id']}/complete").json()
+        assert x['role'] == 'cloud' and x['size_bytes'] == 10 and (ROOT / x['storage_key']).read_bytes() == data
+        assert client.post(f"/api/v1/chunked-uploads/{s['upload_id']}/complete").status_code == 404  # session is gone
+        # cancel removes the partial file
+        c = start().json(); put(c['upload_id'], 1, b'0123'); key = main._chunked[c['upload_id']]['key']
+        assert client.delete(f"/api/v1/chunked-uploads/{c['upload_id']}").status_code == 204 and not (ROOT / key).exists()
+        # with a bucket: S3 multipart upload, a video becomes a Media row
+        fake = _FakeS3()
+        monkeypatch.setattr(storage, '_client', fake); monkeypatch.setattr(storage, 'BUCKET', 'b'); monkeypatch.setattr(storage, 'ACCESS_KEY', 'k'); monkeypatch.setattr(storage, 'SECRET_KEY', 's')
+        monkeypatch.setattr(storage, '_roots', {'uploads': ROOT.resolve()}); monkeypatch.setattr(storage, 'PREFIX', '')
+        v = start(kind='media', filename='flight.mp4', content_type='video/mp4').json()
+        for n, b in ((2, b'4567'), (1, b'0123'), (3, b'89')): assert put(v['upload_id'], n, b).status_code == 200
+        m = client.post(f"/api/v1/chunked-uploads/{v['upload_id']}/complete").json()
+        assert m['content_type'] == 'video/mp4' and fake.o['uploads/' + m['storage_key']] == data

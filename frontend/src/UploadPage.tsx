@@ -1,6 +1,6 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {AlertTriangle,ArrowRight,Box,CheckCircle2,Cpu,FileBox,Film,Image as ImageIcon,Plus,UploadCloud,X} from 'lucide-react';
-import {Inspection,Media,Site,json,request,uploadFile} from './api';
+import {Inspection,Media,Site,json,request,uploadChunked,uploadFile} from './api';
 import PointCloudPanel,{PointCloudFile,buildFromPointCloud,mb} from './PointCloudPanel';
 import './upload.css';
 
@@ -40,7 +40,8 @@ export default function UploadPage({site,inspections,go,onChanged}:{site?:Site;i
   const ctl=new AbortController();abort.current=ctl;const done:number[]=[];setMsg(null);setBatch({files,index:0,loaded:0,total:files[0].size,done});
   try{
    for(const [i,f] of files.entries()){
-    const x=await uploadFile<Media>(`/api/v1/inspections/${inspection.id}/media`,f,(loaded,total)=>setBatch({files,index:i,loaded,total,done:[...done]}),ctl.signal);
+    const onProgress=(loaded:number,total:number)=>setBatch({files,index:i,loaded,total,done:[...done]});  // videos in parts: one request must finish within the proxy's 5 minutes
+    const x=f.size>32*1024*1024?await uploadChunked<Media>(inspection.id,'media',f,onProgress,ctl.signal):await uploadFile<Media>(`/api/v1/inspections/${inspection.id}/media`,f,onProgress,ctl.signal);
     done.push(x.id);setBatch({files,index:i,loaded:f.size,total:f.size,done:[...done]})}
    const skipped=bad.length?` ${bad.length} file(s) skipped (unsupported or over 500 MB).`:'';
    if(auto){
