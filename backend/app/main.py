@@ -1,7 +1,7 @@
-import os, uuid, hashlib, shutil, csv, io, tempfile, zipfile, threading, math, time
+import os, uuid, hashlib, hmac, shutil, csv, io, tempfile, zipfile, threading, math, time
 from urllib.parse import quote
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,7 +102,7 @@ async def authentication_gate(request,call_next):
     # the web app's own files are public (the login page must load); the API and every data file (drone photos,
     # 3D models, reference photos) need a signed-in user. The worker uses its own token.
     data=path.startswith(('/api/v1/','/uploads/','/recon/','/vendor-refs/'))
-    public=path in ('/health','/api/v1/auth/login','/api/v1/auth/config') or path.startswith('/api/v1/worker/') or not data
+    public=path in ('/health','/api/v1/auth/login','/api/v1/auth/config') or path.startswith(('/api/v1/worker/','/api/v1/copc/')) or not data  # copc: signed links
     if public or request.method=='OPTIONS' or os.getenv('AUTH_DISABLED','false').lower()=='true':return await call_next(request)
     with SessionLocal() as db:user=auth.authenticate(db,auth.token_from(request))
     if not user:return JSONResponse({'detail':'Authentication required'},401,{'WWW-Authenticate':'Bearer'})
@@ -423,9 +423,9 @@ async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends
         raise
 # ---------- uploaded point clouds (optional; replace COLMAP's dense reconstruction) ----------
 POINTCLOUD_MAX=int(os.getenv('POINTCLOUD_MAX_BYTES',str(10*1024**3)))
-def _pc_dict(x):return to_dict(x)|{'role':'sidecar' if '.'+x.file_format in pointcloud_mod.SIDECAR_EXT else 'cloud'}
+def _pc_dict(x):return to_dict(x)|{'role':'sidecar' if '.'+x.file_format in pointcloud_mod.SIDECAR_EXT else 'cloud','copc_url':copc_url(x)}
 @app.post('/api/v1/inspections/{inspection_id}/pointclouds',status_code=201)
-async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Session=Depends(get_db)):
+async def upload_pointcloud(inspection_id:int,background:BackgroundTasks,file:UploadFile=File(...),db:Session=Depends(get_db)):
     """A point cloud for this inspection (.las .laz .ply .xyz .pts .txt .csv) or its sidecar (.lax index, .prj coordinate system)."""
     inspection=db.get(Inspection,inspection_id)
     if not inspection:raise HTTPException(404,'Inspection not found')
@@ -441,7 +441,7 @@ async def upload_pointcloud(inspection_id:int,file:UploadFile=File(...),db:Sessi
                 sha.update(chunk);out.write(chunk)
         await run_in_threadpool(storage.push,target);await run_in_threadpool(storage.release,target)
         x=PointCloudFile(inspection_id=inspection_id,filename=name,storage_key=key,file_format=ext[1:],size_bytes=size,sha256=sha.hexdigest())
-        db.add(x);db.commit();db.refresh(x);return _pc_dict(x)
+        db.add(x);db.commit();db.refresh(x);queue_copc(background,db,x);return _pc_dict(x)
     except Exception:
         target.unlink(missing_ok=True);raise
 # ---------- chunked uploads: large files arrive in parts so every request stays far below the proxy's 300 s limit ----------
@@ -489,7 +489,7 @@ async def chunked_part(upload_id:str,number:int,request:Request):
         await run_in_threadpool(write)
     s['digests'][number]=hashlib.sha256(data).digest();return {'part':number,'bytes':len(data)}
 @app.post('/api/v1/chunked-uploads/{upload_id}/complete',status_code=201)
-async def chunked_complete(upload_id:str,db:Session=Depends(get_db)):
+async def chunked_complete(upload_id:str,background:BackgroundTasks,db:Session=Depends(get_db)):
     s=_chunked.get(upload_id)
     if not s:raise HTTPException(404,'Upload session not found (the server may have restarted); start the upload again')
     missing=[n for n in range(1,s['parts']+1) if n not in s['digests']]
@@ -501,12 +501,63 @@ async def chunked_complete(upload_id:str,db:Session=Depends(get_db)):
         x=PointCloudFile(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],file_format=s['ext'][1:],size_bytes=s['size'],sha256=sha)
     else:x=Media(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],content_type=s['content_type'],sha256=sha,size_bytes=s['size'])
     db.add(x);db.commit();db.refresh(x);_chunked.pop(upload_id,None)
+    if s['kind']=='pointcloud':queue_copc(background,db,x)  # the browser copy (COPC) is built on the GPU worker
     return _pc_dict(x) if s['kind']=='pointcloud' else to_dict(x)
 @app.delete('/api/v1/chunked-uploads/{upload_id}',status_code=204)
 def chunked_cancel(upload_id:str):
     s=_chunked.pop(upload_id,None)
     if s:_abort_chunked(s)
     return Response(status_code=204)
+# ---------- COPC for the browser (Potree streams every point by level of detail) ----------
+COPC_LINK_HOURS=12
+_SIGNING_KEY=(os.getenv('URL_SIGNING_KEY') or uuid.uuid4().hex+uuid.uuid4().hex).encode()  # links stop working after a restart without it; the viewer asks for fresh ones
+def _copc_key(x):
+    p=PurePosixPath(x.storage_key);stem=p.name[:-len('.copc.laz')] if p.name.lower().endswith('.copc.laz') else p.stem
+    return str(p.with_name(f'{stem}.copc.laz'))
+def _copc_sig(file_id,exp):return hmac.new(_SIGNING_KEY,f'copc:{file_id}:{exp}'.encode(),hashlib.sha256).hexdigest()[:32]
+def copc_url(x):
+    """A link Potree can fetch without the sign-in header (copc.js sends plain range requests): signed, valid for hours."""
+    if x.copc_status!='ready' or not x.copc_key:return None
+    exp=int(time.time())+COPC_LINK_HOURS*3600;name=quote(PurePosixPath(x.copc_key).name)
+    return f'/api/v1/copc/{x.id}/{exp}/{_copc_sig(x.id,exp)}/{name}'
+def queue_copc(background,db,x):
+    """Convert an uploaded LAS/LAZ to COPC on the GPU worker (a COPC upload is used as it is)."""
+    if '.'+x.file_format not in ('.las','.laz'):return
+    if x.filename.lower().endswith('.copc.laz'):x.copc_key,x.copc_status,x.copc_points=x.storage_key,'ready',None;db.commit();return
+    x.copc_status,x.copc_error='queued',None;db.commit();gpu.start(background,'convert_pointcloud',file_id=x.id)
+def _copc_prepare(db,file_id):
+    x=db.get(PointCloudFile,file_id)
+    if not x:raise HTTPException(404,'Point cloud not found')
+    x.copc_status='converting';db.commit();return {'key':x.storage_key,'out':_copc_key(x)}
+def _copc_apply(db,r,file_id):
+    x=db.get(PointCloudFile,file_id)
+    if x:x.copc_key,x.copc_status,x.copc_points,x.copc_error=_copc_key(x),'ready',int(r['points']),None;db.commit()
+    return {'file_id':file_id,'points':r['points']}
+def _copc_fail(db,error,file_id):
+    x=db.get(PointCloudFile,file_id)
+    if x:x.copc_status,x.copc_error='failed',str((error or {}).get('detail') or error)[:2000];db.commit()
+gpu.register('convert_pointcloud',prepare=_copc_prepare,apply=_copc_apply,fail=_copc_fail)
+@app.post('/api/v1/pointclouds/{file_id}/convert',status_code=202)
+def convert_pointcloud(file_id:int,background:BackgroundTasks,db:Session=Depends(get_db)):
+    """(Re)build the browser copy of an uploaded LAS/LAZ."""
+    x=db.get(PointCloudFile,file_id)
+    if not x:raise HTTPException(404,'Point cloud not found')
+    if '.'+x.file_format not in ('.las','.laz'):raise HTTPException(409,'Only LAS/LAZ files are converted for the browser')
+    if x.copc_status in ('queued','converting'):raise HTTPException(409,'This file is already being converted')
+    if colmap_state()=='worker_offline' and gpu.REMOTE:raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
+    queue_copc(background,db,x);return _pc_dict(x)
+@app.get('/api/v1/copc/{file_id}/{exp}/{sig}/{name}')
+def copc_file(file_id:int,exp:int,sig:str,name:str,request:Request,db:Session=Depends(get_db)):
+    """The COPC by byte range (public route: the signature in the link is the permission)."""
+    if exp<time.time() or not hmac.compare_digest(sig,_copc_sig(file_id,exp)):raise HTTPException(403,'This point cloud link has expired: reload the page')
+    x=db.get(PointCloudFile,file_id)
+    if not x or not x.copc_key:raise HTTPException(404,'Point cloud not found')
+    path=ROOT/x.copc_key;cache={'Cache-Control':'private, max-age=3600'}
+    if path.is_file():return FileResponse(path,media_type='application/octet-stream',headers=cache)
+    found=storage.stream(path,request.headers.get('range'))
+    if not found:raise HTTPException(404,'Point cloud file not found in storage')
+    body,status,headers=found
+    return StreamingResponse(body,status_code=status,headers={**headers,**cache},media_type='application/octet-stream')
 @app.get('/api/v1/inspections/{inspection_id}/pointclouds')
 def pointclouds(inspection_id:int,db:Session=Depends(get_db)):
     return [_pc_dict(x) for x in db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==inspection_id).order_by(PointCloudFile.id)).all()]
@@ -514,7 +565,8 @@ def pointclouds(inspection_id:int,db:Session=Depends(get_db)):
 def delete_pointcloud(file_id:int,db:Session=Depends(get_db)):
     x=db.get(PointCloudFile,file_id)
     if not x:raise HTTPException(404,'Point cloud not found')
-    (ROOT/x.storage_key).unlink(missing_ok=True);storage.delete(ROOT/x.storage_key);db.delete(x);db.commit();return Response(status_code=204)
+    for key in {x.storage_key,x.copc_key}-{None}:(ROOT/key).unlink(missing_ok=True);storage.delete(ROOT/key)
+    db.delete(x);db.commit();return Response(status_code=204)
 @app.post('/api/v1/inspections/{inspection_id}/pointcloud-model',status_code=202)
 def build_pointcloud_model(inspection_id:int,background:BackgroundTasks,db:Session=Depends(get_db)):
     """3D model from the uploaded point cloud(s): no photogrammetry (COLMAP is not used). The photos' camera positions and

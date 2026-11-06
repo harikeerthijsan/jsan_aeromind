@@ -256,6 +256,30 @@ def _pointcloud_model(payload, progress, work):
         for p in temp:
             if storage.bucket_only(): p.unlink(missing_ok=True)
 
+def convert_pointcloud(payload, progress):
+    """payload: {'key': uploaded LAS/LAZ, 'out': COPC key} -> {'points', 'bytes'}. The browser shows the COPC with Potree.
+    Untwine needs the file on disk: it is fetched, converted, the COPC stored, and (bucket mode) both are removed again."""
+    from . import copc
+    src, out = ROOT / payload['key'], ROOT / payload['out']
+    if not copc.untwine_exe(): raise HTTPException(503, 'Untwine is not installed on the GPU machine: conda install -c conda-forge untwine, or set UNTWINE_BIN')
+    had = src.is_file(); found = None if had else storage.head(src)
+    size = src.stat().st_size if had else (found or (None, 0))[1]
+    stream = None if had else storage.open_remote(src)
+    try: points = copc.point_count(src if had else stream)  # from the header: no download yet
+    finally:
+        if stream is not None: stream.close()
+    need_disk((0 if had else size) + points * copc.SCRATCH_PER_POINT + points * 8 + 512 * 1024 ** 2, f'to convert {src.name} ({points / 1e6:.0f} M points) to COPC')
+    try:
+        if not had: progress('downloading', 5, f'Fetching {src.name} ({size / 1e9:.1f} GB)'); storage.fetch(src)
+        progress('converting', 20, f'Converting {points / 1e6:.0f} M points to COPC')
+        n = copc.convert(src, out, lambda msg: progress('converting', 50, msg))
+        progress('uploading', 90, 'Saving the COPC to storage'); storage.push(out)
+        return {'points': n, 'bytes': out.stat().st_size}
+    finally:
+        if storage.bucket_only():
+            if not had: src.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+
 def scale_of(work, photo_keys):
     """Metres per viewer unit of a built model: its cameras (web/cameras.json) fitted to the photos' GPS positions."""
     import json
@@ -323,5 +347,5 @@ def plain(v):
     if isinstance(v, (list, tuple)): return [plain(x) for x in v]
     return v.tolist() if hasattr(v, 'tolist') else v
 
-COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'run_pointcloud_model': pointcloud_model, 'model_scale': model_scale, 'vendor_suggestion': vendor_suggestion,
+COMPUTE = {'run_detection': detect, 'run_reconstruction': reconstruct_model, 'run_pointcloud_model': pointcloud_model, 'convert_pointcloud': convert_pointcloud, 'model_scale': model_scale, 'vendor_suggestion': vendor_suggestion,
            'condition_assessment': condition_assessment, 'register_assets': register_assets}

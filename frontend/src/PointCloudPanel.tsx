@@ -6,7 +6,9 @@ import './pointcloud.css';
 /** Optional point cloud for an inspection (LiDAR / photogrammetry export). When present, "Build 3D model from point
  * cloud" uses it as the 3D model instead of COLMAP's dense reconstruction; photos (with GPS) are only aligned to it so
  * the 3D equipment boxes still work. */
-export type PointCloudFile={id:number;inspection_id:number;filename:string;file_format:string;size_bytes:number;created_at:string;role:'cloud'|'sidecar'};
+export type PointCloudFile={id:number;inspection_id:number;filename:string;file_format:string;size_bytes:number;created_at:string;role:'cloud'|'sidecar';
+ copc_status?:'queued'|'converting'|'ready'|'failed'|null;copc_points?:number|null;copc_error?:string|null};  // copc: the browser copy (full LiDAR view)
+const VIEWER:Record<string,string>={queued:'Waiting to prepare for the viewer',converting:'Preparing for the full LiDAR viewer…',ready:'Ready for the full LiDAR viewer',failed:'Could not prepare for the viewer'};
 const ACCEPT='.las,.laz,.lax,.e57,.ply,.xyz,.pts,.txt,.csv,.prj';
 export const mb=(n:number)=>n>=1e9?`${(n/1e9).toFixed(2)} GB`:n>=1e6?`${(n/1e6).toFixed(1)} MB`:`${Math.max(1,Math.round(n/1e3))} kB`;
 
@@ -19,6 +21,9 @@ export default function PointCloudPanel({inspectionId,inspectionLabel,onBuilt,on
  const load=()=>{if(!inspectionId)return;request<PointCloudFile[]>(`/api/v1/inspections/${inspectionId}/pointclouds`).then(f=>{setFiles(f);changed.current?.(f)}).catch(e=>setError(String(e.message||e)));
   request<{content_type:string;parent_media_id:number|null}[]>(`/api/v1/inspections/${inspectionId}/media`).then(m=>setPhotoCount(m.filter(x=>x.parent_media_id==null&&x.content_type.startsWith('image/')).length)).catch(()=>{})};
  useEffect(()=>{setFiles([]);setError('');setNote('');load();return()=>abort.current?.abort()},[inspectionId]);
+ const preparing=files.some(f=>f.copc_status==='queued'||f.copc_status==='converting');
+ useEffect(()=>{if(!preparing)return;const t=setInterval(load,10000);return()=>clearInterval(t)},[preparing,inspectionId]);  // conversion runs on the GPU worker
+ async function convert(f:PointCloudFile){setError('');try{await request(`/api/v1/pointclouds/${f.id}/convert`,{method:'POST'});load()}catch(e){setError(String((e as Error).message||e))}}
  async function choose(list:FileList|File[]|null){if(!list||!list.length||!inspectionId)return;const chosen=Array.from(list);setError('');setNote('');setBusy('upload');
   const ctl=new AbortController();abort.current=ctl;const done:PointCloudFile[]=[];
   try{for(const [i,f] of chosen.entries()){setProgress({name:f.name,loaded:0,total:f.size,n:i+1,of:chosen.length});
@@ -42,7 +47,8 @@ export default function PointCloudPanel({inspectionId,inspectionLabel,onBuilt,on
    <input type="file" multiple accept={ACCEPT} disabled={!!busy} onChange={e=>{choose(e.target.files);e.target.value=''}}/></label>
   :progress&&<div className="pc-progress"><div><span>Uploading {progress.n}/{progress.of} · {progress.name}</span><b>{mb(progress.loaded)} / {mb(progress.total)}</b></div><i><s style={{width:`${progress.total?progress.loaded/progress.total*100:0}%`}}/></i>
    <button type="button" className="btn outline pc-cancel" onClick={()=>abort.current?.abort()}><X size={14}/>Cancel upload</button></div>}
-  {files.length>0&&<ul className="pc-files">{files.map(f=><li key={f.id}><span className={'pc-fmt '+f.role}>{f.file_format}</span><b>{f.filename}</b><small>{mb(f.size_bytes)}{f.role==='sidecar'?' · sidecar':''}</small>
+  {files.length>0&&<ul className="pc-files">{files.map(f=><li key={f.id}><span className={'pc-fmt '+f.role}>{f.file_format}</span><b>{f.filename}</b><small>{mb(f.size_bytes)}{f.role==='sidecar'?' · sidecar':''}{f.copc_status&&<> · <span title={f.copc_error||''} style={{color:f.copc_status==='ready'?'#19765a':f.copc_status==='failed'?'#b42318':'#966506'}}>{VIEWER[f.copc_status]}{f.copc_status==='ready'&&f.copc_points?` (${(f.copc_points/1e6).toFixed(1)} M points)`:''}</span></>}
+    {f.role==='cloud'&&['las','laz'].includes(f.file_format)&&(f.copc_status==='failed'||!f.copc_status)&&<button type="button" className="pc-retry" onClick={()=>convert(f)} style={{marginLeft:6,border:0,background:'none',color:'#1769aa',cursor:'pointer',fontSize:'inherit',padding:0}}>{f.copc_status==='failed'?'Retry':'Prepare for viewer'}</button>}</small>
    <button title="Remove" disabled={!!busy} onClick={()=>remove(f)}><Trash2 size={14}/></button></li>)}</ul>}
   {!hideBuild&&clouds.length>0&&<button className="btn primary pc-build" disabled={!!busy} onClick={build}><Box size={15}/>{busy==='build'?'Starting…':`Build 3D model from point cloud${clouds.length>1?` (${clouds.length} files)`:''}`}</button>}
   {note&&<div className="pc-note"><CheckCircle2 size={14}/>{note}</div>}

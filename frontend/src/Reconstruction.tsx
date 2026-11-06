@@ -1,6 +1,7 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,ThreeEvent,useFrame,useThree} from '@react-three/fiber';import {OrbitControls,Grid,TransformControls} from '@react-three/drei';import {LabelAnchor} from './Label3D';
 import PointCloudPanel from './PointCloudPanel';
+import PotreeView,{copcClouds} from './PotreeView';
 import * as THREE from 'three';import {PLYLoader} from 'three/examples/jsm/loaders/PLYLoader.js';
 import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize,X} from 'lucide-react';
 import {API,request,Inspection,Job,Media,RegistrationCandidate,getAuthToken} from './api';
@@ -160,7 +161,16 @@ function MeasurePicker({object,onPick}:{object:THREE.Object3D;onPick:(point:Meas
   return()=>{el.removeEventListener('pointerdown',onDown);el.removeEventListener('pointerup',onUp);el.style.cursor=prev}},[gl,camera,object]);
  return null}
 export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMarker,editingMarker,markerEditMode='translate',focusRequest=0,onMarkerPick,onMarkerTransform,measurementMode,measurementPoints=[],onMeasurementPoint}:{model:Model3D;mode:'points'|'mesh';pointSize:number;showCams:boolean;markers?:RegistrationCandidate[];selectedMarker?:number|null;editingMarker?:number|null;markerEditMode?:MarkerEditMode;focusRequest?:number;onMarkerPick?:(id:number)=>void;onMarkerTransform?:(id:number,position:[number,number,number],yaw:number)=>void;measurementMode?:MeasurementMode|null;measurementPoints?:MeasurementPoint[];onMeasurementPoint?:(point:MeasurementPoint)=>void}){
- const useMesh=mode==='mesh'&&!!model.urls.web_mesh;const {geo,err}=usePly(useMesh?model.urls.web_mesh:model.urls.web_points);
+ // point cloud models: the full survey, streamed by Potree from its COPC copy (every point); the preview below stays for
+ // measuring and moving boxes, and while the COPC is still being built
+ const isCloud=model.quality?.source==='pointcloud',[clouds,setClouds]=useState<Awaited<ReturnType<typeof copcClouds>>|null>(null),[preview,setPreview]=useState(false);
+ const ready=(clouds||[]).filter(c=>c.copc_url);
+ useEffect(()=>{if(!isCloud)return;let live=true,timer=0;
+  const load=()=>copcClouds(model.inspection_id).then(c=>{if(!live)return;setClouds(c);if(!c.some(x=>x.copc_url)&&c.some(x=>['queued','converting'].includes(x.copc_status||'')))timer=window.setTimeout(load,15000)}).catch(()=>{});
+  load();return()=>{live=false;clearTimeout(timer)}},[model.id]);
+ const q=model.quality as Model3D['quality']&{transform?:number[][];pointcloud?:{origin?:number[]}};
+ const full=isCloud&&ready.length>0&&!preview&&!measurementMode&&editingMarker==null&&!!q.transform&&!!q.pointcloud?.origin;
+ const useMesh=mode==='mesh'&&!!model.urls.web_mesh;const {geo,err}=usePly(full?undefined:useMesh?model.urls.web_mesh:model.urls.web_points);
  const [selectedCam,setSelectedCam]=useState<Cam|null>(null);
  const obj=useMemo(()=>{if(!geo)return null;const colors=!!geo.getAttribute('color');
   if(useMesh){geo.computeVertexNormals();return new THREE.Mesh(geo,new THREE.MeshStandardMaterial({vertexColors:colors,color:colors?'#ffffff':'#c8d3de',side:THREE.DoubleSide,roughness:.9}))}
@@ -175,7 +185,15 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
  useEffect(()=>{if(!showCams)setSelectedCam(null)},[showCams]);
  const label=useRef<HTMLDivElement>(null),sel=markers.find(m=>m.id===selectedMarker);// selected box label, positioned by LabelAnchor
  const cameraRoot=model.urls.web_cameras?.replace(/\/web\/cameras\.json(?:\?.*)?$/,'')||'',cameraImage=selectedCam?`${API}${cameraRoot}/images/${selectedCam.name.split('/').map(encodeURIComponent).join('/')}`:'';
- return <><div ref={label} className="three-label floating-label">{sel&&<><strong>{sel.class_name.replaceAll('_',' ')}</strong><br/><small>Estimated · {sel.media_count} images · {Math.round(sel.confidence*100)}%</small></>}</div>{err&&<div className="recon-msg">Could not load the model: {err}</div>}{!geo&&!err&&<div className="recon-msg">Loading 3D model…</div>}
+ const converting=(clouds||[]).find(c=>['queued','converting'].includes(c.copc_status||'')),failed=(clouds||[]).find(c=>c.copc_status==='failed');
+ const lidarBar=isCloud&&(ready.length>0||converting||failed)&&<div style={{position:'absolute',left:12,top:12,zIndex:6,display:'flex',alignItems:'center',gap:4,padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.85)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
+  {ready.length>0?<>{(['full','preview'] as const).map(v=><button key={v} type="button" onClick={()=>setPreview(v==='preview')} disabled={v==='full'&&(!!measurementMode||editingMarker!=null)}
+    style={{padding:'3px 8px',borderRadius:6,border:'1px solid '+((v==='preview')===(!full)?'#5fa8e6':'transparent'),background:(v==='preview')===(!full)?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:'pointer'}}>{v==='full'?'Full LiDAR':'Preview'}</button>)}
+   {(measurementMode||editingMarker!=null)&&<span style={{opacity:.75}}>· measuring and moving boxes use the preview</span>}</>
+  :converting?<span>Preparing the full LiDAR view ({converting.copc_status})…</span>:<span title={failed?.copc_error||''}>Full LiDAR view could not be prepared</span>}</div>;
+ if(full)return <div style={{position:'relative',width:'100%',height:'100%'}}>{lidarBar}
+  <PotreeView clouds={ready} transform={q.transform!} origin={q.pointcloud!.origin!} view={q.view} markers={markers} selected={selectedMarker} colorOf={classColor} onPick={onMarkerPick}/></div>;
+ return <div style={{position:'relative',width:'100%',height:'100%'}}>{lidarBar}<div ref={label} className="three-label floating-label">{sel&&<><strong>{sel.class_name.replaceAll('_',' ')}</strong><br/><small>Estimated · {sel.media_count} images · {Math.round(sel.confidence*100)}%</small></>}</div>{err&&<div className="recon-msg">Could not load the model: {err}</div>}{!geo&&!err&&<div className="recon-msg">Loading 3D model…</div>}
   {selectedCam&&<div className="camera-preview"><div className="camera-preview-head"><span><Camera size={14}/><b>Drone capture</b></span><button type="button" onClick={()=>setSelectedCam(null)} title="Close image preview"><X size={15}/></button></div><img src={cameraImage} alt={`Drone capture ${selectedCam.name}`}/><div className="camera-preview-meta"><span>{selectedCam.name.split('/').pop()}</span><small>Captured from the selected yellow camera point</small></div></div>}
   {ctxObj&&<div className="trees-toggle" style={{position:'absolute',right:12,bottom:12,zIndex:5,display:'flex',alignItems:'center',gap:4,padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.85)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
    <span style={{marginRight:2}}>Trees</span>{TREES.map(([v,l])=><button key={v} type="button" onClick={()=>setTrees(v)} style={{padding:'3px 8px',borderRadius:6,border:'1px solid '+(trees===v?'#5fa8e6':'transparent'),background:trees===v?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:'pointer'}}>{l}</button>)}</div>}
@@ -183,7 +201,7 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
    <color attach="background" args={['#0f1f31']}/><ambientLight intensity={.9}/><directionalLight position={[8,12,6]} intensity={1.2}/>
    {obj&&<primitive object={obj}/>}{ctxObj&&trees!=='hidden'&&<primitive object={ctxObj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
    <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={view?.target||[0,1,0]}/><CameraFocus marker={sel} request={focusRequest}/>
-  </Canvas></>;
+  </Canvas></div>;
 }
 
 export default function Reconstruction({inspections,jobs,onChanged}:{inspections:Inspection[];jobs:Job[];onChanged:()=>void}){

@@ -232,3 +232,8 @@ class PointCloudFile(Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    # COPC copy for the browser (every point, streamed level of detail by Potree): converted with Untwine on the GPU worker
+    copc_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    copc_status: Mapped[str | None] = mapped_column(String(20), nullable=True)  # queued / converting / ready / failed
+    copc_points: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    copc_error: Mapped[str | None] = mapped_column(Text, nullable=True)

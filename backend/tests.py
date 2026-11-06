@@ -1280,3 +1280,28 @@ def test_tower_split_from_trees_and_clear_start_view():
     view = pc.clear_view(P, S, info, M)
     cam = ((np.asarray(view['position']) - M[:3, 3]) @ (M[:3, :3] / np.linalg.norm(M[:3, 0]))) / np.linalg.norm(M[:3, 0])  # back to metres
     assert cam[1] > -1 and np.hypot(cam[0], cam[1]) > 20  # not on the south side, where all the trees are, and far enough out
+
+def test_las_upload_is_converted_to_copc_and_streamed_by_range():
+    """Upload a LAS: the GPU worker converts it to COPC with Untwine (like the PLA QC app); the browser gets a signed
+    link that serves byte ranges without the sign-in header (copc.js / Potree) and nothing else."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('laspy')
+    from app import copc
+    if not copc.untwine_exe(): pytest.skip('untwine not installed')
+    import tempfile
+    from pathlib import Path
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'copc'}).json()
+        tmp = Path(tempfile.mkdtemp()) / 'site.las'; rng = np.random.default_rng(0)
+        _write_las(tmp, rng.uniform(0, 50, (20000, 3)) + [400000, 300000, 10], crs=__import__('pyproj').CRS.from_epsg(32630), rgb=rng.integers(0, 255, (20000, 3)))
+        up = client.post(f"/api/v1/inspections/{ins['id']}/pointclouds", files={'file': ('site.las', tmp.read_bytes(), 'application/octet-stream')}).json()
+        f = next(x for x in client.get(f"/api/v1/inspections/{ins['id']}/pointclouds").json() if x['id'] == up['id'])
+        assert f['copc_status'] == 'ready' and f['copc_points'] == 20000 and f['copc_key'].endswith('site.copc.laz'), f
+        url = f['copc_url']; assert '.copc.laz' in url  # Potree picks its COPC loader from the name
+        anon = TestClient(app)
+        r = anon.get(url, headers={'Range': 'bytes=0-374'}); assert r.status_code == 206 and r.content[:4] == b'LASF' and len(r.content) == 375
+        parts = url.split('/'); parts[6] = '0' * 32
+        assert anon.get('/'.join(parts)).status_code == 403  # tampered signature
+        parts = url.split('/'); parts[5] = '1000'
+        assert anon.get('/'.join(parts)).status_code == 403  # expired
+        assert client.post(f"/api/v1/pointclouds/{up['id']}/convert").status_code == 202  # rebuild on request
+        assert client.delete(f"/api/v1/pointclouds/{up['id']}").status_code == 204
