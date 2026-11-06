@@ -1,6 +1,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {API,request} from './api';
 import type {RegistrationCandidate} from './api';
+import ViewToolbar,{ViewMode} from './ViewToolbar';
 
 /** Every point of the uploaded LiDAR, streamed by level of detail with Potree from the COPC copy the GPU worker builds
  * (the way the PLA QC app shows its surveys), with the 3D equipment boxes drawn in the survey's own coordinates. */
@@ -10,7 +11,6 @@ type Win=Window&{Potree?:any};
 const BASE='/potree';
 const SCRIPTS=['libs/jquery/jquery-3.1.1.min.js','libs/other/BinaryHeap.js','libs/tween/tween.min.js','libs/proj4/proj4.js','libs/copc/index.js','build/potree/potree.js'];
 let runtime:Promise<any>|null=null;
-const btn=(on:boolean,off=false):React.CSSProperties=>({padding:'3px 8px',borderRadius:6,border:'1px solid '+(on?'#5fa8e6':'transparent'),background:on?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:off?'default':'pointer',opacity:off?.45:1});
 function loadPotree():Promise<any>{  // Potree 1.8 is a set of classic scripts; it brings its own three.js, used for the boxes too
  if(runtime)return runtime;
  runtime=(async()=>{
@@ -29,14 +29,13 @@ function toLocal(M:number[][],v:[number,number,number]){
  const s=Math.hypot(M[0][0],M[1][0],M[2][0]),d=[v[0]-M[0][3],v[1]-M[1][3],v[2]-M[2][3]];
  return [0,1,2].map(j=>(M[0][j]*d[0]+M[1][j]*d[1]+M[2][j]*d[2])/(s*s)) as [number,number,number];
 }
-function corners(m:RegistrationCandidate):[number,number,number][]{
+export function corners(m:RegistrationCandidate):[number,number,number][]{
  const w=(m.size_w||.05)/2,h=(m.size_h||.05)/2,d=(m.size_d||.05)/2,c=Math.cos(m.yaw||0),s=Math.sin(m.yaw||0),out:[number,number,number][]=[];
  for(const a of [-w,w])for(const b of [-h,h])for(const e of [-d,d])out.push([m.x+a*c+e*s,m.z+b,m.y-a*s+e*c]);
  return out;  // same layout as the preview: centre (x, z, y), yaw about the vertical
 }
 const EDGES=[[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
 // ---------- navigation (as in the PLA QC app): views, orbit / pan, fit, zoom to a spot, focus and isolate a box ----------
-type ViewMode='3d'|'top'|'front'|'side';
 const VIEWS:Record<ViewMode,{yaw:number;pitch:number}>={top:{yaw:0,pitch:-Math.PI/2},front:{yaw:0,pitch:0},side:{yaw:Math.PI/2,pitch:0},'3d':{yaw:Math.PI/4,pitch:-Math.PI/4}};
 const ZOOM_IN=.4,ZOOM_OUT=2.5;
 function easeView(viewer:any,target:any,toRadius:number,ms=320){  // move the focus point onto target while the distance changes, view angle kept
@@ -140,19 +139,9 @@ export default function PotreeView({clouds,transform,origin,view,markers,selecte
     if(m&&!e.shiftKey){onPick?.(m.id);focus(m);return}zoomAt(st,e.clientX-r.left,e.clientY-r.top,e.shiftKey?ZOOM_OUT:ZOOM_IN)}}>
   <div ref={host} style={{position:'absolute',inset:0}}/>
   {hover&&<div style={{position:'absolute',left:hover.x+14,top:hover.y+10,pointerEvents:'none',zIndex:7,padding:'6px 9px',borderRadius:8,background:'rgba(255,255,255,.95)',color:'#1d2f40',fontSize:12,boxShadow:'0 4px 14px rgba(0,0,0,.25)'}}><strong>{hover.m.class_name.replaceAll('_',' ')}</strong><br/><small>{hover.m.media_count} images · {Math.round(hover.m.confidence*100)}%</small></div>}
-  {loaded>0&&<div onPointerDown={e=>e.stopPropagation()} onPointerUp={e=>e.stopPropagation()} onDoubleClick={e=>e.stopPropagation()}
-   style={{position:'absolute',right:12,top:12,zIndex:6,display:'flex',flexWrap:'wrap',justifyContent:'flex-end',alignItems:'center',gap:4,maxWidth:'calc(100% - 200px)',padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.88)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
-   {(['3d','top','front','side'] as ViewMode[]).map(v=><button key={v} type="button" title={v==='3d'?'Perspective 3D view':`${v[0].toUpperCase()+v.slice(1)} view (orthographic)`} onClick={()=>{const st=state.current;if(st){setView(st.viewer,v);setMode(v)}}} style={btn(mode===v)}>{v==='3d'?'3D':v[0].toUpperCase()+v.slice(1)}</button>)}
-   <span style={{width:1,height:16,background:'#2d5878',margin:'0 2px'}}/>
-   <button type="button" title="Orbit: left-drag rotates around the focus. Pan: left-drag moves, right-drag rotates" onClick={()=>setPan(p=>!p)} style={btn(false)}>{pan?'Pan':'Orbit'}</button>
-   <button type="button" title="Show the whole point cloud" onClick={()=>{const st=state.current;if(st){isolate(null);st.viewer.fitToScreen(.8)}}} style={btn(false)}>Fit</button>
-   <button type="button" disabled={!sel} title="Zoom onto the selected box" onClick={()=>sel&&focus(sel)} style={btn(false,!sel)}>Focus</button>
-   <button type="button" disabled={!sel&&isolated==null} title="Close-up: show only the selected box and 1.5 m around it" onClick={()=>isolate(isolated!=null?null:sel||null)} style={btn(isolated!=null,!sel&&isolated==null)}>{isolated!=null?'Show all':'Isolate'}</button>
-   <span style={{width:1,height:16,background:'#2d5878',margin:'0 2px'}}/>
-   <label title="Point size" style={{display:'flex',alignItems:'center',gap:4}}>Size<input type="range" min={.3} max={3} step={.1} value={size} onChange={e=>setSize(+e.target.value)} style={{width:70}}/></label>
-  </div>}
-  {loaded>0&&<div style={{position:'absolute',left:12,bottom:10,zIndex:6,padding:'3px 8px',borderRadius:6,background:'rgba(15,31,49,.75)',color:'#9fb6c8',fontSize:11,pointerEvents:'none'}}>
-   {pan?'Left-drag: pan · Right-drag: rotate · Wheel: zoom to cursor':'Left-drag: rotate · Right/middle-drag: pan · Wheel: zoom'} · Double-click: zoom in on a spot (Shift: out) · Double-click a box: focus it</div>}
+  {loaded>0&&<ViewToolbar orthographic mode={mode} onView={v=>{const st=state.current;if(st){setView(st.viewer,v);setMode(v)}}} pan={pan} onPan={()=>setPan(p=>!p)}
+   onFit={()=>{const st=state.current;if(st){isolate(null);st.viewer.fitToScreen(.8)}}} canFocus={!!sel} onFocus={()=>sel&&focus(sel)}
+   isolated={isolated!=null} onIsolate={()=>isolate(isolated!=null?null:sel||null)} size={size} onSize={setSize}/>}
   {err&&<div className="recon-msg">Could not start the LiDAR viewer: {err}</div>}
   {!err&&!loaded&&<div className="recon-msg">Streaming the LiDAR point cloud…</div>}
  </div>;

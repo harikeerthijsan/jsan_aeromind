@@ -1,7 +1,8 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,ThreeEvent,useFrame,useThree} from '@react-three/fiber';import {OrbitControls,Grid,TransformControls} from '@react-three/drei';import {LabelAnchor} from './Label3D';
 import PointCloudPanel from './PointCloudPanel';
-import PotreeView,{copcClouds} from './PotreeView';
+import PotreeView,{copcClouds,corners} from './PotreeView';
+import ViewToolbar,{ViewMode} from './ViewToolbar';
 import * as THREE from 'three';import {PLYLoader} from 'three/examples/jsm/loaders/PLYLoader.js';
 import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize,X} from 'lucide-react';
 import {API,request,Inspection,Job,Media,RegistrationCandidate,getAuthToken} from './api';
@@ -148,6 +149,34 @@ function nearestPoint(points:THREE.Points|THREE.Mesh,ray:THREE.Ray,camera:THREE.
  for(const i of hits){const vx=a[i]-ox,vy=a[i+1]-oy,vz=a[i+2]-oz,t=vx*dx+vy*dy+vz*dz;if(t>front+band)continue;
   const off=Math.sqrt(Math.max(0,vx*vx+vy*vy+vz*vz-t*t))/t;if(off<bestPx){bestPx=off;best=i}}  // angular offset from the ray ~ pixels
  return new THREE.Vector3(a[best],a[best+1],a[best+2]).applyMatrix4(points.matrixWorld)}
+// ---------- navigation, the same as in the full LiDAR view: view presets, fit, double-click zoom to a spot / a box ----------
+type NavCmd={seq:number;kind:'view'|'fit';mode?:ViewMode};
+function ViewNav({object,cmd,markers,onBox}:{object:THREE.Object3D|null;cmd:NavCmd|null;markers:RegistrationCandidate[];onBox?:(id:number)=>void}){
+ const {camera,controls,gl}=useThree(),anim=useRef<FocusAnimation|null>(null);
+ const orbit=()=>controls as unknown as {target:THREE.Vector3;update:()=>void}|null;
+ const go=(toTarget:THREE.Vector3,toPosition:THREE.Vector3)=>{const o=orbit();if(o)anim.current={fromPosition:camera.position.clone(),toPosition,fromTarget:o.target.clone(),toTarget,progress:0}};
+ useEffect(()=>{const o=orbit();if(!cmd||!o)return;const dist=camera.position.distanceTo(o.target)||10;
+  if(cmd.kind==='fit'){if(!object)return;const sph=new THREE.Box3().setFromObject(object).getBoundingSphere(new THREE.Sphere()),fov=THREE.MathUtils.degToRad((camera as THREE.PerspectiveCamera).fov||45);
+   const dir=camera.position.clone().sub(o.target).normalize();go(sph.center.clone(),sph.center.clone().add(dir.multiplyScalar(sph.radius/Math.sin(fov/2)*.9)));return}
+  const dir=cmd.mode==='top'?new THREE.Vector3(0,1,.0001):cmd.mode==='front'?new THREE.Vector3(0,0,1):cmd.mode==='side'?new THREE.Vector3(1,0,0):new THREE.Vector3(1,.65,1);
+  go(o.target.clone(),o.target.clone().add(dir.normalize().multiplyScalar(dist)));
+ },[cmd?.seq]);
+ useEffect(()=>{const el=gl.domElement;
+  const onDbl=(e:MouseEvent)=>{const o=orbit();if(!o)return;const r=el.getBoundingClientRect(),ray=new THREE.Raycaster();
+   ray.setFromCamera(new THREE.Vector2((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1),camera);
+   if(!e.shiftKey&&onBox){let best:RegistrationCandidate|null=null,bd=Infinity;  // a box under the cursor: select and focus it
+    for(const m of markers){if(m.status==='rejected')continue;const hit=ray.ray.intersectBox(new THREE.Box3().setFromPoints(corners(m).map(p=>new THREE.Vector3(...p))),new THREE.Vector3());
+     if(hit&&hit.distanceTo(ray.ray.origin)<bd){bd=hit.distanceTo(ray.ray.origin);best=m}}
+    if(best){onBox(best.id);return}}
+   const dist=camera.position.distanceTo(o.target),hit=object instanceof THREE.Points?nearestPoint(object,ray.ray,camera,r.height):object?ray.intersectObject(object,false)[0]?.point??null:null;
+   const spot=hit?new THREE.Vector3(hit.x,hit.y,hit.z):ray.ray.at(dist,new THREE.Vector3()),to=e.shiftKey?o.target.clone().lerp(spot,.35):spot;
+   go(to,to.clone().add(camera.position.clone().sub(o.target).normalize().multiplyScalar(Math.max(.05,dist*(e.shiftKey?2.5:.4)))))};  // Shift: zoom out
+  el.addEventListener('dblclick',onDbl);return()=>el.removeEventListener('dblclick',onDbl)},[gl,camera,object,markers,onBox]);
+ useFrame((_,delta)=>{const a=anim.current,o=orbit();if(!a||!o)return;
+  a.progress=Math.min(1,a.progress+delta/.4);const t=a.progress*a.progress*(3-2*a.progress);
+  camera.position.lerpVectors(a.fromPosition,a.toPosition,t);o.target.lerpVectors(a.fromTarget,a.toTarget,t);o.update();if(a.progress===1)anim.current=null});
+ return null;
+}
 function MeasurePicker({object,onPick}:{object:THREE.Object3D;onPick:(point:MeasurementPoint)=>void}){
  const {gl,camera}=useThree(),pick=useRef(onPick);pick.current=onPick;
  useEffect(()=>{const el=gl.domElement,prev=el.style.cursor;let down:{x:number;y:number}|null=null;el.style.cursor='crosshair';
@@ -182,6 +211,15 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
  const ctxObj=useMemo(()=>ctx.geo?new THREE.Points(ctx.geo,new THREE.PointsMaterial({size:pointSize,vertexColors:!!ctx.geo.getAttribute('color'),sizeAttenuation:true})):null,[ctx.geo]);
  useEffect(()=>{if(!ctxObj)return;const m=ctxObj.material as THREE.PointsMaterial;m.size=pointSize;m.transparent=trees==='faint';m.opacity=trees==='faint'?.12:1;m.depthWrite=trees!=='faint';m.needsUpdate=true},[ctxObj,trees,pointSize]);
  const view=model.quality?.view;
+ const [viewMode,setViewMode]=useState<ViewMode>('3d'),[pan,setPan]=useState(false),[isolated,setIsolated]=useState<number|null>(null),[navCmd,setNavCmd]=useState<NavCmd|null>(null),[focusLocal,setFocusLocal]=useState(0);
+ const nav=(kind:NavCmd['kind'],mode?:ViewMode)=>setNavCmd(c=>({seq:(c?.seq||0)+1,kind,mode}));
+ // close-up: the model clipped to the selected box and 1.5 m around it
+ const clipPlanes=useMemo(()=>{const m=isolated==null?null:markers.find(x=>x.id===isolated);if(!m)return null;
+  const P=corners(m),lo=[0,1,2].map(i=>Math.min(...P.map(p=>p[i]))),hi=[0,1,2].map(i=>Math.max(...P.map(p=>p[i]))),mpu=model.quality?.scale?.m_per_unit;
+  const pad=mpu?1.5/mpu:1.5*Math.max(m.size_w||0,m.size_h||0,m.size_d||0,.1);
+  return [0,1,2].flatMap(i=>{const n=new THREE.Vector3();n.setComponent(i,1);return [new THREE.Plane(n.clone(),-(lo[i]-pad)),new THREE.Plane(n.clone().negate(),hi[i]+pad)]})},[isolated,markers]);
+ useEffect(()=>{for(const o of [obj,ctxObj]){if(!o)continue;const mat=(o as THREE.Points).material as THREE.Material;mat.clippingPlanes=clipPlanes;mat.needsUpdate=true}},[obj,ctxObj,clipPlanes]);
+ useEffect(()=>{if(isolated!=null&&isolated!==selectedMarker)setIsolated(selectedMarker??null)},[selectedMarker]);  // the close-up follows the selection
  useEffect(()=>{if(!showCams)setSelectedCam(null)},[showCams]);
  const label=useRef<HTMLDivElement>(null),sel=markers.find(m=>m.id===selectedMarker);// selected box label, positioned by LabelAnchor
  const cameraRoot=model.urls.web_cameras?.replace(/\/web\/cameras\.json(?:\?.*)?$/,'')||'',cameraImage=selectedCam?`${API}${cameraRoot}/images/${selectedCam.name.split('/').map(encodeURIComponent).join('/')}`:'';
@@ -197,10 +235,14 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
   {selectedCam&&<div className="camera-preview"><div className="camera-preview-head"><span><Camera size={14}/><b>Drone capture</b></span><button type="button" onClick={()=>setSelectedCam(null)} title="Close image preview"><X size={15}/></button></div><img src={cameraImage} alt={`Drone capture ${selectedCam.name}`}/><div className="camera-preview-meta"><span>{selectedCam.name.split('/').pop()}</span><small>Captured from the selected yellow camera point</small></div></div>}
   {ctxObj&&<div className="trees-toggle" style={{position:'absolute',right:12,bottom:12,zIndex:5,display:'flex',alignItems:'center',gap:4,padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.85)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
    <span style={{marginRight:2}}>Trees</span>{TREES.map(([v,l])=><button key={v} type="button" onClick={()=>setTrees(v)} style={{padding:'3px 8px',borderRadius:6,border:'1px solid '+(trees===v?'#5fa8e6':'transparent'),background:trees===v?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:'pointer'}}>{l}</button>)}</div>}
-  <Canvas camera={{position:view?.position||[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}}>{/* high enough to show the tower and the drone path above it */}
+  {obj&&<ViewToolbar mode={viewMode} onView={v=>{setViewMode(v);nav('view',v)}} pan={pan} onPan={()=>setPan(p=>!p)} onFit={()=>{setIsolated(null);nav('fit')}}
+   canFocus={!!sel} onFocus={()=>setFocusLocal(n=>n+1)} isolated={isolated!=null} onIsolate={()=>{if(isolated!=null)setIsolated(null);else if(sel){setIsolated(sel.id);setFocusLocal(n=>n+1)}}}/>}
+  <Canvas camera={{position:view?.position||[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}} onCreated={({gl})=>{gl.localClippingEnabled=true}}>{/* high enough to show the tower and the drone path above it */}
    <color attach="background" args={['#0f1f31']}/><ambientLight intensity={.9}/><directionalLight position={[8,12,6]} intensity={1.2}/>
-   {obj&&<primitive object={obj}/>}{ctxObj&&trees!=='hidden'&&<primitive object={ctxObj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
-   <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={view?.target||[0,1,0]}/><CameraFocus marker={sel} request={focusRequest}/>
+   {obj&&<primitive object={obj}/>}{ctxObj&&trees!=='hidden'&&<primitive object={ctxObj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={isolated!=null?markers.filter(m=>m.id===isolated):markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
+   <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={view?.target||[0,1,0]} zoomToCursor={pan}
+    mouseButtons={pan?{LEFT:THREE.MOUSE.PAN,MIDDLE:THREE.MOUSE.PAN,RIGHT:THREE.MOUSE.ROTATE}:{LEFT:THREE.MOUSE.ROTATE,MIDDLE:THREE.MOUSE.PAN,RIGHT:THREE.MOUSE.PAN}}/>
+   <ViewNav object={obj} cmd={navCmd} markers={markers} onBox={onMarkerPick}/><CameraFocus marker={sel} request={focusRequest+focusLocal}/>
   </Canvas></div>;
 }
 
