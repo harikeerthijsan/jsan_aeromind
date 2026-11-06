@@ -1262,3 +1262,21 @@ def test_vote_boxes_one_per_object_any_confidence():
     a = next(c for c in out if c['class_name'] == 'sector_antenna')
     assert abs(a['size_h'] - 1.6) < .3 and np.allclose(a['position'], [1.5, .3, 0], atol=.15)
     assert all(c['media_count'] >= 4 and len(c['detection_ids']) >= 4 for c in out)
+
+def test_tower_split_from_trees_and_clear_start_view():
+    """Unclassified clouds: grey tower points stay the structure, green trees around it go to the surroundings layer,
+    and the viewer starts on the side with no trees between the camera and the tower."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('scipy')
+    from app import pointcloud as pc
+    rng = np.random.default_rng(0)
+    a = rng.uniform(0, 2 * np.pi, 20000); tower = np.c_[1.0 * np.cos(a), 1.0 * np.sin(a), rng.uniform(0, 20, 20000)]
+    top = np.c_[rng.uniform(-2.5, 2.5, (8000, 2)), rng.uniform(16, 20, 8000)]  # antennas reaching 2.5 m out
+    trees = np.c_[rng.uniform(-12, 12, 30000), rng.uniform(-12, -3, 30000), rng.uniform(0, 9, 30000)]  # forest on the south side
+    P = np.r_[tower, top, trees]; C = np.r_[np.full((28000, 3), 150), np.tile([60, 140, 50], (30000, 1))].astype(np.uint8)
+    S, info = pc.split_structure(P, C, np.ones(len(P), bool))
+    assert S[:28000].mean() > .95 and S[28000:].mean() < .02, (S[:28000].mean(), S[28000:].mean())
+    assert 2.5 <= info['reach_m'] <= 4.0
+    M, _ = pc.viewer_transform(P)
+    view = pc.clear_view(P, S, info, M)
+    cam = ((np.asarray(view['position']) - M[:3, 3]) @ (M[:3, :3] / np.linalg.norm(M[:3, 0]))) / np.linalg.norm(M[:3, 0])  # back to metres
+    assert cam[1] > -1 and np.hypot(cam[0], cam[1]) > 20  # not on the south side, where all the trees are, and far enough out

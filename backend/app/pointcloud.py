@@ -182,6 +182,46 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None, focus=N
         h, _, _ = _crs_parts(crs); units = h.axis_info[0].unit_name if h and h.axis_info else 'metre'
     return {'points': P, 'colors': C, 'focus': in_focus, 'crs': crs, 'total': int(total), 'kept': int(len(P)), 'units': units}
 
+GREEN = 25  # excess green (2G - R - B) above this: vegetation (steel, antennas and cables are grey, white or black)
+
+def split_structure(points, colors, focus):
+    """Which points are the structure (tower) and which its surroundings (trees, grass, buildings), for the viewer: trees
+    around a tower hide its lower half from almost every angle. Surveys often leave points unclassified, so this uses
+    colour (vegetation is green) and the structure's own reach: the horizontal distance from its axis that the
+    equipment at the top extends to. points: local metres (z up); focus: points near the structure.
+    Returns (bool mask of structure points, info)."""
+    import numpy as np
+    P = points[focus]; z0, top = np.percentile(P[:, 2], 1), P[:, 2].max()
+    axis = np.median(P[P[:, 2] >= np.percentile(P[:, 2], 97)][:, :2], 0)  # the middle of the highest points
+    green = (2 * colors[:, 1].astype(int) - colors[:, 0] - colors[:, 2]) > GREEN if colors is not None else np.zeros(len(points), bool)
+    r = np.linalg.norm(points[:, :2] - axis, axis=1)
+    upper = focus & ~green & (points[:, 2] > z0 + .6 * (top - z0))
+    reach = float(np.clip(np.percentile(r[upper], 95) + .5, 2.0, 8.0)) if upper.sum() > 100 else 4.0
+    structure = focus & ~green & (r <= reach)
+    return structure, {'axis': [round(float(v), 3) for v in axis], 'reach_m': round(reach, 2), 'structure_points': int(structure.sum())}
+
+def clear_view(points, structure, info, M, distance=None):
+    """Where the viewer's camera should start: the side of the structure with the fewest other points (trees)
+    between it and the camera, far enough out to see all of it and at about its middle height, so the lines of sight
+    to its foot pass over the open side rather than down through the trees next to it. Returns {'position', 'target'}
+    in viewer coordinates."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    from . import reconstruct
+    S, O = points[structure], points[~structure]
+    axis = np.asarray(info['axis']); z0, top = np.percentile(S[:, 2], 1), S[:, 2].max(); mid = z0 + .45 * (top - z0)
+    d = distance or max(30.0, 2.3 * (top - z0))
+    tree = cKDTree(O[np.random.default_rng(0).choice(len(O), min(len(O), 400_000), replace=False)]) if len(O) else None
+    best, score = 0.0, None
+    for a in np.radians(np.arange(0, 360, 30)):
+        u = np.array([np.cos(a), np.sin(a)]); hits = 0
+        for h in np.linspace(z0 + 1, top, 8):  # lines of sight from the camera to the structure, low to high
+            t = np.linspace(1.5, d, 40)[:, None]; L = np.c_[axis + t * u, np.full(len(t), h)]
+            if tree is not None: hits += int((tree.query(L, distance_upper_bound=1.0)[0] < 1.0).sum())
+        if score is None or hits < score: best, score = a, hits
+    cam = np.r_[axis + d * np.array([np.cos(best), np.sin(best)]), z0 + .6 * (top - z0)]
+    return {'position': reconstruct._apply(M, cam[None])[0].round(3).tolist(), 'target': reconstruct._apply(M, np.r_[axis, mid][None])[0].round(3).tolist()}
+
 def height_colours(z):
     """Blue -> green -> yellow by height, for clouds without colour or intensity."""
     import numpy as np

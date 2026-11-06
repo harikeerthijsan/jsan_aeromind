@@ -9,7 +9,10 @@ import {API,request,Inspection,Job,Media,RegistrationCandidate,getAuthToken} fro
 type ReconInfo={status:string;colmap:string|null;colmap_path_env:string|null;video_stride:number;max_images:number;dense_max_size:number};
 export type Model3D={id:number;inspection_id:number;job_id:number;status:string;dense:boolean;created_at:string|null;urls:Record<string,string>;
  quality:{registered_images?:number;images_total?:number;sparse_points?:number;dense_points?:number;mesh_faces?:number;mean_reprojection_error_px?:number|null;mean_track_length?:number|null;models_found?:number;seconds?:number;error?:string;source_model?:number;scale?:ModelScale|null;
-  source?:'pointcloud'|string;pointcloud?:{files:string[];points_total:number;points_used:number;crs:string|null;units:string;cropped_to_flight:boolean;alignment?:{gps_residual_m:number;vertical_shift_m:number;icp_rms_m:number|null;inliers_pct:number}};boxes_available?:boolean;boxes_note?:string;warning?:string}};
+  source?:'pointcloud'|string;pointcloud?:{files:string[];points_total:number;points_used:number;crs:string|null;units:string;cropped_to_flight:boolean;alignment?:{gps_residual_m:number;vertical_shift_m:number;icp_rms_m:number|null;inliers_pct:number}};boxes_available?:boolean;boxes_note?:string;warning?:string;
+  view?:{position:[number,number,number];target:[number,number,number]}}};  // point cloud models: start from the side with the clearest view of the structure
+type TreesMode='shown'|'faint'|'hidden';
+const TREES:[TreesMode,string][]=[['shown','Shown'],['faint','See-through'],['hidden','Hidden']];
 /** Metres per model unit (app/scale.py): from the drone's GPS / RTK positions, or calibrated by a reviewer. */
 export type ModelScale={m_per_unit:number;method:'gps_rtk'|'gps'|'manual'|string;cameras?:number;rtk?:boolean;residual_median_m?:number;uncertainty_pct?:number|null;reference_m?:number;note?:string};
 type Cam={name:string;center:[number,number,number];dir:[number,number,number]};
@@ -163,15 +166,23 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
   if(useMesh){geo.computeVertexNormals();return new THREE.Mesh(geo,new THREE.MeshStandardMaterial({vertexColors:colors,color:colors?'#ffffff':'#c8d3de',side:THREE.DoubleSide,roughness:.9}))}
   return new THREE.Points(geo,new THREE.PointsMaterial({size:pointSize,vertexColors:colors,color:colors?'#ffffff':'#9fd0ff',sizeAttenuation:true}))},[geo,useMesh]);
  useEffect(()=>{if(obj instanceof THREE.Points)(obj.material as THREE.PointsMaterial).size=pointSize},[obj,pointSize]);
+ // point cloud models: trees, ground and buildings around the structure come separately, so trees in front of a tower
+ // can be made see-through or hidden instead of hiding its lower half
+ const [trees,setTrees]=useState<TreesMode>('shown');const ctx=usePly(useMesh?undefined:model.urls.web_context);
+ const ctxObj=useMemo(()=>ctx.geo?new THREE.Points(ctx.geo,new THREE.PointsMaterial({size:pointSize,vertexColors:!!ctx.geo.getAttribute('color'),sizeAttenuation:true})):null,[ctx.geo]);
+ useEffect(()=>{if(!ctxObj)return;const m=ctxObj.material as THREE.PointsMaterial;m.size=pointSize;m.transparent=trees==='faint';m.opacity=trees==='faint'?.12:1;m.depthWrite=trees!=='faint';m.needsUpdate=true},[ctxObj,trees,pointSize]);
+ const view=model.quality?.view;
  useEffect(()=>{if(!showCams)setSelectedCam(null)},[showCams]);
  const label=useRef<HTMLDivElement>(null),sel=markers.find(m=>m.id===selectedMarker);// selected box label, positioned by LabelAnchor
  const cameraRoot=model.urls.web_cameras?.replace(/\/web\/cameras\.json(?:\?.*)?$/,'')||'',cameraImage=selectedCam?`${API}${cameraRoot}/images/${selectedCam.name.split('/').map(encodeURIComponent).join('/')}`:'';
  return <><div ref={label} className="three-label floating-label">{sel&&<><strong>{sel.class_name.replaceAll('_',' ')}</strong><br/><small>Estimated · {sel.media_count} images · {Math.round(sel.confidence*100)}%</small></>}</div>{err&&<div className="recon-msg">Could not load the model: {err}</div>}{!geo&&!err&&<div className="recon-msg">Loading 3D model…</div>}
   {selectedCam&&<div className="camera-preview"><div className="camera-preview-head"><span><Camera size={14}/><b>Drone capture</b></span><button type="button" onClick={()=>setSelectedCam(null)} title="Close image preview"><X size={15}/></button></div><img src={cameraImage} alt={`Drone capture ${selectedCam.name}`}/><div className="camera-preview-meta"><span>{selectedCam.name.split('/').pop()}</span><small>Captured from the selected yellow camera point</small></div></div>}
-  <Canvas camera={{position:[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}}>{/* high enough to show the tower and the drone path above it */}
+  {ctxObj&&<div className="trees-toggle" style={{position:'absolute',right:12,bottom:12,zIndex:5,display:'flex',alignItems:'center',gap:4,padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.85)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
+   <span style={{marginRight:2}}>Trees</span>{TREES.map(([v,l])=><button key={v} type="button" onClick={()=>setTrees(v)} style={{padding:'3px 8px',borderRadius:6,border:'1px solid '+(trees===v?'#5fa8e6':'transparent'),background:trees===v?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:'pointer'}}>{l}</button>)}</div>}
+  <Canvas camera={{position:view?.position||[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}}>{/* high enough to show the tower and the drone path above it */}
    <color attach="background" args={['#0f1f31']}/><ambientLight intensity={.9}/><directionalLight position={[8,12,6]} intensity={1.2}/>
-   {obj&&<primitive object={obj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
-   <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={[0,1,0]}/><CameraFocus marker={sel} request={focusRequest}/>
+   {obj&&<primitive object={obj}/>}{ctxObj&&trees!=='hidden'&&<primitive object={ctxObj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
+   <Grid position={[0,-5.2,0]} args={[30,30]} cellColor="#22405c" sectionColor="#2d5878" fadeDistance={45}/><OrbitControls makeDefault enableDamping target={view?.target||[0,1,0]}/><CameraFocus marker={sel} request={focusRequest}/>
   </Canvas></>;
 }
 

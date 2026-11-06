@@ -144,9 +144,9 @@ def _cloud_sources(keys):
     return sources, temp
 
 FOCUS_RADIUS_M = 12.0              # around the structure the photos look at: every point kept (up to pointcloud.FOCUS_POINTS)
-SURROUNDING_POINTS = 1_500_000     # the rest of the cropped area (ground, trees) for context
+SURROUNDING_POINTS = 4_000_000     # the rest of the cropped area (ground, road, trees) for context
 WEB_FOCUS_POINTS = 2_500_000       # viewer: the structure ...
-WEB_SURROUNDING_POINTS = 500_000   # ... and its surroundings
+WEB_CONTEXT_POINTS = 1_500_000     # ... and its surroundings (trees, ground, road)
 
 def need_disk(nbytes, why):
     """Stop with a clear message instead of failing half way when the GPU machine's disk is nearly full."""
@@ -213,17 +213,21 @@ def _pointcloud_model(payload, progress, work):
             pp.write_text_model(work / 'sparse' / '0', cams, [n for n, _ in posed])
             on_cloud = pp.check(cams, L)
             progress('exporting', 92, 'Preparing the model for the viewer')
-            rng = np.random.default_rng(0); idx_f, idx_r = np.flatnonzero(F), np.flatnonzero(~F)  # viewer: the structure first
-            web = np.r_[rng.choice(idx_f, min(len(idx_f), WEB_FOCUS_POINTS), replace=False), rng.choice(idx_r, min(len(idx_r), WEB_SURROUNDING_POINTS), replace=False)]
+            # viewer: the structure in web/points.ply, trees and the rest in web/context.ply (drawn faint, so they do not hide it)
+            S, sinfo = pc.split_structure(L, cloud['colors'], F); info['structure'] = sinfo
+            rng = np.random.default_rng(0); idx_s, idx_c = np.flatnonzero(S), np.flatnonzero(~S)
+            web = rng.choice(idx_s, min(len(idx_s), WEB_FOCUS_POINTS), replace=False); ctx = rng.choice(idx_c, min(len(idx_c), WEB_CONTEXT_POINTS), replace=False)
             web_files, n_web = reconstruct.export_web(work, M, {'points': L[web], 'colors': cloud['colors'][web]}, None,
                                                       [{'name': n, 'center': c['C'].tolist(), 'dir': c['R'][2].tolist()} for (n, _), c in zip(posed, cams)], max_points=len(web))
+            reconstruct.write_ply(work / 'web' / 'context.ply', reconstruct._apply(M, L[ctx]).astype(np.float32), cloud['colors'][ctx]); web_files['web_context'] = 'web/context.ply'
+            view = pc.clear_view(L, S, sinfo, M)
             info['cameras'] = {'source': 'photo metadata (RTK position, gimbal angles, lens calibration)', **pinfo, 'photos': len(cams),
                                'rtk_fixed': sum(m['rtk'] for _, m in posed), 'on_cloud_pct': on_cloud,
                                'takeoff_above_ground_m': round(takeoff, 2) if takeoff is not None else None}
             result = {'registered_images': len(cams), 'images_total': len(photos), 'sparse_points': 0, 'mean_reprojection_error_px': None,
                       'dense': True, 'dense_points': int(F.sum()), 'mesh_faces': 0, 'sparse_model': 'sparse/0', 'camera_source': 'metadata',
                       'files': {'dense_ply': 'dense/fused.ply', 'log': 'colmap.log', **web_files}, 'web_points': n_web,
-                      'transform': M.round(8).tolist(), 'boxes_available': True,
+                      'transform': M.round(8).tolist(), 'boxes_available': True, 'view': view,
                       'scale': {'m_per_unit': round(1 / s, 6), 'method': 'pointcloud', 'rtk': all(m['rtk'] for _, m in posed), 'cameras': len(cams),
                                 'note': f"from the uploaded point cloud ({cloud['units']})"}}
             if on_cloud < 50: result['warning'] = (f'Only {on_cloud}% of the photos look at the point cloud: it may show a different place, '
