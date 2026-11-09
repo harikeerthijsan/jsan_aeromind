@@ -26,7 +26,7 @@ const running=(j:Job)=>['queued','running'].includes(j.status);
 
 /** 3D files need the signed-in user too: send the token header and, across ports in local dev, the session cookie. */
 function authLoader<L extends THREE.Loader>(l:L):L{l.setWithCredentials(true);const t=getAuthToken();if(t)l.setRequestHeader({Authorization:`Bearer ${t}`});return l}
-function usePly(url?:string){
+export function usePly(url?:string){
  const [geo,setGeo]=useState<THREE.BufferGeometry|null>(null),[err,setErr]=useState('');
  useEffect(()=>{setGeo(null);setErr('');if(!url)return;let live=true;authLoader(new PLYLoader()).load(API+url,g=>{if(live)setGeo(g)},undefined,e=>live&&setErr(String((e as Error)?.message||e)));return()=>{live=false}},[url]);
  return {geo,err};
@@ -150,7 +150,7 @@ function nearestPoint(points:THREE.Points|THREE.Mesh,ray:THREE.Ray,camera:THREE.
   const off=Math.sqrt(Math.max(0,vx*vx+vy*vy+vz*vz-t*t))/t;if(off<bestPx){bestPx=off;best=i}}  // angular offset from the ray ~ pixels
  return new THREE.Vector3(a[best],a[best+1],a[best+2]).applyMatrix4(points.matrixWorld)}
 /** Elevation colours (blue low -> red high) over a height range, or back to the model's own colours. */
-function recolour(geo:THREE.BufferGeometry,mode:ColourMode,range:[number,number]|null){
+export function recolour(geo:THREE.BufferGeometry,mode:ColourMode,range:[number,number]|null){
  const c=geo.getAttribute('color') as THREE.BufferAttribute|undefined,p=geo.getAttribute('position');if(!c||!p)return;
  if(!geo.userData.rgb)geo.userData.rgb=(c.array as Float32Array).slice();
  if(mode!=='elevation'||!range){(c.array as Float32Array).set(geo.userData.rgb as Float32Array);c.needsUpdate=true;return}
@@ -158,7 +158,7 @@ function recolour(geo:THREE.BufferGeometry,mode:ColourMode,range:[number,number]
  for(let i=0;i<p.count;i++){const t=Math.min(1,Math.max(0,(p.getY(i)-lo)/span));tmp.setHSL(.66*(1-t),1,.5);c.setXYZ(i,tmp.r,tmp.g,tmp.b)}
  c.needsUpdate=true;
 }
-function heightRange(geo:THREE.BufferGeometry):[number,number]|null{
+export function heightRange(geo:THREE.BufferGeometry):[number,number]|null{
  const p=geo.getAttribute('position');if(!p||p.count<10)return null;const step=Math.max(1,Math.floor(p.count/20000)),y:number[]=[];
  for(let i=0;i<p.count;i+=step)y.push(p.getY(i));y.sort((a,b)=>a-b);return [y[Math.floor(.02*(y.length-1))],y[Math.floor(.98*(y.length-1))]];
 }

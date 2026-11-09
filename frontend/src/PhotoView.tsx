@@ -1,12 +1,13 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
-import {AlertTriangle,ArrowUpFromLine,ChevronLeft,ChevronRight,Eye,EyeOff,Maximize,Ruler,Trash2} from 'lucide-react';
+import {AlertTriangle,ArrowUpFromLine,ChevronLeft,ChevronRight,Eye,EyeOff,Footprints,Maximize,Ruler,Trash2} from 'lucide-react';
 import {API,Inspection,Site,json,request} from './api';
 import {Model3D,classColor} from './Reconstruction';
+import WalkView,{Pose} from './WalkView';
 import './photoview.css';
 
 /** Photo 3D view: the drone photos, with the 3D model's point cloud behind every pixel. A click on a photo is the 3D
  * point the camera sees there, so distances and heights are measured on the clear photo in real units. */
-type Photo={media_id:number;filename:string;url:string;width:number;height:number;angle?:number};
+type Photo={media_id:number;filename:string;url:string;width:number;height:number;angle?:number;pose?:Pose};
 type Point={x:number;y:number;z:number;height_m:number;distance_from_camera:number;snapped_px:number};
 type Pick={u:number;v:number;p:Point|null};
 type Measure={id:number;media_id:number;filename:string;kind:'distance'|'height';a:Pick;b?:Pick};
@@ -19,6 +20,7 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
  const [photos,setPhotos]=useState<Photo[]>([]),[scaled,setScaled]=useState(true),[idx,setIdx]=useState(0),[err,setErr]=useState(''),[loading,setLoading]=useState('');
  const [tool,setTool]=useState<Tool>('distance'),[pending,setPending]=useState<Pick|null>(null),[measures,setMeasures]=useState<Measure[]>([]),[busy,setBusy]=useState(false);
  const [unit,setUnit]=useState<'m'|'ft'>('m'),[showBoxes,setShowBoxes]=useState(true),[dets,setDets]=useState<Det[]>([]),[note,setNote]=useState('');
+ const [mode,setMode]=useState<'walk'|'measure'>('walk');  // walk: stand where each photo was taken, the 3D points over it; measure: click on the photo
  const inspection=inspections.find(i=>i.id===insId)||inspections[0];
  useEffect(()=>{setInsId(null)},[site?.id]);
  // the inspection's latest completed 3D model
@@ -29,12 +31,12 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
   request<{scaled:boolean;photos:Photo[]}>(`/api/v1/models/${modelId}/photos`).then(r=>{if(!live)return;setPhotos(r.photos);setScaled(r.scaled)})
    .catch(e=>live&&setErr(String(e.message||e))).finally(()=>live&&setLoading(''));
   return()=>{live=false}},[modelId]);
- const photo=photos[idx];
+ const photo=photos[idx],model=models.find(m=>m.id===modelId);
  useEffect(()=>{if(!photo||!inspection)return;let live=true;setDets([]);setPending(null);setNote('');
   request<Det[]>(`/api/v1/inspections/${inspection.id}/detections?media_id=${photo.media_id}`).then(d=>live&&setDets(d)).catch(()=>{});
   return()=>{live=false}},[photo?.media_id]);
  useEffect(()=>{const k=(e:KeyboardEvent)=>{if((e.target as HTMLElement)?.tagName==='INPUT'||(e.target as HTMLElement)?.tagName==='SELECT')return;
-  if(e.key==='ArrowRight')setIdx(i=>Math.min(photos.length-1,i+1));if(e.key==='ArrowLeft')setIdx(i=>Math.max(0,i-1));if(e.key==='Escape')setPending(null)};
+  if(e.key==='ArrowRight'||e.key==='PageDown')setIdx(i=>Math.min(photos.length-1,i+1));if(e.key==='ArrowLeft'||e.key==='PageUp')setIdx(i=>Math.max(0,i-1));if(e.key==='Escape')setPending(null)};
   window.addEventListener('keydown',k);return()=>window.removeEventListener('keydown',k)},[photos.length]);
 
  // ---------- the photo: zoom (wheel, at the cursor) and pan (drag); a click (no drag) measures ----------
@@ -69,13 +71,20 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
    <label className="pv-field"><span>Inspection</span><select value={inspection?.id??''} onChange={e=>setInsId(+e.target.value)}>{inspections.map(i=><option key={i.id} value={i.id}>{insCode(i.id)} · {i.label}</option>)}</select></label>
    {models.length>1&&<label className="pv-field"><span>3D model</span><select value={modelId??''} onChange={e=>setModelId(+e.target.value)}>{models.map(m=><option key={m.id} value={m.id}>Model #{m.id} · {m.quality?.source==='pointcloud'?'LiDAR point cloud':m.dense?'Dense':'Sparse'}</option>)}</select></label>}
    <div className="pv-tools">
+    <span>View</span>
+    <button className={mode==='walk'?'on':''} onClick={()=>setMode('walk')}><Footprints size={14}/>Walk 3D</button>
+    <button className={mode==='measure'?'on':''} onClick={()=>setMode('measure')}><Ruler size={14}/>Measure on photo</button>
+   </div>
+   {mode==='walk'?<p className="pv-help">You stand where the drone took the photo: the photo is the backdrop and the 3D / LiDAR points are drawn over it in the same lens.
+    Step to the next photo with → / ← (the camera flies there), walk forward / back with ↑ / ↓, drag to look around, wheel to zoom. Fade the photo to see the points alone.</p>:<>
+   <div className="pv-tools">
     <span>Measure</span>
     <button className={tool==='distance'?'on':''} onClick={()=>{setTool('distance');setPending(null)}}><Ruler size={14}/>Distance</button>
     <button className={tool==='height'?'on':''} onClick={()=>{setTool('height');setPending(null)}}><ArrowUpFromLine size={14}/>Height</button>
     <button className={tool==='look'?'on':''} onClick={()=>{setTool('look');setPending(null)}}><Eye size={14}/>Look only</button>
    </div>
    <p className="pv-help">{tool==='distance'?(pending?'Click the second point.':'Click two points on the photo: the 3D distance between them, its vertical and horizontal parts.'):tool==='height'?'Click a point: its height above the ground.':'Zoom with the wheel, drag to move.'}
-    {' '}Clicks snap to the structure behind the photo (the 3D point cloud).</p>
+    {' '}Clicks snap to the structure behind the photo (the 3D point cloud).</p></>}
    <div className="pv-row"><span>Units</span><div className="pv-seg">{(['m','ft'] as const).map(u=><button key={u} className={unit===u?'on':''} onClick={()=>setUnit(u)}>{u}</button>)}</div>
     <button className="pv-link" onClick={()=>setShowBoxes(s=>!s)}>{showBoxes?<EyeOff size={13}/>:<Eye size={13}/>}{showBoxes?'Hide':'Show'} detections</button></div>
    {!scaled&&<div className="pv-warn"><AlertTriangle size={14}/>This 3D model has no real-world scale yet: values are in model units. Detect the scale in the 3D Digital Twin.</div>}
@@ -90,6 +99,9 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
    <div className="pv-bar"><b>{photo?photo.filename:'Photo 3D view'}</b><small>{photos.length?`${idx+1} of ${photos.length} · ordered around the tower`:''}</small>
     <span className="pv-bar-tools"><button onClick={()=>setIdx(i=>Math.max(0,i-1))} disabled={idx<=0} title="Previous photo (←)"><ChevronLeft size={16}/></button><button onClick={()=>setIdx(i=>Math.min(photos.length-1,i+1))} disabled={idx>=photos.length-1} title="Next photo (→)"><ChevronRight size={16}/></button>
      <button onClick={fit} title="Fit the photo"><Maximize size={15}/></button></span></div>
+   {mode==='walk'?<div className="pv-walk">{(loading||err||!photos.length)?<div className="pv-view">{loading&&<div className="pv-msg">{loading}</div>}{err&&<div className="pv-msg error">{err}</div>}
+     {!loading&&!photos.length&&!err&&<div className="pv-msg">{models.length?'This 3D model has no photos with camera positions.':'No completed 3D model for this inspection: build one on the 3D Reconstruction page.'}</div>}</div>
+    :<WalkView photos={photos} idx={idx} setIdx={setIdx} pointsUrl={model?.urls.web_points} contextUrl={model?.urls.web_context}/>}</div>:
    <div ref={box} className={'pv-view'+(tool==='look'?'':' measuring')+(busy?' busy':'')} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}>
     {photo&&<img key={photo.media_id+(full?'f':'t')} src={full?API+photo.url:`${API}/api/v1/media/${photo.media_id}/thumb?w=1280`} onLoad={()=>!full&&setFull(true)} draggable={false} alt={photo.filename}
      style={{position:'absolute',left:view.x,top:view.y,width:photo.width*view.k,height:photo.height*view.k}}/>}
@@ -105,7 +117,7 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
     {!loading&&!photos.length&&!err&&<div className="pv-msg">{models.length?'This 3D model has no photos with camera positions.':'No completed 3D model for this inspection: build one on the 3D Reconstruction page.'}</div>}
     {err&&<div className="pv-msg error">{err}</div>}
     {note&&<div className="pv-note">{note}</div>}
-   </div>
+   </div>}
    <div className="pv-strip">{order.map(({p,i})=><button key={p.media_id} className={i===idx?'on':''} onClick={()=>setIdx(i)} title={p.filename}>
     <img loading="lazy" src={`${API}/api/v1/media/${p.media_id}/thumb?w=200`} alt=""/>{measures.some(m=>m.media_id===p.media_id)&&<i/>}</button>)}</div>
   </section>

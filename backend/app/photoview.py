@@ -50,6 +50,24 @@ def load(model_id: int, work: Path, dense: Path, quality: dict, photos: list):
         while len(_models) > 2: _models.popitem(last=False)
     return model
 
+def _intrinsics(cam):
+    """fx, fy, cx, cy, k1, k2, p1, p2 of a COLMAP camera (OpenCV lens model; the simpler models map onto it)."""
+    model, p = cam[0], list(cam[1])
+    if model in ('SIMPLE_PINHOLE', 'SIMPLE_RADIAL', 'RADIAL', 'SIMPLE_RADIAL_FISHEYE', 'RADIAL_FISHEYE'):
+        return [p[0], p[0], p[1], p[2], p[3] if len(p) > 3 else 0.0, p[4] if len(p) > 4 else 0.0, 0.0, 0.0]
+    if model == 'PINHOLE': return [*p[:4], 0.0, 0.0, 0.0, 0.0]
+    return [*p[:4], *(list(p[4:8]) + [0.0] * 4)[:4]]
+
+def _viewer_pose(model, pose, cam):
+    """Where the photo was taken in the 3D viewer's frame (the frame of web/points.ply): centre and the camera's right,
+    down and forward axes, plus its lens, so the viewer can stand exactly where the drone was (photo walk)."""
+    import numpy as np
+    M = model['M']; Rm = M[:3, :3] / model['s']; R = np.asarray(pose[4], float)
+    centre = M[:3, :3] @ np.asarray(pose[2], float) + M[:3, 3]
+    r = lambda v: [round(float(x), 6) for x in v]
+    return {'centre': r(centre), 'right': r(Rm @ R[0]), 'down': r(Rm @ R[1]), 'forward': r(Rm @ R[2]),
+            'lens': [round(float(x), 6) for x in _intrinsics(cam)]}
+
 def cameras(model):
     """Photos that have a camera pose, with their position for ordering around the structure."""
     import numpy as np
@@ -58,7 +76,8 @@ def cameras(model):
         pose = model['poses'].get(name)
         if not pose: continue
         cam = model['cams'][pose[3]]; m = model['photos'][mid]
-        out.append({'media_id': mid, 'filename': m.filename, 'url': f'/uploads/{m.storage_key}', 'width': cam[2], 'height': cam[3], 'centre': np.asarray(pose[2], float)})
+        out.append({'media_id': mid, 'filename': m.filename, 'url': f'/uploads/{m.storage_key}', 'width': cam[2], 'height': cam[3], 'centre': np.asarray(pose[2], float),
+                    'pose': _viewer_pose(model, pose, cam)})
     if out:  # around the structure: by the angle of each camera seen from the middle of all of them
         C = np.array([o['centre'] for o in out]); mid = C.mean(0)
         for o in out: o['angle'] = float(np.degrees(np.arctan2(o['centre'][1] - mid[1], o['centre'][0] - mid[0])) % 360)
