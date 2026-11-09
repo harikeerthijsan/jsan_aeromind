@@ -1,7 +1,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {API,request} from './api';
 import type {RegistrationCandidate} from './api';
-import ViewToolbar,{ViewMode} from './ViewToolbar';
+import ViewToolbar,{ColourMode,ViewMode} from './ViewToolbar';
 
 /** Every point of the uploaded LiDAR, streamed by level of detail with Potree from the COPC copy the GPU worker builds
  * (the way the PLA QC app shows its surveys), with the 3D equipment boxes drawn in the survey's own coordinates. */
@@ -57,6 +57,18 @@ function zoomAt(st:{viewer:any;THREE:any},x:number,y:number,factor:number){
  const r=Math.max(1.5,Math.min(v.scene.view.radius*factor,20000));
  easeView(v,factor<1?target:v.scene.view.getPivot().clone().lerp(target,.35),r);
 }
+/** Elevation / intensity ranges from the points in memory (2nd-98th percentile), so a few stray points (birds, noise)
+ * don't wash the colours out; every file shares one range. As in the PLA QC app. */
+function sampleRanges(st:{viewer:any;THREE:any}){
+ const z:number[]=[],inten:number[]=[],v=new st.THREE.Vector3();
+ for(const pc of st.viewer.scene.pointclouds)for(const node of pc.visibleNodes||[]){const sn=node.sceneNode,g=sn?.geometry;if(!g)continue;
+  const pos=g.attributes.position,it=g.attributes.intensity,n=pos?.count||0,step=Math.max(1,Math.floor(n/400));
+  for(let i=0;i<n;i+=step){v.fromBufferAttribute(pos,i).applyMatrix4(sn.matrixWorld);z.push(v.z);if(it)inten.push(it.array[i])}}
+ if(z.length<200)return null;
+ const pct=(a:number[],p:number)=>a[Math.min(a.length-1,Math.max(0,Math.floor(p*(a.length-1))))];z.sort((a,b)=>a-b);inten.sort((a,b)=>a-b);
+ return {elevation:[pct(z,.02),pct(z,.98)] as [number,number],intensity:inten.length>200?[pct(inten,.01),pct(inten,.98)] as [number,number]:null};
+}
+const POTREE_COLOUR:Record<ColourMode,string>={rgb:'rgba',elevation:'elevation',intensity:'intensity'};
 function setView(viewer:any,mode:ViewMode){
  const Potree=(window as Win).Potree,view=viewer.scene.view,pivot=view.getPivot();
  viewer.setCameraMode(mode==='3d'?Potree.CameraMode.PERSPECTIVE:Potree.CameraMode.ORTHOGRAPHIC);
@@ -68,7 +80,11 @@ export default function PotreeView({clouds,transform,origin,view,markers,selecte
  const host=useRef<HTMLDivElement>(null),[err,setErr]=useState(''),[hover,setHover]=useState<{m:RegistrationCandidate;x:number;y:number}|null>(null),[loaded,setLoaded]=useState(0);
  const state=useRef<{viewer:any;THREE:any;boxes:any;raf:number;picks:{mesh:any;m:RegistrationCandidate}[]}|null>(null);
  const [mode,setMode]=useState<ViewMode>('3d'),[pan,setPan]=useState(false),[size,setSize]=useState(1),[isolated,setIsolated]=useState<number|null>(null);
- const clip=useRef<any>(null);
+ const clip=useRef<any>(null),[colour,setColour]=useState<ColourMode>('rgb');
+ useEffect(()=>{const st=state.current;if(!st)return;  // colour mode; ranges follow the points as more of them stream in
+  const apply=()=>{const r=colour==='rgb'?null:sampleRanges(st);for(const pc of st.viewer.scene.pointclouds){const m=pc.material;m.activeAttributeName=POTREE_COLOUR[colour];
+   if(colour==='elevation'&&r)m.elevationRange=r.elevation;if(colour==='intensity'&&r?.intensity&&r.intensity[1]>r.intensity[0])m.intensityRange=r.intensity}};
+  apply();if(colour==='rgb')return;const t=setInterval(apply,2000);return()=>clearInterval(t)},[colour,loaded]);
  const urls=clouds.map(c=>c.copc_url).filter(Boolean).join('|');
  useEffect(()=>{let live=true;const el=host.current;if(!el)return;
   loadPotree().then(THREE=>{if(!live||!el)return;const Potree=(window as Win).Potree;
@@ -141,7 +157,8 @@ export default function PotreeView({clouds,transform,origin,view,markers,selecte
   {hover&&<div style={{position:'absolute',left:hover.x+14,top:hover.y+10,pointerEvents:'none',zIndex:7,padding:'6px 9px',borderRadius:8,background:'rgba(255,255,255,.95)',color:'#1d2f40',fontSize:12,boxShadow:'0 4px 14px rgba(0,0,0,.25)'}}><strong>{hover.m.class_name.replaceAll('_',' ')}</strong><br/><small>{hover.m.media_count} images · {Math.round(hover.m.confidence*100)}%</small></div>}
   {loaded>0&&<ViewToolbar orthographic mode={mode} onView={v=>{const st=state.current;if(st){setView(st.viewer,v);setMode(v)}}} pan={pan} onPan={()=>setPan(p=>!p)}
    onFit={()=>{const st=state.current;if(st){isolate(null);st.viewer.fitToScreen(.8)}}} canFocus={!!sel} onFocus={()=>sel&&focus(sel)}
-   isolated={isolated!=null} onIsolate={()=>isolate(isolated!=null?null:sel||null)} size={size} onSize={setSize}/>}
+   isolated={isolated!=null} onIsolate={()=>isolate(isolated!=null?null:sel||null)} size={size} onSize={setSize}
+   colour={colour} onColour={setColour} colours={{rgb:true,elevation:true,intensity:true}}/>}
   {err&&<div className="recon-msg">Could not start the LiDAR viewer: {err}</div>}
   {!err&&!loaded&&<div className="recon-msg">Streaming the LiDAR point cloud…</div>}
  </div>;

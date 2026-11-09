@@ -2,7 +2,7 @@ import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,ThreeEvent,useFrame,useThree} from '@react-three/fiber';import {OrbitControls,Grid,TransformControls} from '@react-three/drei';import {LabelAnchor} from './Label3D';
 import PointCloudPanel from './PointCloudPanel';
 import PotreeView,{copcClouds,corners} from './PotreeView';
-import ViewToolbar,{ViewMode} from './ViewToolbar';
+import ViewToolbar,{ColourMode,ViewMode} from './ViewToolbar';
 import * as THREE from 'three';import {PLYLoader} from 'three/examples/jsm/loaders/PLYLoader.js';
 import {Box,Play,AlertTriangle,Download,Camera,Image as ImageIcon,Film,CheckCircle2,Layers,Maximize,Minimize,X} from 'lucide-react';
 import {API,request,Inspection,Job,Media,RegistrationCandidate,getAuthToken} from './api';
@@ -149,6 +149,19 @@ function nearestPoint(points:THREE.Points|THREE.Mesh,ray:THREE.Ray,camera:THREE.
  for(const i of hits){const vx=a[i]-ox,vy=a[i+1]-oy,vz=a[i+2]-oz,t=vx*dx+vy*dy+vz*dz;if(t>front+band)continue;
   const off=Math.sqrt(Math.max(0,vx*vx+vy*vy+vz*vz-t*t))/t;if(off<bestPx){bestPx=off;best=i}}  // angular offset from the ray ~ pixels
  return new THREE.Vector3(a[best],a[best+1],a[best+2]).applyMatrix4(points.matrixWorld)}
+/** Elevation colours (blue low -> red high) over a height range, or back to the model's own colours. */
+function recolour(geo:THREE.BufferGeometry,mode:ColourMode,range:[number,number]|null){
+ const c=geo.getAttribute('color') as THREE.BufferAttribute|undefined,p=geo.getAttribute('position');if(!c||!p)return;
+ if(!geo.userData.rgb)geo.userData.rgb=(c.array as Float32Array).slice();
+ if(mode!=='elevation'||!range){(c.array as Float32Array).set(geo.userData.rgb as Float32Array);c.needsUpdate=true;return}
+ const [lo,hi]=range,span=Math.max(hi-lo,1e-9),tmp=new THREE.Color();
+ for(let i=0;i<p.count;i++){const t=Math.min(1,Math.max(0,(p.getY(i)-lo)/span));tmp.setHSL(.66*(1-t),1,.5);c.setXYZ(i,tmp.r,tmp.g,tmp.b)}
+ c.needsUpdate=true;
+}
+function heightRange(geo:THREE.BufferGeometry):[number,number]|null{
+ const p=geo.getAttribute('position');if(!p||p.count<10)return null;const step=Math.max(1,Math.floor(p.count/20000)),y:number[]=[];
+ for(let i=0;i<p.count;i+=step)y.push(p.getY(i));y.sort((a,b)=>a-b);return [y[Math.floor(.02*(y.length-1))],y[Math.floor(.98*(y.length-1))]];
+}
 // ---------- navigation, the same as in the full LiDAR view: view presets, fit, double-click zoom to a spot / a box ----------
 type NavCmd={seq:number;kind:'view'|'fit';mode?:ViewMode};
 function ViewNav({object,cmd,markers,onBox}:{object:THREE.Object3D|null;cmd:NavCmd|null;markers:RegistrationCandidate[];onBox?:(id:number)=>void}){
@@ -213,6 +226,9 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
  const view=model.quality?.view;
  const [viewMode,setViewMode]=useState<ViewMode>('3d'),[pan,setPan]=useState(false),[isolated,setIsolated]=useState<number|null>(null),[navCmd,setNavCmd]=useState<NavCmd|null>(null),[focusLocal,setFocusLocal]=useState(0);
  const nav=(kind:NavCmd['kind'],mode?:ViewMode)=>setNavCmd(c=>({seq:(c?.seq||0)+1,kind,mode}));
+ const [colour,setColour]=useState<ColourMode>('rgb');
+ useEffect(()=>{const g=obj&&(obj as THREE.Points).geometry;if(!g)return;const r=colour==='elevation'?heightRange(g):null;  // one height range for the structure and its surroundings
+  recolour(g,colour,r);const cg=ctxObj&&(ctxObj as THREE.Points).geometry;if(cg)recolour(cg,colour,r)},[obj,ctxObj,colour]);
  // close-up: the model clipped to the selected box and 1.5 m around it
  const clipPlanes=useMemo(()=>{const m=isolated==null?null:markers.find(x=>x.id===isolated);if(!m)return null;
   const P=corners(m),lo=[0,1,2].map(i=>Math.min(...P.map(p=>p[i]))),hi=[0,1,2].map(i=>Math.max(...P.map(p=>p[i]))),mpu=model.quality?.scale?.m_per_unit;
@@ -236,7 +252,8 @@ export function ModelView({model,mode,pointSize,showCams,markers=[],selectedMark
   {ctxObj&&<div className="trees-toggle" style={{position:'absolute',right:12,bottom:12,zIndex:5,display:'flex',alignItems:'center',gap:4,padding:'4px 6px',borderRadius:8,background:'rgba(15,31,49,.85)',border:'1px solid #2d5878',color:'#cfe0ee',fontSize:11}}>
    <span style={{marginRight:2}}>Trees</span>{TREES.map(([v,l])=><button key={v} type="button" onClick={()=>setTrees(v)} style={{padding:'3px 8px',borderRadius:6,border:'1px solid '+(trees===v?'#5fa8e6':'transparent'),background:trees===v?'#1d4a73':'transparent',color:'inherit',fontSize:11,cursor:'pointer'}}>{l}</button>)}</div>}
   {obj&&<ViewToolbar mode={viewMode} onView={v=>{setViewMode(v);nav('view',v)}} pan={pan} onPan={()=>setPan(p=>!p)} onFit={()=>{setIsolated(null);nav('fit')}}
-   canFocus={!!sel} onFocus={()=>setFocusLocal(n=>n+1)} isolated={isolated!=null} onIsolate={()=>{if(isolated!=null)setIsolated(null);else if(sel){setIsolated(sel.id);setFocusLocal(n=>n+1)}}}/>}
+   canFocus={!!sel} onFocus={()=>setFocusLocal(n=>n+1)} isolated={isolated!=null} onIsolate={()=>{if(isolated!=null)setIsolated(null);else if(sel){setIsolated(sel.id);setFocusLocal(n=>n+1)}}}
+   colour={colour} onColour={setColour} colours={{rgb:true,elevation:true,intensity:isCloud?(ready.length?'Intensity is shown in the Full LiDAR view':'Intensity needs the full LiDAR view (still being prepared)'):'Photo-built models have no LiDAR intensity'}}/>}
   <Canvas camera={{position:view?.position||[16,12,16],fov:45,near:.05,far:500}} gl={{antialias:true}} onCreated={({gl})=>{gl.localClippingEnabled=true}}>{/* high enough to show the tower and the drone path above it */}
    <color attach="background" args={['#0f1f31']}/><ambientLight intensity={.9}/><directionalLight position={[8,12,6]} intensity={1.2}/>
    {obj&&<primitive object={obj}/>}{ctxObj&&trees!=='hidden'&&<primitive object={ctxObj}/>}{obj&&measurementMode&&onMeasurementPoint&&<MeasurePicker object={obj} onPick={onMeasurementPoint}/>} {showCams&&<Cameras url={model.urls.web_cameras} selected={selectedCam?.name} onPick={setSelectedCam}/>} {!measurementMode&&<RegistrationMarkers markers={isolated!=null?markers.filter(m=>m.id===isolated):markers} selected={selectedMarker} editing={editingMarker} editMode={markerEditMode} onPick={onMarkerPick} onTransform={onMarkerTransform}/>} {measurementMode&&<MeasurementLayer mode={measurementMode} points={measurementPoints}/>}<LabelAnchor target={label} position={sel?[sel.x,sel.z+(sel.size_h??.2)/2+.05,sel.y]:null}/>
@@ -287,7 +304,8 @@ export default function Reconstruction({inspections,jobs,onChanged}:{inspections
    <PointCloudPanel compact inspectionId={inspection?.id??null} inspectionLabel={inspection?.label} onBuilt={onChanged}/>
   </div>
   <div className="viewer-middle"><div className="viewer-toolbar ann-toolbar">
-    <div className="ann-tools ann-title"><b>{model?`Model #${model.id} · ${insCode(model.inspection_id)}`:'3D model'}</b></div>
+    <div className="ann-tools ann-title"><select aria-label="Inspection" title="Inspection" value={inspection?.id??''} onChange={e=>{setInspectionId(+e.target.value);setSelected(null)}} style={{background:'transparent',color:'inherit',border:'1px solid #2d5878',borderRadius:6,padding:'2px 6px',fontSize:12,fontWeight:600,maxWidth:260}}>
+     {inspections.map(i=><option key={i.id} value={i.id} style={{color:'#1d2f40'}}>{insCode(i.id)} · {i.label}</option>)}</select><b>{model?`Model #${model.id}`:'No 3D model yet'}</b></div>
     <div className="ann-tools">
      <button className={mode==='points'?'on':''} onClick={()=>setMode('points')} title="Point cloud"><Layers size={15}/>Points</button>
      <button className={mode==='mesh'?'on':''} onClick={()=>setMode('mesh')} disabled={!model?.urls.web_mesh} title={model?.urls.web_mesh?'Surface mesh':'Mesh needs a dense build'}><Box size={15}/>Mesh</button><i className="ann-sep"/>
