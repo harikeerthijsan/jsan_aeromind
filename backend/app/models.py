@@ -45,6 +45,7 @@ class Inspection(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey('sites.id'))
     label: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(48), default='draft')
+    tower_type: Mapped[str | None] = mapped_column(String(60), nullable=True)  # chosen at upload (lattice / monopole); None = the site's type
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 class Media(Base):
     __tablename__ = 'media'

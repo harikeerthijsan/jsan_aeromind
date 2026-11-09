@@ -420,8 +420,8 @@ def test_video_frames_and_scoped_processing(monkeypatch):
     from app import detector, frames
     from app.main import ROOT
     box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':1,'y1':1,'x2':20,'y2':30}
-    monkeypatch.setattr(detector,'status',lambda:'ready')
-    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    monkeypatch.setattr(detector,'status',lambda *a:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False,tower=None:iter([(0,64,48,[box])]))
     calls=[]
     def fake_extract(video_path,out_dir,*a,**k):
         calls.append(1);out_dir.mkdir(parents=True,exist_ok=True);out=[]
@@ -458,8 +458,8 @@ def test_annotated_output_uses_each_files_latest_run(monkeypatch):
     pytest.importorskip('PIL')
     from app import detector
     box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':2,'y1':2,'x2':30,'y2':40}
-    monkeypatch.setattr(detector,'status',lambda:'ready')
-    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    monkeypatch.setattr(detector,'status',lambda *a:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False,tower=None:iter([(0,64,48,[box])]))
     with TestClient(app) as client:
         i=client.post('/api/v1/inspections',json={'site_id':1,'label':'Scoped runs'}).json()
         old=client.post(f"/api/v1/inspections/{i['id']}/media",files={'file':('old.jpg',_drone_jpeg(1),'image/jpeg')}).json()
@@ -476,8 +476,8 @@ def test_review_regressions(monkeypatch):
     from PIL import Image
     from app import detector, frames, vendor, condition
     box={'class_id':0,'class_name':'sector_antenna','confidence':.9,'x1':2,'y1':2,'x2':30,'y2':40}
-    monkeypatch.setattr(detector,'status',lambda:'ready')
-    monkeypatch.setattr(detector,'detect',lambda path,video=False:iter([(0,64,48,[box])]))
+    monkeypatch.setattr(detector,'status',lambda *a:'ready')
+    monkeypatch.setattr(detector,'detect',lambda path,video=False,tower=None:iter([(0,64,48,[box])]))
     def bad_video(*a,**k):raise RuntimeError('Cannot open video broken.MOV')
     monkeypatch.setattr(frames,'extract',bad_video)
     with TestClient(app) as client:
@@ -762,7 +762,7 @@ def test_remote_gpu_worker_runs_queued_work(monkeypatch):
     monkeypatch.setattr(gpu, 'REMOTE', True); monkeypatch.setattr(gpu, 'TOKEN', 'tok'); monkeypatch.setattr(gpu, 'CALL_TIMEOUT', 20)
     caps = {'detector': {'status': 'ready', 'model': 'w/best.pt', 'classes': {'0': 'rru'}}, 'reconstruction': {'status': 'ready'}, 'gpu': 'Test GPU'}
     monkeypatch.setattr(worker, 'capabilities', lambda: caps)
-    monkeypatch.setattr(tasks.detector, 'detect', lambda path, save: [(None, 640, 480, [{'class_id': 0, 'class_name': 'rru', 'confidence': .9, 'x1': 1, 'y1': 2, 'x2': 30, 'y2': 40}])])
+    monkeypatch.setattr(tasks.detector, 'detect', lambda path, save, tower=None: [(None, 640, 480, [{'class_id': 0, 'class_name': 'rru', 'confidence': .9, 'x1': 1, 'y1': 2, 'x2': 30, 'y2': 40}])])
     stop = threading.Event(); monkeypatch.setattr(worker, '_stop', stop)
     with TestClient(app) as client:
         assert client.post('/api/v1/worker/claim', json={'name': 'x'}).status_code == 401  # token required
@@ -1337,3 +1337,27 @@ def test_delete_wrongly_uploaded_files_with_their_review_work():
             assert db.get(Model3D, model_id).quality['photos_removed'] == 2
         r = client.post(f'/api/v1/models/{model_id}/register-assets'); assert r.status_code == 409 and 'rebuild the 3D model' in r.json()['detail']
         assert client.post(f"/api/v1/inspections/{ins['id']}/media/delete", json={'media_ids': [999999]}).status_code == 404
+
+def test_tower_type_picks_the_detection_model(monkeypatch, tmp_path):
+    """Upload page: lattice or monopole per inspection; detection runs with that tower type's model (IoU 0.5)."""
+    from app import detector, tasks
+    assert detector.IOU == 0.5
+    (tmp_path / 'lattice.pt').write_bytes(b'x'); (tmp_path / 'monopole.pt').write_bytes(b'x')
+    monkeypatch.setattr(detector, 'MODELS_DIR', tmp_path)
+    assert detector.tower_model_type('Monopole') == 'monopole' and detector.tower_model_type('Guyed mast') == 'lattice' and detector.tower_model_type(None) == 'lattice'
+    assert detector.model_path('monopole').endswith('monopole.pt') and detector.model_name('monopole') == 'monopole model'
+    used = []
+    monkeypatch.setattr(detector, 'status', lambda *a: 'ready')
+    monkeypatch.setattr(tasks.detector, 'detect', lambda path, video=False, tower=None: used.append(tower) or iter([(0, 64, 48, [])]))
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'mono'}).json()
+        client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('a.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')})
+        assert client.patch(f"/api/v1/inspections/{ins['id']}/tower-type", json={'tower_type': 'pole'}).status_code == 422
+        r = client.patch(f"/api/v1/inspections/{ins['id']}/tower-type", json={'tower_type': 'monopole'}).json()
+        assert r['tower_type'] == 'monopole' and r['model'] == 'monopole model'
+        job = client.post(f"/api/v1/inspections/{ins['id']}/process").json()
+        assert 'monopole tower' in job['detail'] and used == ['monopole']
+        assert client.get(f"/api/v1/jobs/{job['id']}").json()['status'] == 'completed'
+        ins2 = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'lattice default'}).json()  # site 1 is a lattice tower
+        client.post(f"/api/v1/inspections/{ins2['id']}/media", files={'file': ('b.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')})
+        client.post(f"/api/v1/inspections/{ins2['id']}/process"); assert used[-1] == 'lattice'

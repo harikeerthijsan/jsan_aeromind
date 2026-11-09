@@ -5,7 +5,7 @@ const TOKEN_KEY='aeromind_session';
 export const getAuthToken=()=>localStorage.getItem(TOKEN_KEY);
 export function setAuthToken(token:string|null){if(token)localStorage.setItem(TOKEN_KEY,token);else localStorage.removeItem(TOKEN_KEY)}
 export type Site={id:number;code:string;name:string;region:string;tower_type:string;height_m:number|null;status:string;latitude?:number|null;longitude?:number|null;operator?:string|null;address?:string|null;notes?:string|null;created_at?:string|null};
-export type Inspection={id:number;site_id:number;label:string;status:string;created_at:string};
+export type Inspection={id:number;site_id:number;label:string;status:string;created_at:string;tower_type?:string|null};  // tower_type: the detection model (lattice / monopole)
 export type Asset={id:number;site_id:number;code:string;category:string;condition:string;identity_status:string;localization_status:string;x:number|null;y:number|null;z:number|null;description:string};
 export type Defect={id:number;asset_id:number;defect_type:string;proposed_grade:string;review_status:string;notes:string};
 export type Job={id:number;inspection_id:number;status:string;stage:string;progress:number;detail:string;kind?:string;media_ids?:number[]|null};

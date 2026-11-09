@@ -221,10 +221,24 @@ class RegistrationGeometryIn(BaseModel):
     z:float
     yaw:float|None=None
 
-def detector_state():
-    """YOLO status/model of whoever runs detection: this process, or the remote GPU worker."""
-    if gpu.REMOTE:return gpu.info('detector',{'status':'worker_offline','model':None})
-    return {'status':detector.status(),'model':detector.model_name() if detector.MODEL_PATH else None}
+def detector_state(tower:str|None=None):
+    """YOLO status/model of whoever runs detection (this process, or the remote GPU worker); tower = lattice / monopole."""
+    if gpu.REMOTE:
+        d=gpu.info('detector',{'status':'worker_offline','model':None});per=(d.get('models') or {}).get(tower or detector.DEFAULT_TYPE)
+        return {**d,**per} if per else d
+    return {'status':detector.status(tower),'model':detector.model_name(tower) if detector.model_path(tower) else None}
+def inspection_tower(db,inspection):
+    """The model family for an inspection: its own choice at upload, else the site's structure type."""
+    site=db.get(Site,inspection.site_id) if inspection else None
+    return detector.tower_model_type((inspection.tower_type if inspection else None) or (site.tower_type if site else None))
+class TowerTypeIn(BaseModel):
+    tower_type:str=Field(pattern='^(lattice|monopole)$')
+@app.patch('/api/v1/inspections/{inspection_id}/tower-type')
+def set_inspection_tower_type(inspection_id:int,data:TowerTypeIn,db:Session=Depends(get_db)):
+    """Lattice or monopole: picks the detection model for this inspection's photos."""
+    x=db.get(Inspection,inspection_id)
+    if not x:raise HTTPException(404,'Inspection not found')
+    x.tower_type=data.tower_type;db.commit();db.refresh(x);return to_dict(x)|{'model':detector_state(data.tower_type).get('model')}
 @app.get('/health')
 def health():
     d=detector_state();w=gpu.worker() if gpu.REMOTE else None
@@ -673,8 +687,9 @@ def process(inspection_id:int,background:BackgroundTasks,media_ids:list[int]|Non
         done=completed_runs(db,inspection_id);scope=[i for i in (scope or top) if not any(covers(j,i) for j in done)]
         if not scope:raise HTTPException(409,'Nothing new to process: every upload already has detections')
     if scope is None:scope=list(top)  # a full run still records its files (None only on runs made before this change)
+    tower=inspection_tower(db,db.get(Inspection,inspection_id))
     x=Job(inspection_id=inspection_id,kind='detection',status='queued',stage='detection',media_ids=scope,
-          detail=f'Queued for YOLO detection ({detector_state().get("model")}) · '+(f'{len(scope)} file(s)' if scope is not None else 'all files'))
+          detail=f'Queued for YOLO detection ({tower} tower · {detector_state(tower).get("model")}) · '+(f'{len(scope)} file(s)' if scope is not None else 'all files'))
     db.add(x);db.commit();db.refresh(x);gpu.start(background,'run_detection',job_id=x.id);return to_dict(x)
 def completed_runs(db,inspection_id):
     return db.scalars(select(Job).where(Job.inspection_id==inspection_id,Job.kind=='detection',Job.status=='completed').order_by(Job.id.desc())).all()
@@ -689,10 +704,11 @@ def _detection_prepare(db,job_id):
     def frames_of(m):  # frames extracted by an earlier run are reused
         kids=db.scalars(select(Media).where(Media.parent_media_id==m.id).order_by(Media.frame_index)).all()
         return [{'id':k.id,'storage_key':k.storage_key} for k in kids] or None
-    return {'model':detector_state().get('model'),'items':[{'id':m.id,'filename':m.filename,'content_type':m.content_type,'storage_key':m.storage_key,
+    tower=inspection_tower(db,db.get(Inspection,job.inspection_id))
+    return {'model':detector_state(tower).get('model'),'tower_type':tower,'items':[{'id':m.id,'filename':m.filename,'content_type':m.content_type,'storage_key':m.storage_key,
             'frames':frames_of(m) if m.content_type.startswith('video/') else None} for m in items]}
 def _detection_apply(db,result,job_id):
-    job=db.get(Job,job_id);name=detector_state().get('model') or 'yolo';counts=Counter();nframes=0;failed,ok_ids=[],[]
+    job=db.get(Job,job_id);name=result.get('model') or detector_state(inspection_tower(db,db.get(Inspection,job.inspection_id))).get('model') or 'yolo';counts=Counter();nframes=0;failed,ok_ids=[],[]
     for f in result['files']:
         if not f['ok']:failed.append(f['error']);continue
         video=db.get(Media,f['id']);by_index={}

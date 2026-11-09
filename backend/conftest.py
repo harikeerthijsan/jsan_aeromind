@@ -15,6 +15,7 @@ os.environ['RECON_DIR'] = str(_tmp / 'reconstructions')
 os.environ['COLMAP_PATH'] = 'off'  # tests stub the photogrammetry step; don't pick up an installed COLMAP
 os.environ['AEROMIND_SKIP_DOTENV'] = '1'  # tests never read the developer's backend/.env
 os.environ['YOLO_MODEL_PATH'] = ''  # tests stub the detector; never load real weights
+os.environ['YOLO_MODELS_DIR'] = str(_tmp / 'yolo_models')  # ... nor the per-tower-type models
 os.environ.setdefault('ENABLE_DEMO_SEED', 'true')  # tests rely on demo site 1
 os.environ['AUTH_DISABLED'] = 'true'  # endpoint tests focus on domain behavior; auth has dedicated tests
 if not os.getenv('AEROMIND_TEST_KEEP'):

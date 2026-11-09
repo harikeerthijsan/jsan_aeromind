@@ -66,11 +66,11 @@ def detect(payload, progress):
     -> {'files': [{id, ok, error, new_frames: [...], targets: [{media_id | frame_index, w, h, boxes}]}]}"""
     items, out = payload['items'], []
     ahead = [m['storage_key'] for m in items if m['content_type'].startswith('image/')] + [f['storage_key'] for m in items for f in (m.get('frames') or [])]
-    pre = _Prefetch(ahead)
-    try: return _detect(items, out, progress, pre)
+    pre = _Prefetch(ahead); tower = payload.get('tower_type')
+    try: return {**_detect(items, out, progress, pre, tower), 'model': detector.model_name(tower), 'tower_type': tower or detector.DEFAULT_TYPE}
     finally: pre.close()
 
-def _detect(items, out, progress, pre):
+def _detect(items, out, progress, pre, tower=None):
     for n, m in enumerate(items, 1):
         res = {'id': m['id'], 'ok': True, 'error': None, 'new_frames': [], 'targets': []}
         try:
@@ -93,7 +93,7 @@ def _detect(items, out, progress, pre):
             for k, t in enumerate(targets, 1):
                 progress('detection', int(((n - 1) + (k - 1) / len(targets)) * 100 / len(items)),
                          f"Detecting in {m['filename']}" + (f' · frame {k}/{len(targets)}' if len(targets) > 1 or 'frame_index' in t else '') + f' ({n}/{len(items)})')
-                for _, w, h, boxes in detector.detect(pre.get(t['storage_key']), False):
+                for _, w, h, boxes in detector.detect(pre.get(t['storage_key']), False, tower):  # the lattice or the monopole model
                     res['targets'].append({**{k2: t[k2] for k2 in ('media_id', 'frame_index') if k2 in t}, 'w': w, 'h': h, 'boxes': boxes})
         except Exception as e:  # one unreadable file shouldn't hide every other file's results
             res.update(ok=False, error=f"{m['filename']}: {e}"[:200], targets=[], new_frames=[])

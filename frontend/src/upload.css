@@ -62,3 +62,12 @@
 .up-files-list li small{color:#8a9aa6}.up-files-list li em{padding:1px 6px;border-radius:5px;background:#e7f7ef;color:#19765a;font-size:10.5px;font-style:normal}
 .up-files-msg{display:flex;align-items:center;gap:7px;margin-top:8px;padding:8px 10px;border-radius:8px;font-size:12.5px}
 .up-files-msg.ok{background:#e7f7ef;color:#19765a}.up-files-msg.error{background:#fef3f2;color:#b42318}
+
+/* tower type: picks the detection model */
+.up-target-type{display:flex;flex-direction:column;gap:5px}
+.up-target-type>small{color:#7b8d9b;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.up-seg{display:inline-flex;padding:3px;border:1px solid #dce4e9;border-radius:9px;background:#f6f9fb}
+.up-seg button{padding:6px 14px;border:0;border-radius:7px;background:none;color:#516a7c;font-size:13px;font-weight:600;cursor:pointer}
+.up-seg button.on{background:#1769aa;color:#fff;box-shadow:0 1px 3px rgba(23,105,170,.35)}
+.up-seg button:disabled{cursor:default;opacity:.6}
+.up-type-note{color:#7b8d9b;font-size:11.5px}

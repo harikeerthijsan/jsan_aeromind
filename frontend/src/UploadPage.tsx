@@ -31,6 +31,12 @@ export default function UploadPage({site,inspections,go,onChanged}:{site?:Site;i
  const top=media.filter(m=>m.parent_media_id==null),photos=top.filter(m=>m.content_type.startsWith('image/')).length,videos=top.filter(m=>m.content_type.startsWith('video/')).length;
  const cloudFiles=clouds.filter(c=>c.role==='cloud');
 
+ // the detection model: this inspection's choice, else the tower's structure type (Sites page)
+ const [types,setTypes]=useState<Record<number,string>>({});
+ const towerType:'lattice'|'monopole'=((inspection&&(types[inspection.id]||inspection.tower_type))||(site?.tower_type?.toLowerCase().startsWith('monopole')?'monopole':'lattice'))==='monopole'?'monopole':'lattice';
+ async function setTower(t:'lattice'|'monopole'){if(!inspection||t===towerType)return;setBusy('tower');
+  try{await request(`/api/v1/inspections/${inspection.id}/tower-type`,json('PATCH',{tower_type:t}));setTypes(m=>({...m,[inspection.id]:t}));onChanged()}
+  catch(e){setMsg({kind:'error',text:String((e as Error).message||e)})}finally{setBusy('')}}
  async function createInspection(){if(!site||!newLabel||newLabel.trim().length<2)return;setBusy('inspection');
   try{const x=await request<Inspection>('/api/v1/inspections',json('POST',{site_id:site.id,label:newLabel.trim()}));setNewLabel(null);await onChanged();setInspectionId(x.id)}
   catch(e){setMsg({kind:'error',text:String((e as Error).message||e)})}finally{setBusy('')}}
@@ -85,6 +91,10 @@ export default function UploadPage({site,inspections,go,onChanged}:{site?:Site;i
       <button className="btn outline" disabled={uploading||!site} onClick={()=>setNewLabel('Drone survey '+new Date().toLocaleDateString())}><Plus size={14}/>New inspection</button></div>
      :<form className="up-row" onSubmit={e=>{e.preventDefault();createInspection()}}><input autoFocus value={newLabel} onChange={e=>setNewLabel(e.target.value)} placeholder="Inspection label"/>
        <button className="btn primary" disabled={busy==='inspection'||newLabel.trim().length<2}>Create</button><button type="button" className="btn outline" onClick={()=>setNewLabel(null)}>Cancel</button></form>}</div>
+    {inspection&&<div className="up-target-type"><small>Tower type</small>
+     <div className="up-seg" role="radiogroup" aria-label="Tower type">{(['lattice','monopole'] as const).map(t=><button key={t} type="button" role="radio" aria-checked={towerType===t}
+      className={towerType===t?'on':''} disabled={uploading||busy==='tower'} onClick={()=>setTower(t)}>{t==='lattice'?'Lattice':'Monopole'}</button>)}</div>
+     <span className="up-type-note">Detection uses the {towerType} model</span></div>}
     <div className="up-counts"><span><ImageIcon size={14}/>{photos} photos</span><span><Film size={14}/>{videos} videos</span><span><FileBox size={14}/>{cloudFiles.length} point cloud{cloudFiles.length===1?'':'s'}</span></div>
    </section>
 
