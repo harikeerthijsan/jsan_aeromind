@@ -315,7 +315,7 @@ def sites_overview(db:Session=Depends(get_db)):
             'images':images.get(i,0),'approved_images':approved.get(i,0),'items':items.get(i,0),'items_with_defects':defective.get(i,0),'poor_or_critical':critical.get(i,0),
             'models':models.get(i,0),'dense_models':dense.get(i,0),'boxes_3d':boxes.get(i,0),'jobs_running':running.get(i,0)}})
     return out
-THUMB_DIR=ROOT/'.thumbs'  # small cached JPEGs for cards (drone originals are ~15 MB); regenerated on demand, never pushed to the bucket
+THUMB_DIR=ROOT/'.thumbs'  # small JPEGs for strips, cards and viewers (drone originals are ~15 MB); also kept in the bucket, so a deploy does not lose them
 THUMB_SIZES=(200,480,1280)  # what the pages ask for (film strips, cards, photo viewers): made together from one download
 _thumb_gate:'asyncio.Semaphore|None'=None  # a few builds at a time; waiting requests hold no thread and no database connection
 _thumb_building:dict[int,'asyncio.Future']={}  # photo -> the build in progress: it makes every size, other requests wait for it
@@ -331,6 +331,40 @@ def _make_thumbs(media_id:int,src:Path,w:int):
         for s in want:  # largest first, each from the one before
             im.thumbnail((s,s));out=THUMB_DIR/f'{media_id}_{s}.jpg';tmp=out.with_suffix(f'.{uuid.uuid4().hex}.part')
             im.save(tmp,'JPEG',quality=82,optimize=True);os.replace(tmp,out)
+            try:storage.push(out)  # kept in the bucket: the server's disk is wiped by every deploy
+            except Exception:pass
+def _thumbs_from_bucket(media_id:int,w:int)->bool:
+    """A preview made earlier (before a deploy, or trimmed from the cache) comes back from the bucket: ~100 KB instead
+    of downloading and decoding the original."""
+    out=THUMB_DIR/f'{media_id}_{w}.jpg'
+    try:storage.fetch(out)
+    except Exception:return False
+    return out.is_file()
+def _build_thumbs(media_id:int,key:str,w:int=THUMB_SIZES[-1]):
+    """Every standard preview of a photo, from the bucket copies or else from the original (a downloaded original is
+    not kept in bucket mode: a backfill of a whole flight must not fill the server's disk)."""
+    if all((THUMB_DIR/f'{media_id}_{s}.jpg').is_file() or _thumbs_from_bucket(media_id,s) for s in {w,*THUMB_SIZES}):return
+    src=ROOT/key;was_here=src.is_file();storage.fetch(src)
+    if not src.is_file():raise HTTPException(404,'Image file not found')
+    try:_make_thumbs(media_id,src,w)
+    finally:
+        if not was_here and storage.bucket_only():src.unlink(missing_ok=True)
+from concurrent.futures import ThreadPoolExecutor
+_thumb_pool=ThreadPoolExecutor(int(os.getenv('THUMB_PREPARE_WORKERS','2')),thread_name_prefix='thumbs')  # previews made after upload, in the background
+def _prepare_thumbs(media_id:int,key:str,release:bool=False):
+    """After an upload: the previews from the file just received (no download), then (bucket mode) the local original goes."""
+    src=ROOT/key
+    try:
+        if src.is_file():_make_thumbs(media_id,src,THUMB_SIZES[-1])
+        else:_build_thumbs(media_id,key)
+    except Exception as e:print(f'previews of photo {media_id} failed: {e}',flush=True)
+    finally:
+        if release:
+            try:storage.release(src)
+            except Exception:pass
+def queue_thumbs(media_id:int,key:str,content_type:str,release:bool=False):
+    if content_type.startswith('image/'):_thumb_pool.submit(_prepare_thumbs,media_id,key,release)
+    elif release:_thumb_pool.submit(storage.release,ROOT/key)
 @app.get('/api/v1/media/{media_id}/thumb')
 async def media_thumb(media_id:int,w:int=Query(480,ge=120,le=1280)):
     """A small JPEG of a photo. A thumbnail already made is served without the database; a new one reads the file's
@@ -353,12 +387,22 @@ async def media_thumb(media_id:int,w:int=Query(480,ge=120,le=1280)):
         try:
             _thumb_gate=_thumb_gate or asyncio.Semaphore(int(os.getenv('THUMB_WORKERS','4')))
             async with _thumb_gate:
-                src=await run_in_threadpool(storage.fetch,ROOT/key)
-                if not src.is_file():raise HTTPException(404,'Image file not found')
-                await run_in_threadpool(_make_thumbs,media_id,src,w)
+                await run_in_threadpool(_build_thumbs,media_id,key,w)
         finally:
             _thumb_building.pop(media_id,None);fut.set_result(None)
     return FileResponse(out,media_type='image/jpeg',headers={'Cache-Control':'private, max-age=86400'})
+def _drop_thumbs(media_id:int):
+    for t in THUMB_DIR.glob(f'{media_id}_*.jpg') if THUMB_DIR.is_dir() else []:t.unlink(missing_ok=True)
+    for s in THUMB_SIZES:storage.delete(THUMB_DIR/f'{media_id}_{s}.jpg')
+@app.post('/api/v1/inspections/{inspection_id}/thumbnails')
+def prepare_thumbnails(inspection_id:int,_:object=Depends(auth.require_admin)):
+    """Admin: make the previews of an inspection's photos uploaded before previews were made at upload (in the background)."""
+    with SessionLocal() as db:
+        if not db.get(Inspection,inspection_id):raise HTTPException(404,'Inspection not found')
+        rows=db.execute(select(Media.id,Media.storage_key).where(Media.inspection_id==inspection_id,Media.content_type.like('image/%'))).all()
+    todo=[(i,k) for i,k in rows if not all((THUMB_DIR/f'{i}_{s}.jpg').is_file() for s in THUMB_SIZES)]
+    for i,k in todo:_thumb_pool.submit(_prepare_thumbs,i,k)
+    return {'photos':len(rows),'queued':len(todo)}
 def _cover(db,inspection_id):
     """First photo of an inspection in capture order: the picture shown on its cards."""
     return db.scalar(select(Media.id).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None),Media.content_type.like('image/%')).order_by(func.lower(Media.filename),Media.id).limit(1))
@@ -459,9 +503,11 @@ async def upload(inspection_id:int, file:UploadFile=File(...),db:Session=Depends
                 size+=len(chunk)
                 if size>MAX_SIZE:raise HTTPException(413,'File too large')
                 sha.update(chunk);out.write(chunk)
-        await run_in_threadpool(storage.push,target);await run_in_threadpool(storage.release,target)
+        await run_in_threadpool(storage.push,target)
         x=Media(inspection_id=inspection_id,filename=name,storage_key=key,content_type=file.content_type,sha256=sha.hexdigest(),size_bytes=size)
-        db.add(x);db.commit();db.refresh(x);return to_dict(x)
+        db.add(x);db.commit();db.refresh(x)
+        queue_thumbs(x.id,key,x.content_type,release=True)  # previews from the file still on disk, then (bucket mode) it goes
+        return to_dict(x)
     except Exception:
         target.unlink(missing_ok=True)
         raise
@@ -546,6 +592,7 @@ async def chunked_complete(upload_id:str,background:BackgroundTasks,db:Session=D
     else:x=Media(inspection_id=s['inspection_id'],filename=s['name'],storage_key=s['key'],content_type=s['content_type'],sha256=sha,size_bytes=s['size'])
     db.add(x);db.commit();db.refresh(x);_chunked.pop(upload_id,None)
     if s['kind']=='pointcloud':queue_copc(background,db,x)  # the browser copy (COPC) is built on the GPU worker
+    else:queue_thumbs(x.id,x.storage_key,x.content_type)  # previews ready before anyone opens the photo
     return _pc_dict(x) if s['kind']=='pointcloud' else to_dict(x)
 @app.delete('/api/v1/chunked-uploads/{upload_id}',status_code=204)
 def chunked_cancel(upload_id:str):
@@ -656,7 +703,7 @@ def delete_media(media_id:int,db:Session=Depends(get_db)):
             raise HTTPException(409,f'{m.filename} already has {label}; it can no longer be removed as an upload')
     for x in items:
         path=ROOT/x.storage_key;path.unlink(missing_ok=True);storage.delete(path)
-        for t in THUMB_DIR.glob(f'{x.id}_*.jpg') if THUMB_DIR.is_dir() else []:t.unlink(missing_ok=True)
+        _drop_thumbs(x.id)
     for x in sorted(items,key=lambda x:x.parent_media_id is None):db.delete(x)  # frames before their video
     db.commit();return Response(status_code=204)
 @app.get('/api/v1/inspections/{inspection_id}/media')
@@ -686,7 +733,7 @@ def purge_media(db,items):
             m3.quality={**(m3.quality or {}),'photos_removed':int((m3.quality or {}).get('photos_removed',0))+len(gone&set(job.media_ids))};removed['models_affected']+=1
     for x in items:
         path=ROOT/x.storage_key;path.unlink(missing_ok=True);storage.delete(path);removed['files']+=1
-        for t in THUMB_DIR.glob(f'{x.id}_*.jpg') if THUMB_DIR.is_dir() else []:t.unlink(missing_ok=True)
+        _drop_thumbs(x.id)
     for x in sorted(items,key=lambda x:x.parent_media_id is None):db.delete(x)  # frames before their video
     db.commit();return removed
 @app.post('/api/v1/inspections/{inspection_id}/media/delete')

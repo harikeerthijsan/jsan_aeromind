@@ -1385,3 +1385,36 @@ def test_photo_view_measures_through_the_photo(tmp_path):
     assert abs(base['height_m'] - 1) < .3 and base['snapped_px'] > 0  # 15 px beside the pole: snapped onto it, not the field behind
     assert sky is None
     assert abs(math.dist([top['x'], top['y'], top['z']], [base['x'], base['y'], base['z']]) - 10) < .5
+
+def test_photo_previews_made_at_upload_and_kept_in_the_bucket(monkeypatch):
+    """Previews are made right after upload from the file received, pushed to the bucket (the server's disk is wiped
+    by a deploy), served from the bucket copy afterwards, backfilled on request and deleted with the photo."""
+    import io, shutil, time
+    from PIL import Image
+    from app import storage
+    from app.main import ROOT, THUMB_DIR, THUMB_SIZES
+    fake = _FakeS3()
+    monkeypatch.setattr(storage, '_client', fake); monkeypatch.setattr(storage, 'BUCKET', 'b'); monkeypatch.setattr(storage, 'ACCESS_KEY', 'k'); monkeypatch.setattr(storage, 'SECRET_KEY', 's')
+    monkeypatch.setattr(storage, '_roots', {'uploads': ROOT.resolve()}); monkeypatch.setattr(storage, 'PREFIX', ''); monkeypatch.setattr(storage, 'MODE', 'bucket')
+    buf = io.BytesIO(); Image.new('RGB', (3000, 2000), (120, 160, 200)).save(buf, 'JPEG'); jpg = buf.getvalue()
+    wait = lambda ok: next((True for _ in range(100) if ok() or time.sleep(.05)), False)
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'previews'}).json()
+        m = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('p.jpg', jpg, 'image/jpeg')}).json()
+        keys = [f"uploads/.thumbs/{m['id']}_{s}.jpg" for s in THUMB_SIZES]
+        assert wait(lambda: all(k in fake.o for k in keys)), sorted(fake.o)          # made after upload, in the bucket
+        assert wait(lambda: not (ROOT / m['storage_key']).exists())                     # bucket mode: the original is not kept
+        assert Image.open(io.BytesIO(fake.o[keys[-1]])).size == (1280, 853)
+        shutil.rmtree(THUMB_DIR); fake.o.pop('uploads/' + m['storage_key'])             # a deploy wipes the disk; even without the original ...
+        r = client.get(f"/api/v1/media/{m['id']}/thumb?w=200")
+        assert r.status_code == 200 and Image.open(io.BytesIO(r.content)).size == (200, 133)  # ... the preview comes back from the bucket
+        m2 = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('q.jpg', jpg, 'image/jpeg')}).json()
+        assert wait(lambda: f"uploads/.thumbs/{m2['id']}_1280.jpg" in fake.o)
+        for s in THUMB_SIZES: fake.o.pop(f"uploads/.thumbs/{m2['id']}_{s}.jpg"); (THUMB_DIR / f"{m2['id']}_{s}.jpg").unlink()  # uploaded before previews existed
+        from app import auth
+        app.dependency_overrides[auth.require_admin] = lambda: None  # sign-in is off in these tests; the endpoint is admin-only
+        try: assert client.post(f"/api/v1/inspections/{ins['id']}/thumbnails").json() == {'photos': 2, 'queued': 1}
+        finally: app.dependency_overrides.pop(auth.require_admin, None)
+        assert wait(lambda: all(f"uploads/.thumbs/{m2['id']}_{s}.jpg" in fake.o for s in THUMB_SIZES))
+        assert client.post(f"/api/v1/inspections/{ins['id']}/media/delete", json={'media_ids': [m2['id']]}).status_code == 200
+        assert not any(f"{m2['id']}_" in k for k in fake.o if '.thumbs' in k)           # deleted with the photo
