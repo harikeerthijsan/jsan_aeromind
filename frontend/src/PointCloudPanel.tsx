@@ -34,7 +34,9 @@ export default function PointCloudPanel({inspectionId,inspectionLabel,onBuilt,on
      setNote(`Upload cancelled${done.length?` · ${done.length} uploaded file${done.length===1?'':'s'} removed`:''}.`)}
    else setError(String((e as Error).message||e))}
   finally{abort.current=null;setBusy('');setProgress(null);load()}}
- async function remove(f:PointCloudFile){setBusy('remove');try{await request(`/api/v1/pointclouds/${f.id}`,{method:'DELETE'});load()}catch(e){setError(String((e as Error).message||e))}finally{setBusy('')}}
+ async function remove(f:PointCloudFile){if(!confirm(`Delete ${f.filename} (${mb(f.size_bytes)}) from storage?${f.role==='cloud'?' Its full LiDAR viewer copy is deleted too.':''}
+
+This cannot be undone.`))return;setBusy('remove');try{await request(`/api/v1/pointclouds/${f.id}`,{method:'DELETE'});load()}catch(e){setError(String((e as Error).message||e))}finally{setBusy('')}}
  async function build(){if(!inspectionId)return;setBusy('build');setError('');
   try{await buildFromPointCloud(inspectionId);setNote('3D model build started: follow it on 3D Reconstruction.');onBuilt?.()}
   catch(e){setError(String((e as Error).message||e))}finally{setBusy('')}}

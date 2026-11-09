@@ -614,7 +614,46 @@ def delete_media(media_id:int,db:Session=Depends(get_db)):
     db.commit();return Response(status_code=204)
 @app.get('/api/v1/inspections/{inspection_id}/media')
 def media(inspection_id:int,db:Session=Depends(get_db)):
-    return [to_dict(m)|{'url':f'/uploads/{m.storage_key}'} for m in db.scalars(select(Media).where(Media.inspection_id==inspection_id)).all()]
+    items=db.scalars(select(Media).where(Media.inspection_id==inspection_id)).all();top={m.id:(m.parent_media_id or m.id) for m in items};work=Counter()
+    for model in (Detection,ImageReview,Annotation):  # review work on a file (or its video frames): deleting it needs a manager
+        for mid,n in db.execute(select(model.media_id,func.count()).where(model.media_id.in_(list(top))).group_by(model.media_id)).all():work[top.get(mid,mid)]+=n
+    return [to_dict(m)|{'url':f'/uploads/{m.storage_key}','processed':work[m.id]>0} for m in items]
+class MediaDeleteIn(BaseModel):
+    media_ids:list[int]=Field(min_length=1,max_length=20000)
+def purge_media(db,items):
+    """Remove uploads for good: the stored files (originals, video frames, thumbnails), their detections, reviews and
+    approved boxes, and the detection ids in the 3D boxes' evidence. 3D models built with a removed photo are marked:
+    the build named its photos by position, so their boxes need the model rebuilt first."""
+    ids=[x.id for x in items];removed={'files':0,'detections':0,'reviews':0,'approved_boxes':0,'models_affected':0}
+    det_ids=set(db.scalars(select(Detection.id).where(Detection.media_id.in_(ids))).all())
+    for model,key in ((Detection,'detections'),(ImageReview,'reviews'),(Annotation,'approved_boxes')):
+        removed[key]=db.execute(delete(model).where(model.media_id.in_(ids))).rowcount or 0
+    inspections={x.inspection_id for x in items}
+    if det_ids:
+        for c in db.scalars(select(RegistrationCandidate).where(RegistrationCandidate.inspection_id.in_(inspections))).all():
+            if set(c.detection_ids or [])&det_ids:c.detection_ids=[d for d in c.detection_ids if d not in det_ids]
+    gone=set(ids)
+    for m3 in db.scalars(select(Model3D).where(Model3D.inspection_id.in_(inspections))).all():
+        job=db.get(Job,m3.job_id) if m3.job_id else None
+        if job and job.kind=='reconstruction' and gone&set(job.media_ids or []):
+            m3.quality={**(m3.quality or {}),'photos_removed':int((m3.quality or {}).get('photos_removed',0))+len(gone&set(job.media_ids))};removed['models_affected']+=1
+    for x in items:
+        path=ROOT/x.storage_key;path.unlink(missing_ok=True);storage.delete(path);removed['files']+=1
+        for t in THUMB_DIR.glob(f'{x.id}_*.jpg') if THUMB_DIR.is_dir() else []:t.unlink(missing_ok=True)
+    for x in sorted(items,key=lambda x:x.parent_media_id is None):db.delete(x)  # frames before their video
+    db.commit();return removed
+@app.post('/api/v1/inspections/{inspection_id}/media/delete')
+def delete_media_files(inspection_id:int,data:MediaDeleteIn,request:Request,db:Session=Depends(get_db)):
+    """Delete wrongly uploaded photos/videos of an inspection from storage and the database. Files that already have
+    detections, reviews or approved boxes are deleted with that work, which needs the manager role."""
+    top=db.scalars(select(Media).where(Media.inspection_id==inspection_id,Media.id.in_(data.media_ids),Media.parent_media_id.is_(None))).all()
+    if not top:raise HTTPException(404,'None of these files belong to this inspection')
+    items=top+db.scalars(select(Media).where(Media.parent_media_id.in_([m.id for m in top]))).all();ids=[x.id for x in items]
+    worked=any(db.scalar(select(func.count()).select_from(model).where(model.media_id.in_(ids))) for model in (Detection,ImageReview,Annotation))
+    user=getattr(request.state,'auth_user',None)
+    if worked and user is not None and auth.ROLE_LEVEL.get(user.role,-1)<auth.ROLE_LEVEL['manager']:
+        raise HTTPException(403,'Some of these files already have detections or reviews: deleting them needs the manager role')
+    return {'deleted':len(top),'frames':len(items)-len(top),**purge_media(db,items)}
 @app.post('/api/v1/inspections/{inspection_id}/process',status_code=202)
 def process(inspection_id:int,background:BackgroundTasks,media_ids:list[int]|None=Query(None),only_new:bool=False,db:Session=Depends(get_db)):
     """Run YOLO over the inspection's uploaded files (videos are split into frames first).
@@ -1049,6 +1088,7 @@ def _register_prepare(db,model_id):
     if not inspection:raise HTTPException(404,'Inspection not found')
     quality=model.quality or {};transform=quality.get('transform')
     if not transform:raise HTTPException(409,'This model has no viewer coordinate transform')
+    if quality.get('photos_removed'):raise HTTPException(409,f"{quality['photos_removed']} photo(s) this 3D model was built with have been deleted: rebuild the 3D model, then place the boxes")
     media=db.scalars(select(Media).where(Media.inspection_id==inspection.id)).all()
     job=db.get(Job,model.job_id);built=set(job.media_ids) if job and job.media_ids else None
     if built is not None:media=[m for m in media if m.id in built or m.parent_media_id in built]  # the build named exactly these photos photos/00000 ...

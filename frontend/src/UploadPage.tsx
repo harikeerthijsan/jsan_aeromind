@@ -2,6 +2,7 @@ import {useEffect,useMemo,useRef,useState} from 'react';
 import {AlertTriangle,ArrowRight,Box,CheckCircle2,Cpu,FileBox,Film,Image as ImageIcon,Plus,UploadCloud,X} from 'lucide-react';
 import {Inspection,Media,Site,json,request,uploadChunked,uploadFile} from './api';
 import PointCloudPanel,{PointCloudFile,buildFromPointCloud,mb} from './PointCloudPanel';
+import UploadedFiles from './UploadedFiles';
 import './upload.css';
 
 /** Media Upload: 1 photos & videos -> 2 point cloud (optional) -> 3 processing, for one chosen inspection.
@@ -100,6 +101,7 @@ export default function UploadPage({site,inspections,go,onChanged}:{site?:Site;i
       <small className="muted">Cancelling stops the transfer and removes the files of this batch that were already uploaded.</small></div>}
     <label className="up-check"><input type="checkbox" checked={auto} disabled={uploading} onChange={e=>{setAuto(e.target.checked);try{localStorage.setItem('aeromind.upload.auto',String(e.target.checked))}catch{/* private mode */}}}/>
      <span><b>Run detection automatically after the upload</b><small>Only the newly uploaded files are processed.</small></span></label>
+    {inspection&&<UploadedFiles inspectionId={inspection.id} media={media} disabled={uploading} onChanged={()=>{loadMedia();onChanged()}}/>}
    </Step>
 
    <Step n={2} title="Point cloud (optional)" hint="A LiDAR scan or a point cloud from other software replaces the slow photo reconstruction" done={cloudFiles.length>0}>

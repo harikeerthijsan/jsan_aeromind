@@ -1305,3 +1305,35 @@ def test_las_upload_is_converted_to_copc_and_streamed_by_range():
         assert anon.get('/'.join(parts)).status_code == 403  # expired
         assert client.post(f"/api/v1/pointclouds/{up['id']}/convert").status_code == 202  # rebuild on request
         assert client.delete(f"/api/v1/pointclouds/{up['id']}").status_code == 204
+
+def test_delete_wrongly_uploaded_files_with_their_review_work():
+    """Bulk delete of an inspection's photos: stored files, detections, reviews and approved boxes go; 3D boxes keep
+    only their other evidence; a 3D model built with a removed photo must be rebuilt before boxes are placed."""
+    import os
+    from pathlib import Path
+    from app.database import SessionLocal
+    from app.models import Detection, Job, Model3D, RegistrationCandidate, ImageReview
+    with TestClient(app) as client:
+        ins = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'wrong upload'}).json()
+        up = [client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': (f'{n}.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')}).json() for n in 'abc']
+        with SessionLocal() as db:
+            j = Job(inspection_id=ins['id'], kind='detection', status='completed', stage='detection'); db.add(j); db.flush()
+            dets = [Detection(job_id=j.id, inspection_id=ins['id'], media_id=up[i]['id'], frame_index=0, class_id=0, class_name='rru', confidence=.9,
+                              x1=0, y1=0, x2=1, y2=1, image_width=2, image_height=2, model_name='t') for i in (0, 1)]
+            db.add_all(dets); db.add(ImageReview(inspection_id=ins['id'], media_id=up[0]['id'], frame_index=0, status='approved', workflow='qc'))
+            rj = Job(inspection_id=ins['id'], kind='reconstruction', status='completed', stage='done', media_ids=[u['id'] for u in up]); db.add(rj); db.flush()
+            m3 = Model3D(inspection_id=ins['id'], job_id=rj.id, dense=False, status='completed', quality={'transform': [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}); db.add(m3); db.flush()
+            c = RegistrationCandidate(model_id=m3.id, inspection_id=ins['id'], site_id=1, class_name='rru', x=0, y=0, z=0, confidence=.8, status='needs_review',
+                                      evidence_count=2, media_count=2, point_count=10, spread=0, detection_ids=[dets[0].id, dets[1].id])
+            db.add(c); db.commit(); keep_det, cand_id, model_id = dets[1].id, c.id, m3.id
+        listed = {m['id']: m['processed'] for m in client.get(f"/api/v1/inspections/{ins['id']}/media").json()}
+        assert listed == {up[0]['id']: True, up[1]['id']: True, up[2]['id']: False}
+        path = Path(os.environ['UPLOAD_DIR']) / up[0]['storage_key']; assert path.is_file()
+        r = client.post(f"/api/v1/inspections/{ins['id']}/media/delete", json={'media_ids': [up[0]['id'], up[2]['id']]}).json()
+        assert (r['deleted'], r['detections'], r['reviews'], r['models_affected']) == (2, 1, 1, 1), r
+        assert not path.exists() and [m['id'] for m in client.get(f"/api/v1/inspections/{ins['id']}/media").json()] == [up[1]['id']]
+        with SessionLocal() as db:
+            assert db.get(RegistrationCandidate, cand_id).detection_ids == [keep_det]  # the box keeps its other evidence
+            assert db.get(Model3D, model_id).quality['photos_removed'] == 2
+        r = client.post(f'/api/v1/models/{model_id}/register-assets'); assert r.status_code == 409 and 'rebuild the 3D model' in r.json()['detail']
+        assert client.post(f"/api/v1/inspections/{ins['id']}/media/delete", json={'media_ids': [999999]}).status_code == 404
