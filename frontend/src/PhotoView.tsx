@@ -2,13 +2,13 @@ import {useEffect,useMemo,useRef,useState} from 'react';
 import {AlertTriangle,ArrowUpFromLine,ChevronLeft,ChevronRight,Eye,EyeOff,Footprints,Maximize,Ruler,Trash2} from 'lucide-react';
 import {API,Inspection,Site,json,request} from './api';
 import {Model3D,classColor} from './Reconstruction';
-import WalkView,{Pose} from './WalkView';
+import WalkView,{Pose,WalkMark} from './WalkView';
 import './photoview.css';
 
 /** Photo 3D view: the drone photos, with the 3D model's point cloud behind every pixel. A click on a photo is the 3D
  * point the camera sees there, so distances and heights are measured on the clear photo in real units. */
 type Photo={media_id:number;filename:string;url:string;width:number;height:number;angle?:number;pose?:Pose};
-type Point={x:number;y:number;z:number;height_m:number;distance_from_camera:number;snapped_px:number};
+type Point={x:number;y:number;z:number;height_m:number;distance_from_camera:number;snapped_px:number;viewer?:number[];foot?:number[]};
 type Pick={u:number;v:number;p:Point|null};
 type Measure={id:number;media_id:number;filename:string;kind:'distance'|'height';a:Pick;b?:Pick};
 type Det={id:number;media_id:number;class_name:string;confidence:number;x1:number;y1:number;x2:number;y2:number;image_width:number;image_height:number};
@@ -64,6 +64,12 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
  const f=unit==='ft'?3.28084:1,fmt=(m:number)=>`${(m*f).toFixed(2)} ${scaled?unit:'units'}`;
  const dist=(a:Point,b:Point)=>({d:Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z),h:Math.hypot(a.x-b.x,a.y-b.y),v:Math.abs(a.z-b.z)});
  const here=measures.filter(m=>m.media_id===photo?.media_id);
+ // the walk draws every measurement in 3D (taken on any photo), with the newest value in the corner
+ const marks:WalkMark[]=measures.filter(m=>m.a.p?.viewer&&(m.kind==='height'||m.b?.p?.viewer)).map(m=>m.kind==='height'
+  ?{id:m.id,kind:'height',a:m.a.p!.viewer!,foot:m.a.p!.foot,label:`${fmt(m.a.p!.height_m)} high`}
+  :{id:m.id,kind:'distance',a:m.a.p!.viewer!,b:m.b!.p!.viewer!,label:fmt(dist(m.a.p!,m.b!.p!).d)});
+ const last=measures[measures.length-1],lastResult=!last?'':last.kind==='height'?`Height ${fmt(last.a.p!.height_m)} above ground`
+  :(()=>{const r=dist(last.a.p!,last.b!.p!);return `Distance ${fmt(r.d)} · vertical ${fmt(r.v)} · horizontal ${fmt(r.h)}`})();
  const order=useMemo(()=>photos.map((p,i)=>({p,i})),[photos]);
  if(!site)return <div className="pv-empty">Select a tower first.</div>;
  return <div className="pv-page">
@@ -75,9 +81,9 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
     <button className={mode==='walk'?'on':''} onClick={()=>setMode('walk')}><Footprints size={14}/>Walk 3D</button>
     <button className={mode==='measure'?'on':''} onClick={()=>setMode('measure')}><Ruler size={14}/>Measure on photo</button>
    </div>
-   {mode==='walk'?<p className="pv-help">You stand where the drone took the photo: the photo is the backdrop and the 3D / LiDAR points are drawn over it in the same lens.
-    Step to the next photo with → / ← (the camera flies there), walk forward / back with ↑ / ↓, drag to look around, wheel to zoom. Fade the photo to see the points alone.</p>:<>
-   <div className="pv-tools">
+   {mode==='walk'&&<p className="pv-help">You stand where the drone took the photo: the photo is the backdrop and the 3D / LiDAR points are drawn over it in the same lens.
+    Step to the next photo with → / ← (the camera flies there), walk forward / back with ↑ / ↓, drag to look around, wheel to zoom. Fade the photo to see the points alone.<br/><br/>Measure with the tools at the top left of the view: Distance (click two points) or Height (click one point). Clicks snap to the structure behind the photo.</p>}
+   {mode==='measure'&&<><div className="pv-tools">
     <span>Measure</span>
     <button className={tool==='distance'?'on':''} onClick={()=>{setTool('distance');setPending(null)}}><Ruler size={14}/>Distance</button>
     <button className={tool==='height'?'on':''} onClick={()=>{setTool('height');setPending(null)}}><ArrowUpFromLine size={14}/>Height</button>
@@ -101,7 +107,8 @@ export default function PhotoView({site,inspections}:{site?:Site;inspections:Ins
      <button onClick={fit} title="Fit the photo"><Maximize size={15}/></button></span></div>
    {mode==='walk'?<div className="pv-walk">{(loading||err||!photos.length)?<div className="pv-view">{loading&&<div className="pv-msg">{loading}</div>}{err&&<div className="pv-msg error">{err}</div>}
      {!loading&&!photos.length&&!err&&<div className="pv-msg">{models.length?'This 3D model has no photos with camera positions.':'No completed 3D model for this inspection: build one on the 3D Reconstruction page.'}</div>}</div>
-    :<WalkView photos={photos} idx={idx} setIdx={setIdx} pointsUrl={model?.urls.web_points} contextUrl={model?.urls.web_context}/>}</div>:
+    :<WalkView photos={photos} idx={idx} setIdx={setIdx} pointsUrl={model?.urls.web_points} contextUrl={model?.urls.web_context}
+      tool={tool} onTool={t=>{setTool(t);setPending(null)}} marks={marks} pendingAt={pending?.p?.viewer} onPick={pick} busy={busy} note={note} result={lastResult}/>}</div>:
    <div ref={box} className={'pv-view'+(tool==='look'?'':' measuring')+(busy?' busy':'')} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}>
     {photo&&<img key={photo.media_id+(full?'f':'t')} src={full?API+photo.url:`${API}/api/v1/media/${photo.media_id}/thumb?w=1280`} onLoad={()=>!full&&setFull(true)} draggable={false} alt={photo.filename}
      style={{position:'absolute',left:view.x,top:view.y,width:photo.width*view.k,height:photo.height*view.k}}/>}

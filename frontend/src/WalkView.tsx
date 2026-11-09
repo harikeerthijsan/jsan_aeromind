@@ -1,5 +1,7 @@
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {Canvas,useFrame,useThree} from '@react-three/fiber';
+import {Html,Line} from '@react-three/drei';
+import {ArrowUpFromLine,Eye,Ruler} from 'lucide-react';
 import * as THREE from 'three';
 import {API,getAuthToken} from './api';
 import {heightRange,recolour,usePly} from './Reconstruction';
@@ -8,6 +10,9 @@ import {heightRange,recolour,usePly} from './Reconstruction';
  * 3D points drawn over it in the same lens, then step from photo to photo with the camera flying between the poses. */
 export type Pose={centre:number[];right:number[];down:number[];forward:number[];lens:number[]};  // lens: fx fy cx cy k1 k2 p1 p2
 export type WalkPhoto={media_id:number;filename:string;width:number;height:number;pose?:Pose};
+/** A measurement drawn in the walk, in the 3D viewer's frame (the page measures; the walk draws). */
+export type WalkMark={id:number;kind:'distance'|'height';a:number[];b?:number[];foot?:number[];label:string};
+export type WalkTool='distance'|'height'|'look';
 type Station={photo:WalkPhoto;pos:THREE.Vector3;quat:THREE.Quaternion;tex:THREE.Texture|null};
 
 const v3=(a:number[])=>new THREE.Vector3(a[0],a[1],a[2]);
@@ -51,7 +56,7 @@ type Look={yaw:number;pitch:number;zoom:number};
 /** Overlay colours: by height (stands out on any photo), the cloud's own colours, or one bright colour. */
 type Tint='elevation'|'rgb'|'highlight';
 const TINTS:[Tint,string][]=[['elevation','Height'],['rgb','RGB'],['highlight','Highlight']];
-function Walker({stations,cur,photoOpacity,lidar,surroundings,pointOpacity,pointSize,tint,look,onMoving,geo,ctxGeo}:{stations:Station[];cur:number;photoOpacity:number;lidar:boolean;surroundings:boolean;pointOpacity:number;pointSize:number;tint:Tint;look:React.MutableRefObject<Look>;onMoving:(b:boolean)=>void;geo:THREE.BufferGeometry|null;ctxGeo:THREE.BufferGeometry|null}){
+function Walker({stations,cur,photoOpacity,lidar,surroundings,pointOpacity,pointSize,tint,look,onMoving,toPixel,marks,pendingAt,geo,ctxGeo}:{stations:Station[];cur:number;photoOpacity:number;lidar:boolean;surroundings:boolean;pointOpacity:number;pointSize:number;tint:Tint;look:React.MutableRefObject<Look>;onMoving:(b:boolean)=>void;toPixel:React.MutableRefObject<((nx:number,ny:number)=>[number,number]|null)|null>;marks:WalkMark[];pendingAt?:number[];geo:THREE.BufferGeometry|null;ctxGeo:THREE.BufferGeometry|null}){
  const {camera,size}=useThree(),cam=camera as THREE.PerspectiveCamera;
  const radius=useMemo(()=>{if(!geo)return 50;geo.computeBoundingSphere();return geo.boundingSphere!.radius},[geo]);
  const pts=useMemo(()=>[geo,ctxGeo].map(g=>{if(!g)return null;const o=new THREE.Points(g,new THREE.PointsMaterial({size:pointSize,sizeAttenuation:false,vertexColors:!!g.getAttribute('color'),color:g.getAttribute('color')?'#ffffff':'#9fd0ff',transparent:true}));
@@ -84,10 +89,32 @@ function Walker({stations,cur,photoOpacity,lidar,surroundings,pointOpacity,point
   // look around on the spot: turn about the photo's own up and right axes
   eul.current.set(look.current.pitch,look.current.yaw,0);tmp.current.setFromEuler(eul.current);cam.quaternion.copy(base.current).multiply(tmp.current);
   const m=screen.current;if(m){const u=(m.material as THREE.ShaderMaterial).uniforms;u.map.value=st.tex;u.opacity.value=st.tex?photoOpacity*(f?Math.max(0,(k-.55)/.45):1):0}});
- return <group ref={group}>{pts.map((o,i)=>o&&<primitive key={i} object={o}/>)}</group>;
+ // a click (screen position, -1..1) -> the pixel of the photo the camera stands at: the same lens model as the backdrop
+ toPixel.current=(nx,ny)=>{const st=stations[cur],p=st?.photo.pose;if(!p||fly.current)return null;
+  const d=new THREE.Vector3(nx,ny,.5).unproject(cam).sub(cam.position).normalize(),fz=d.dot(v3(p.forward).normalize());if(fz<=1e-6)return null;
+  const x=d.dot(v3(p.right).normalize())/fz,y=d.dot(v3(p.down).normalize())/fz,[fx,fy,cx,cy,k1,k2,p1,p2]=p.lens,r2=x*x+y*y,rad=1+k1*r2+k2*r2*r2;
+  const u=fx*(x*rad+2*p1*x*y+p2*(r2+2*x*x))+cx,v=fy*(y*rad+p1*(r2+2*y*y)+2*p2*x*y)+cy;
+  return u>=0&&v>=0&&u<st.photo.width&&v<st.photo.height?[u,v]:null};
+ return <group ref={group}>{pts.map((o,i)=>o&&<primitive key={i} object={o}/>)}<Marks marks={marks} pendingAt={pendingAt}/></group>;
+}
+/** Measurements over everything: thick magenta lines and dots (they stand out on the photo and on every point colour), the value next to them. */
+const MARK='#ff3fd5';
+function Marks({marks,pendingAt}:{marks:WalkMark[];pendingAt?:number[]}){
+ const dots=useMemo(()=>{const a:number[]=[];for(const m of marks){a.push(...m.a);if(m.b)a.push(...m.b)}if(pendingAt)a.push(...pendingAt);
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(a,3));
+  const o=new THREE.Points(g,new THREE.PointsMaterial({color:MARK,size:11,sizeAttenuation:false,depthTest:false,transparent:true}));o.renderOrder=52;o.frustumCulled=false;return o},[marks,pendingAt]);
+ useEffect(()=>()=>{dots.geometry.dispose();(dots.material as THREE.Material).dispose()},[dots]);
+ const v=(p:number[]):[number,number,number]=>[p[0],p[1],p[2]];
+ const mid=(m:WalkMark):[number,number,number]=>m.b?[(m.a[0]+m.b[0])/2,(m.a[1]+m.b[1])/2,(m.a[2]+m.b[2])/2]:v(m.a);
+ return <>{marks.map(m=>m.b?<Line key={m.id} points={[v(m.a),v(m.b)]} color={MARK} lineWidth={3} depthTest={false} transparent renderOrder={51}/>
+   :m.foot?<Line key={m.id} points={[v(m.a),v(m.foot)]} color={MARK} lineWidth={2} dashed dashSize={.08} gapSize={.06} depthTest={false} transparent renderOrder={51}/>:null)}
+  <primitive object={dots}/>
+  {marks.map(m=><Html key={m.id} position={mid(m)} zIndexRange={[20,0]} style={{pointerEvents:'none'}}><span className="pw-label">{m.label}</span></Html>)}</>;
 }
 
-export default function WalkView({photos,idx,setIdx,pointsUrl,contextUrl}:{photos:WalkPhoto[];idx:number;setIdx:(i:number)=>void;pointsUrl?:string;contextUrl?:string}){
+export default function WalkView({photos,idx,setIdx,pointsUrl,contextUrl,tool,onTool,marks=[],pendingAt,onPick,busy,note,result}:{photos:WalkPhoto[];idx:number;setIdx:(i:number)=>void;pointsUrl?:string;contextUrl?:string;
+ tool:WalkTool;onTool:(t:WalkTool)=>void;marks?:WalkMark[];pendingAt?:number[];onPick?:(u:number,v:number)=>void;busy?:boolean;note?:string;result?:string}){
+ const toPixel=useRef<((nx:number,ny:number)=>[number,number]|null)|null>(null);
  const {geo,err}=usePly(pointsUrl),ctx=usePly(contextUrl);
  const [texOf,setTexOf]=useState<Record<number,THREE.Texture>>({}),[photoOpacity,setPhotoOpacity]=useState(1),[lidar,setLidar]=useState(true),[pointSize,setPointSize]=useState(1),[pointOpacity,setPointOpacity]=useState(.35),[surroundings,setSurroundings]=useState(false),[tint,setTint]=useState<Tint>('elevation'),[flying,setFlying]=useState(false);
  const look=useRef<Look>({yaw:0,pitch:0,zoom:1});
@@ -113,19 +140,32 @@ export default function WalkView({photos,idx,setIdx,pointsUrl,contextUrl}:{photo
  useEffect(()=>{const el=box.current;if(!el)return;const w=(e:WheelEvent)=>{e.preventDefault();const L=look.current;L.zoom=Math.min(12,Math.max(.5,L.zoom*Math.exp(-e.deltaY*.0015)))};
   el.addEventListener('wheel',w,{passive:false});return()=>el.removeEventListener('wheel',w)},[]);
  const turn=()=>{const st=stations[idx];return st?.photo.pose?Math.atan(st.photo.height/2/st.photo.pose.lens[1])*2/(box.current?.clientHeight||600)/look.current.zoom:.002};
- const onDown=(e:React.PointerEvent)=>{drag.current={x:e.clientX,y:e.clientY,yaw:look.current.yaw,pitch:look.current.pitch};(e.target as Element).setPointerCapture?.(e.pointerId)};
+ const onDown=(e:React.PointerEvent)=>{if((e.target as HTMLElement).closest('button'))return;drag.current={x:e.clientX,y:e.clientY,yaw:look.current.yaw,pitch:look.current.pitch};(e.target as Element).setPointerCapture?.(e.pointerId)};
+ // a click without dragging measures: the point of the photo under the cursor, snapped to the structure behind it
+ const [miss,setMiss]=useState('');
+ const onUp=(e:React.PointerEvent)=>{const d=drag.current;drag.current=null;if(!d||Math.hypot(e.clientX-d.x,e.clientY-d.y)>4||tool==='look'||!onPick||busy)return;
+  const r=box.current!.getBoundingClientRect(),px=toPixel.current?.((e.clientX-r.left)/r.width*2-1,-((e.clientY-r.top)/r.height)*2+1);
+  if(!px){setMiss(flying?'Wait for the camera to arrive.':'Click on the photo: measurements are taken on what this photo shows.');return}setMiss('');onPick(px[0],px[1])};
  const onMove=(e:React.PointerEvent)=>{const d=drag.current;if(!d)return;const k=turn();look.current.yaw=d.yaw+(e.clientX-d.x)*k;look.current.pitch=Math.max(-1.4,Math.min(1.4,d.pitch+(e.clientY-d.y)*k))};
  const missing=photos.length>0&&!ok.length,here=stations[idx],ahead=useMemo(()=>{if(!here)return [false,false];const f=new THREE.Vector3(0,0,-1).applyQuaternion(here.quat);
   return [1,-1].map(dir=>stations.some((o,i)=>{if(!o||i===idx)return false;const d=o.pos.clone().sub(here.pos),l=d.length();return l>1e-6&&d.dot(f)*dir/l>=Math.cos(THREE.MathUtils.degToRad(40))}))},[here,stations]);
  return <div className="pw-wrap">
-  <div ref={box} className="pw-view" onPointerDown={onDown} onPointerMove={onMove} onPointerUp={()=>{drag.current=null}} onDoubleClick={()=>{look.current={yaw:0,pitch:0,zoom:1}}}>
+  <div ref={box} className={'pw-view'+(tool!=='look'?' measuring':'')+(busy?' busy':'')} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onDoubleClick={()=>{look.current={yaw:0,pitch:0,zoom:1}}}>
    <Canvas camera={{fov:50,near:.01,far:1000}} gl={{antialias:true}} onCreated={({gl})=>gl.setClearColor('#0b1622')}>
-    {cur>=0&&<Walker stations={ok} cur={cur} photoOpacity={photoOpacity} lidar={lidar} surroundings={surroundings} pointOpacity={pointOpacity} pointSize={pointSize} tint={tint} look={look} onMoving={setFlying} geo={geo} ctxGeo={ctx.geo}/>}
+    {cur>=0&&<Walker stations={ok} cur={cur} photoOpacity={photoOpacity} lidar={lidar} surroundings={surroundings} pointOpacity={pointOpacity} pointSize={pointSize} tint={tint} look={look} onMoving={setFlying} toPixel={toPixel} marks={marks} pendingAt={pendingAt} geo={geo} ctxGeo={ctx.geo}/>}
    </Canvas>
    {!geo&&!err&&pointsUrl&&<div className="pv-msg">Loading the 3D points…</div>}
    {err&&<div className="pv-msg error">3D points: {err}</div>}
    {missing&&<div className="pv-msg">The camera poses are not available for these photos (the backend needs the latest update).</div>}
    {here&&!here.tex&&<div className="pw-loading">Loading photo…</div>}
+   <div className="pw-tools">
+    <button className={tool==='distance'?'on':''} onClick={()=>onTool('distance')} title="Distance: click two points"><Ruler size={14}/>Distance</button>
+    <button className={tool==='height'?'on':''} onClick={()=>onTool('height')} title="Height above the ground: click a point"><ArrowUpFromLine size={14}/>Height</button>
+    <button className={tool==='look'?'on':''} onClick={()=>onTool('look')} title="Only look around (clicks do not measure)"><Eye size={14}/>Look</button>
+    {tool!=='look'&&<span>{busy?'Measuring…':pendingAt?'Click the second point':tool==='distance'?'Click two points':'Click a point'}</span>}
+   </div>
+   {result&&<div className="pw-result">{result}</div>}
+   {(note||miss)&&<div className="pv-note">{note||miss}</div>}
    <div className="pw-hud">
     <button disabled={!ahead[1]} onClick={()=>step(-1)} title="Step back (↓ / S)">▼</button>
     <button disabled={!ahead[0]} onClick={()=>step(1)} title="Step forward, towards where the camera looks (↑ / W)">▲</button>
@@ -138,7 +178,7 @@ export default function WalkView({photos,idx,setIdx,pointsUrl,contextUrl}:{photo
    {contextUrl&&<label className="pw-check" title="Trees, ground and buildings around the structure (the photo already shows them)"><input type="checkbox" checked={surroundings} disabled={!lidar} onChange={e=>setSurroundings(e.target.checked)}/>Trees &amp; ground</label>}
    <label className="pw-range"><span>LiDAR</span><input type="range" min={.1} max={1} step={.05} value={pointOpacity} disabled={!lidar} onChange={e=>setPointOpacity(+e.target.value)}/><em>{Math.round(pointOpacity*100)}%</em></label>
    <label className="pw-range"><span>Size</span><input type="range" min={1} max={6} step={.5} value={pointSize} disabled={!lidar} onChange={e=>setPointSize(+e.target.value)}/><em>{pointSize}px</em></label>
-   <small className="pw-hint">{flying?'Moving…':'Drag to look around · wheel to zoom · double-click to reset · ← → previous / next photo · ↑ ↓ walk forward / back'}</small>
+   <small className="pw-hint">{flying?'Moving…':(tool==='look'?'':'Click to measure · ')+'Drag to look around · wheel to zoom · double-click to reset · ← → previous / next photo · ↑ ↓ walk forward / back'}</small>
   </div>
  </div>;
 }

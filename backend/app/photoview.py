@@ -123,5 +123,7 @@ def locate(model_id, model, media_id, pixels):
         V = M[:3, :3] @ model['P'][best].astype(np.float64) + M[:3, 3]
         out.append({'x': round(float(V[0]) * mpu, 3), 'y': round(float(-V[2]) * mpu, 3), 'z': round(float(V[1]) * mpu, 3),  # east, north, up
                     'height_m': round(float(V[1] - model['ground']) * mpu, 3), 'distance_from_camera': round(float(np.linalg.norm(model['P'][best] - centre)) * model['s'] * mpu, 3),
-                    'snapped_px': rad * CELL})
+                    'snapped_px': rad * CELL,
+                    # in the 3D viewer's frame (model units), with the ground point below it: the photo walk draws the measurement in 3D
+                    'viewer': [round(float(x), 5) for x in V], 'foot': [round(float(V[0]), 5), round(model['ground'], 5), round(float(V[2]), 5)]})
     return out

@@ -48,3 +48,9 @@
 .pw-range{display:inline-flex;align-items:center;gap:7px}.pw-range span{color:#8fa7ba}.pw-range input{width:110px}.pw-range em{font-style:normal;color:#8fa7ba;min-width:34px}
 .pw-hint{margin-left:auto;color:#8fa7ba;font-size:11.5px}
 .pw-range select{padding:3px 6px;border:1px solid #2d5878;border-radius:6px;background:#13283e;color:#cfe0ee;font-size:12px}
+.pw-view.measuring{cursor:crosshair}.pw-view.busy{cursor:progress}
+.pw-tools{position:absolute;left:12px;top:10px;display:flex;align-items:center;gap:5px;padding:4px;border-radius:9px;background:rgba(15,31,49,.78)}
+.pw-tools button{display:inline-flex;align-items:center;gap:5px;padding:6px 10px;border:0;border-radius:6px;background:transparent;color:#cfe0ee;font-size:12.5px;font-weight:600;cursor:pointer}
+.pw-tools button.on{background:#1769aa;color:#fff}.pw-tools span{padding:0 8px;color:#8fa7ba;font-size:11.5px}
+.pw-result{position:absolute;left:12px;top:56px;padding:6px 10px;border-radius:7px;background:rgba(15,31,49,.85);color:#ff8fe8;font-size:13px;font-weight:700}
+.pw-label{display:inline-block;transform:translate(8px,-50%);padding:2px 7px;border-radius:5px;background:rgba(15,31,49,.88);border:1px solid #ff3fd5;color:#fff;font-size:12.5px;font-weight:700;white-space:nowrap}
