@@ -19,6 +19,7 @@ from . import detector, vendor, condition, frames, reconstruct, registration, st
 from .tasks import ROOT  # uploads folder; it and the 3D/reference folders are backed by the bucket when one is configured
 from . import auth
 from . import pointcloud as pointcloud_mod
+from . import photoview
 MAX_SIZE = int(os.getenv('MAX_UPLOAD_BYTES', str(500 * 1024 * 1024)))
 ALLOWED = {'image/jpeg':'.jpg','image/png':'.png','image/tiff':'.tif','video/mp4':'.mp4','video/quicktime':'.mov'}  # stored extension comes from the checked type, never the client's filename
 WORKFLOWS = {'ai_detection','manual_qc'}
@@ -1093,6 +1094,34 @@ def review_registrations(model_id:int,data:RegistrationBulkReviewIn,db:Session=D
     for row in rows:row.status=status
     db.commit();all_rows=db.scalars(select(RegistrationCandidate).where(RegistrationCandidate.model_id==model_id).order_by(RegistrationCandidate.class_name,RegistrationCandidate.id)).all()
     return {'model_id':model_id,'updated_count':len(rows),'status':status,'candidates':[to_dict(row) for row in all_rows]}
+# ---------- Photo 3D view: measure on the drone photos, the 3D model's point cloud behind every pixel ----------
+def _photo_model(db,model_id):
+    m=db.get(Model3D,model_id)
+    if not m or m.status!='completed' or m.job_id is None:raise HTTPException(404,'Completed 3D model not found')
+    q=m.quality or {};job=db.get(Job,m.job_id);built=set(job.media_ids or []) if job else set()
+    items=db.scalars(select(Media).where(Media.inspection_id==m.inspection_id,Media.parent_media_id.is_(None))).all()
+    photos=sorted([x for x in items if x.content_type.startswith('image/') and (not built or x.id in built)],key=lambda x:(x.filename.lower(),x.id))  # the build's naming order
+    work=reconstruct.RECON_DIR/(q.get('source_model_dir') or f'{m.inspection_id}_{m.job_id}')
+    dense=reconstruct.RECON_DIR/f'{m.inspection_id}_{m.job_id}'/((q.get('files') or {}).get('dense_ply') or 'dense/fused.ply')
+    try:
+        if model_id not in photoview._models:
+            storage.fetch_tree(work/'sparse');storage.fetch(dense)  # built on the GPU worker: the camera model and the cloud
+        return m,photoview.load(model_id,work,dense,q,photos)
+    except photoview.Unavailable as e:raise HTTPException(409,str(e))
+@app.get('/api/v1/models/{model_id}/photos')
+def model_photos(model_id:int,db:Session=Depends(get_db)):
+    """The model's photos that have a camera position, in order around the structure."""
+    m,pm=_photo_model(db,model_id)
+    return {'model_id':m.id,'inspection_id':m.inspection_id,'scaled':pm['mpu'] is not None,'photos':photoview.cameras(pm)}
+class LocateIn(BaseModel):
+    points:list[list[float]]=Field(min_length=1,max_length=50)
+@app.post('/api/v1/models/{model_id}/photos/{media_id}/locate')
+def locate_on_photo(model_id:int,media_id:int,data:LocateIn,db:Session=Depends(get_db)):
+    """Photo pixels (full resolution) -> 3D points from the point cloud: x east, y north, z up, height above ground;
+    metres when the model has a real-world scale."""
+    m,pm=_photo_model(db,model_id)
+    try:return {'scaled':pm['mpu'] is not None,'points':photoview.locate(model_id,pm,media_id,[p[:2] for p in data.points])}
+    except photoview.Unavailable as e:raise HTTPException(409,str(e))
 @app.post('/api/v1/models/{model_id}/register-assets')
 def register_assets(model_id:int):
     """Create conservative, review-only 3D candidates from high-confidence 2D boxes and COLMAP feature tracks."""

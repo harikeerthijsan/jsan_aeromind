@@ -1,0 +1,36 @@
+/* Photo 3D view */
+.pv-page{display:grid;grid-template-columns:290px minmax(0,1fr);gap:16px;min-height:calc(100vh - 230px)}
+.pv-side{display:flex;flex-direction:column;gap:12px;padding:16px;border:1px solid #e3e9ee;border-radius:14px;background:#fff}
+.pv-field{display:flex;flex-direction:column;gap:5px}.pv-field span,.pv-tools>span,.pv-row>span{color:#7b8d9b;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.pv-field select{padding:8px 10px;border:1px solid #dce4e9;border-radius:8px;background:#fff;font-size:13px;color:#2b465b}
+.pv-tools{display:flex;flex-wrap:wrap;align-items:center;gap:6px}.pv-tools>span{width:100%}
+.pv-tools button{display:inline-flex;align-items:center;gap:5px;padding:7px 11px;border:1px solid #dce4e9;border-radius:8px;background:#fff;color:#516a7c;font-size:12.5px;font-weight:600;cursor:pointer}
+.pv-tools button.on{background:#1769aa;border-color:#1769aa;color:#fff}
+.pv-help{margin:0;color:#6e8394;font-size:12px;line-height:1.45}
+.pv-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pv-seg{display:inline-flex;padding:2px;border:1px solid #dce4e9;border-radius:7px}.pv-seg button{padding:3px 10px;border:0;border-radius:5px;background:none;font-size:12px;cursor:pointer;color:#516a7c}.pv-seg button.on{background:#1769aa;color:#fff}
+.pv-link{display:inline-flex;align-items:center;gap:4px;border:0;background:none;color:#1769aa;font-size:12px;cursor:pointer;padding:0}
+.pv-warn{display:flex;gap:7px;padding:8px 10px;border-radius:8px;background:#fff7e6;color:#966506;font-size:12px}
+.pv-list{display:flex;flex-direction:column;gap:6px;min-height:0;overflow:auto}
+.pv-list-head{display:flex;justify-content:space-between;align-items:center}.pv-list-head b{font-size:13px;color:#2b465b}
+.pv-item{position:relative;display:grid;gap:1px;padding:8px 28px 8px 10px;border:1px solid #e9eef2;border-radius:8px;cursor:pointer;background:#fbfcfd}
+.pv-item.here{border-color:#9cc5e8;background:#eef5fb}.pv-item b{font-size:14px;color:#1d2f40}.pv-item small{color:#6e8394;font-size:11.5px}.pv-item em{color:#9aa8b3;font-size:10.5px;font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv-item button{position:absolute;right:6px;top:7px;border:0;background:none;color:#9aa8b3;cursor:pointer}
+.pv-main{display:flex;flex-direction:column;min-width:0;border-radius:14px;overflow:hidden;background:#0f1f31;border:1px solid #1d3550}
+.pv-bar{display:flex;align-items:center;gap:10px;padding:9px 14px;color:#cfe0ee;border-bottom:1px solid #1d3550}.pv-bar b{font-size:13px}.pv-bar small{color:#8fa7ba;font-size:11.5px}
+.pv-bar-tools{margin-left:auto;display:flex;gap:4px}.pv-bar-tools button{display:grid;place-items:center;width:30px;height:28px;border:1px solid #2d5878;border-radius:6px;background:transparent;color:#cfe0ee;cursor:pointer}.pv-bar-tools button:disabled{opacity:.35;cursor:default}
+.pv-view{position:relative;flex:1;min-height:420px;overflow:hidden;cursor:grab;touch-action:none;user-select:none}
+.pv-view.measuring{cursor:crosshair}.pv-view.busy{cursor:progress}
+.pv-view img{pointer-events:none;image-rendering:auto}
+.pv-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.pv-line{stroke:#ffd84a;stroke-width:2.5}.pv-pt{fill:#ffd84a;stroke:#1d2f40;stroke-width:1.5}.pv-pt.pending{fill:#42c8ff}
+.pv-label{fill:#fff;font-size:14px;font-weight:700;paint-order:stroke;stroke:#0f1f31;stroke-width:4px}
+.pv-msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 14px;border-radius:8px;background:rgba(15,31,49,.85);color:#cfe0ee;font-size:13px;text-align:center;max-width:70%}
+.pv-msg.error{color:#ffb4a8}
+.pv-note{position:absolute;left:12px;bottom:12px;padding:6px 10px;border-radius:7px;background:rgba(255,247,230,.95);color:#966506;font-size:12px}
+.pv-strip{display:flex;gap:6px;padding:8px;overflow-x:auto;border-top:1px solid #1d3550;background:#0c1a29}
+.pv-strip button{position:relative;flex:none;width:96px;height:72px;padding:0;border:2px solid transparent;border-radius:6px;overflow:hidden;background:#13283e;cursor:pointer}
+.pv-strip button.on{border-color:#42c8ff}.pv-strip img{width:100%;height:100%;object-fit:cover}
+.pv-strip i{position:absolute;right:4px;top:4px;width:8px;height:8px;border-radius:50%;background:#ffd84a}
+.pv-empty{padding:40px;color:#6e8394}
+@media(max-width:900px){.pv-page{grid-template-columns:1fr}}

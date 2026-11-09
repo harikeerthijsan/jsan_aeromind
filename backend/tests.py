@@ -1,4 +1,4 @@
-import pytest, time
+import math, pytest, time
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -1361,3 +1361,27 @@ def test_tower_type_picks_the_detection_model(monkeypatch, tmp_path):
         ins2 = client.post('/api/v1/inspections', json={'site_id': 1, 'label': 'lattice default'}).json()  # site 1 is a lattice tower
         client.post(f"/api/v1/inspections/{ins2['id']}/media", files={'file': ('b.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg')})
         client.post(f"/api/v1/inspections/{ins2['id']}/process"); assert used[-1] == 'lattice'
+
+def test_photo_view_measures_through_the_photo(tmp_path):
+    """Photo 3D view: a click on a photo is the 3D point the camera sees there (nearest surface, snapped to the
+    structure), in metres with its height above the ground."""
+    np = pytest.importorskip('numpy')
+    from types import SimpleNamespace as NS
+    from app import photoview, photo_pose, reconstruct
+    rng = np.random.default_rng(0)
+    ground = np.c_[rng.uniform(-10, 10, (40000, 2)), np.zeros(40000)]
+    pole = np.c_[rng.normal(0, .05, (20000, 2)), rng.uniform(0, 12, 20000)]  # a 12 m pole at the origin
+    P = np.r_[ground, pole]; work = tmp_path / '1_1'; (work / 'dense').mkdir(parents=True)
+    reconstruct.write_ply(work / 'dense' / 'fused.ply', P.astype(np.float32), np.full((len(P), 3), 128, np.uint8))
+    C = np.array([0, -20.0, 6]); R = np.vstack([[1, 0, 0], [0, 0, -1], [0, 1, 0]])  # looking north at the pole, level
+    meta = {'w': 2000, 'h': 1500, 'fx': 1500.0, 'fy': 1500.0, 'cx': 1000.0, 'cy': 750.0, 'k': [0, 0, 0, 0]}
+    photo_pose.write_text_model(work / 'sparse' / '0', [{'R': R, 'C': C, 'meta': meta}], ['photos/00000.jpg'])
+    M = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1.0]])  # z up -> viewer y up, metres
+    pm = photoview.load(991, work, work / 'dense' / 'fused.ply', {'transform': M.tolist(), 'scale': {'m_per_unit': 1.0}}, [NS(id=5, filename='a.jpg', storage_key='a.jpg')])
+    assert [c['media_id'] for c in photoview.cameras(pm)] == [5]
+    def pixel(X): Xc = R @ (np.asarray(X, float) - C); return [1000 + 1500 * Xc[0] / Xc[2], 750 + 1500 * Xc[1] / Xc[2]]
+    top, base, sky = photoview.locate(991, pm, 5, [pixel([0, 0, 11]), [pixel([0, 0, 1])[0] + 15, pixel([0, 0, 1])[1]], [1000, 5]])
+    assert abs(top['height_m'] - 11) < .3 and abs(top['y']) < .3 and abs(top['distance_from_camera'] - 20.6) < .5
+    assert abs(base['height_m'] - 1) < .3 and base['snapped_px'] > 0  # 15 px beside the pole: snapped onto it, not the field behind
+    assert sky is None
+    assert abs(math.dist([top['x'], top['y'], top['z']], [base['x'], base['y'], base['z']]) - 10) < .5
