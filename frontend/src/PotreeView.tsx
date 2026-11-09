@@ -155,7 +155,7 @@ export default function PotreeView({clouds,transform,origin,view,markers,selecte
     if(m&&!e.shiftKey){onPick?.(m.id);focus(m);return}zoomAt(st,e.clientX-r.left,e.clientY-r.top,e.shiftKey?ZOOM_OUT:ZOOM_IN)}}>
   <div ref={host} style={{position:'absolute',inset:0}}/>
   {hover&&<div style={{position:'absolute',left:hover.x+14,top:hover.y+10,pointerEvents:'none',zIndex:7,padding:'6px 9px',borderRadius:8,background:'rgba(255,255,255,.95)',color:'#1d2f40',fontSize:12,boxShadow:'0 4px 14px rgba(0,0,0,.25)'}}><strong>{hover.m.class_name.replaceAll('_',' ')}</strong><br/><small>{hover.m.media_count} images · {Math.round(hover.m.confidence*100)}%</small></div>}
-  {loaded>0&&<ViewToolbar orthographic mode={mode} onView={v=>{const st=state.current;if(st){setView(st.viewer,v);setMode(v)}}} pan={pan} onPan={()=>setPan(p=>!p)}
+  {loaded>0&&<ViewToolbar orthographic mode={mode} onView={v=>{const st=state.current;if(st){setView(st.viewer,v);setMode(v)}}} pan={pan} onPan={setPan}
    onFit={()=>{const st=state.current;if(st){isolate(null);st.viewer.fitToScreen(.8)}}} canFocus={!!sel} onFocus={()=>sel&&focus(sel)}
    isolated={isolated!=null} onIsolate={()=>isolate(isolated!=null?null:sel||null)} size={size} onSize={setSize}
    colour={colour} onColour={setColour} colours={{rgb:true,elevation:true,intensity:true}}/>}

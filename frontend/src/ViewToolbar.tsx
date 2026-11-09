@@ -14,7 +14,7 @@ export const navHint=(pan:boolean)=>(pan?'Left-drag: pan · Right-drag: rotate �
  +' · Double-click: zoom in on a spot (Shift: out) · Double-click a box: focus it';
 
 export default function ViewToolbar({mode,onView,pan,onPan,onFit,canFocus,onFocus,isolated,onIsolate,size,onSize,orthographic=false,hint=true,colour,onColour,colours}:{mode:ViewMode;onView:(m:ViewMode)=>void;
- pan:boolean;onPan:()=>void;onFit:()=>void;canFocus:boolean;onFocus:()=>void;isolated:boolean;onIsolate:()=>void;size?:number;onSize?:(v:number)=>void;orthographic?:boolean;hint?:boolean;
+ pan:boolean;onPan:(pan:boolean)=>void;onFit:()=>void;canFocus:boolean;onFocus:()=>void;isolated:boolean;onIsolate:()=>void;size?:number;onSize?:(v:number)=>void;orthographic?:boolean;hint?:boolean;
  colour?:ColourMode;onColour?:(c:ColourMode)=>void;colours?:Partial<Record<ColourMode,true|string>>}){
  const stop={onPointerDown:(e:React.PointerEvent)=>e.stopPropagation(),onPointerUp:(e:React.PointerEvent)=>e.stopPropagation(),onDoubleClick:(e:React.MouseEvent)=>e.stopPropagation()};
  return <div {...stop} style={{position:'absolute',right:12,top:12,zIndex:6,maxWidth:'calc(100% - 200px)',display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4}}>
@@ -22,7 +22,8 @@ export default function ViewToolbar({mode,onView,pan,onPan,onFit,canFocus,onFocu
    {(['3d','top','front','side'] as ViewMode[]).map(v=><button key={v} type="button" onClick={()=>onView(v)} style={btn(mode===v)}
     title={v==='3d'?'Perspective 3D view':`${v[0].toUpperCase()+v.slice(1)} view${orthographic?' (orthographic)':''}`}>{v==='3d'?'3D':v[0].toUpperCase()+v.slice(1)}</button>)}
    {sep}
-   <button type="button" title="Orbit: left-drag rotates around the focus. Pan: left-drag moves, right-drag rotates" onClick={onPan} style={btn(false)}>{pan?'Pan':'Orbit'}</button>
+   <button type="button" title="Orbit: left-drag rotates around the focus point" onClick={()=>onPan(false)} style={btn(!pan)}>Orbit</button>
+   <button type="button" title="Pan: left-drag moves the view, right-drag rotates" onClick={()=>onPan(true)} style={btn(pan)}>Pan</button>
    <button type="button" title="Show the whole model" onClick={onFit} style={btn(false)}>Fit</button>
    <button type="button" disabled={!canFocus} title="Zoom onto the selected box" onClick={onFocus} style={btn(false,!canFocus)}>Focus</button>
    <button type="button" disabled={!canFocus&&!isolated} title="Close-up: show only the selected box and 1.5 m around it" onClick={onIsolate} style={btn(isolated,!canFocus&&!isolated)}>{isolated?'Show all':'Isolate'}</button>

@@ -1,30 +1,33 @@
-import {useState} from 'react';
+import {useEffect,useState} from 'react';
 import {ArrowRight,CalendarDays,CheckCircle2,Clock3,Cpu,RadioTower,Search,UploadCloud} from 'lucide-react';
 import {Inspection,Job,Site} from './api';
 import './inspections.css';
 
-type Props={inspections:Inspection[];sites:Site[];jobs:Job[];go:(page:string)=>void;selectSite:(id:number)=>void};
+type Props={inspections:Inspection[];sites:Site[];jobs:Job[];go:(page:string)=>void;selectSite:(id:number)=>void;site?:Site};
 const inspectionCode=(id:number)=>`INS-${String(id).padStart(4,'0')}`;
 
-export default function InspectionsPage({inspections,sites,jobs,go,selectSite}:Props){
- const [query,setQuery]=useState(''),[siteId,setSiteId]=useState('all');
+export default function InspectionsPage({inspections,sites,jobs,go,selectSite,site:current}:Props){
+ // follows the tower picked at the top of the app; "All tower sites" here shows every tower
+ const [query,setQuery]=useState(''),[siteId,setSiteId]=useState(current?String(current.id):'all');
+ useEffect(()=>{if(current)setSiteId(String(current.id))},[current?.id]);
+ const scoped=siteId==='all'?inspections:inspections.filter(i=>i.site_id===+siteId),ids=new Set(scoped.map(i=>i.id)),scopedJobs=jobs.filter(j=>ids.has(j.inspection_id));
  const siteOf=(inspection:Inspection)=>sites.find(site=>site.id===inspection.site_id);
  const jobOf=(inspection:Inspection)=>jobs.filter(job=>job.inspection_id===inspection.id).sort((a,b)=>b.id-a.id)[0]||null;
- const active=jobs.filter(job=>['queued','running','awaiting_worker'].includes(job.status)).length;
- const completed=new Set(jobs.filter(job=>job.status==='completed').map(job=>job.inspection_id)).size;
- const rows=[...inspections].sort((a,b)=>new Date(b.created_at).getTime()-new Date(a.created_at).getTime()).filter(inspection=>{const site=siteOf(inspection),text=`${inspectionCode(inspection.id)} ${inspection.label} ${site?.code||''} ${site?.name||''}`.toLowerCase();return(!query||text.includes(query.toLowerCase()))&&(siteId==='all'||inspection.site_id===+siteId)});
+ const active=scopedJobs.filter(job=>['queued','running','awaiting_worker'].includes(job.status)).length;
+ const completed=new Set(scopedJobs.filter(job=>job.status==='completed').map(job=>job.inspection_id)).size;
+ const rows=[...scoped].sort((a,b)=>new Date(b.created_at).getTime()-new Date(a.created_at).getTime()).filter(inspection=>{const site=siteOf(inspection),text=`${inspectionCode(inspection.id)} ${inspection.label} ${site?.code||''} ${site?.name||''}`.toLowerCase();return(!query||text.includes(query.toLowerCase()))&&(siteId==='all'||inspection.site_id===+siteId)});
  const open=(inspection:Inspection,page:string)=>{selectSite(inspection.site_id);go(page)};
  const jobLabel=(job:Job|null)=>!job?'Not started':job.status==='awaiting_worker'?'Waiting for worker':job.status.replaceAll('_',' ');
  return <div className="is-page">
   <section className="is-summary">
-   <div><span className="is-summary-icon blue"><CalendarDays size={18}/></span><span><small>Total inspections</small><b>{inspections.length}</b></span></div>
+   <div><span className="is-summary-icon blue"><CalendarDays size={18}/></span><span><small>Total inspections</small><b>{scoped.length}</b></span></div>
    <div><span className="is-summary-icon amber"><Cpu size={18}/></span><span><small>Active jobs</small><b>{active}</b></span></div>
    <div><span className="is-summary-icon green"><CheckCircle2 size={18}/></span><span><small>Processed</small><b>{completed}</b></span></div>
   </section>
 
   <section className="is-panel">
-   <div className="is-panel-head"><div><h2>Inspection campaigns</h2><p>Survey records across all tower sites</p></div><span>{rows.length} shown</span></div>
-   <div className="is-toolbar"><label><Search size={15}/><input value={query} onChange={event=>setQuery(event.target.value)} placeholder="Search inspections"/></label><select value={siteId} onChange={event=>setSiteId(event.target.value)} aria-label="Filter by tower site"><option value="all">All tower sites</option>{sites.map(site=><option value={site.id} key={site.id}>{site.code} · {site.name}</option>)}</select></div>
+   <div className="is-panel-head"><div><h2>Inspection campaigns</h2><p>{siteId==='all'?'Survey records across all tower sites':`Survey records of ${sites.find(s=>s.id===+siteId)?.code||'this tower'}`}</p></div><span>{rows.length} shown</span></div>
+   <div className="is-toolbar"><label><Search size={15}/><input value={query} onChange={event=>setQuery(event.target.value)} placeholder="Search inspections"/></label><select value={siteId} onChange={event=>{const v=event.target.value;setSiteId(v);if(v!=='all')selectSite(+v)}} aria-label="Filter by tower site"><option value="all">All tower sites</option>{sites.map(site=><option value={site.id} key={site.id}>{site.code} · {site.name}</option>)}</select></div>
    <div className="is-table-wrap"><table className="is-table"><thead><tr><th>Inspection</th><th>Tower site</th><th>Created</th><th>Workflow</th><th></th></tr></thead><tbody>{rows.map(inspection=>{const site=siteOf(inspection),job=jobOf(inspection),live=!!job&&['queued','running','awaiting_worker'].includes(job.status),done=job?.status==='completed';return <tr key={inspection.id}>
     <td><div className="is-inspection"><span><UploadCloud size={16}/></span><div><b>{inspection.label}</b><small>{inspectionCode(inspection.id)}</small></div></div></td>
     <td><b className="is-site"><RadioTower size={13}/>{site?.code||`Site ${inspection.site_id}`}</b><small>{site?.name||'Unknown tower'}{site?.region?` · ${site.region}`:''}</small></td>

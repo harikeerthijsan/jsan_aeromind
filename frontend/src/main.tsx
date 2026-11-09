@@ -25,7 +25,7 @@ function App(){const location=useLocation(),navigate=useNavigate();const page=lo
  {page==='profile'&&<ProfilePage user={authUser} sites={sites} inspections={inspections} jobs={jobs} go={go} onUserChange={setAuthUser}/>}
  {page==='projects'&&<SitesPage go={go} selectSite={id=>{setSelectedSite(id);setSelectedAsset(null)}} onChanged={load} addSignal={addTower} canManage={canManage}/>}
  {page==='tower'&&<TowerDetailPage site={site} inspections={inspections} assets={filteredAssets} canInspect={canInspect} canManage={canManage} go={go} onCreateInspection={createInspection}/>}
- {page==='inspections'&&<InspectionsPage inspections={inspections} sites={sites} jobs={jobs} go={go} selectSite={id=>{setSelectedSite(id);setSelectedAsset(null)}}/>}
+ {page==='inspections'&&<InspectionsPage inspections={inspections} sites={sites} site={site} jobs={jobs} go={go} selectSite={id=>{setSelectedSite(id);setSelectedAsset(null)}}/>}
  {page==='upload'&&<UploadPage site={site} inspections={inspections} go={go} onChanged={load}/>}
  {page==='processing'&&<ProcessingPage jobs={jobs} inspections={inspections} sites={sites} onRefresh={load} go={go} selectSite={id=>{setSelectedSite(id);setSelectedAsset(null)}}/>}
  {page==='twin'&&<DigitalTwin site={site} inspections={inspections} assets={filteredAssets} selected={selected||null} onPick={setSelectedAsset} onOpenAssets={()=>go('assets')} readOnly={!canInspect}/>}
