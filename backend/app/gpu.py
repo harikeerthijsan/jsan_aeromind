@@ -82,12 +82,14 @@ def call(name, timeout=None, **args):
     if not online(): raise HTTPException(503, 'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
     from .models import WorkerTask
     tid = submit(name, args); deadline = time.monotonic() + (timeout or CALL_TIMEOUT)
+    while time.monotonic() < deadline:  # a short session per look: a long wait must not keep a database connection
+        time.sleep(.4)
+        with _session() as db:
+            t = db.get(WorkerTask, tid); status, result, error = t.status, t.result, t.error
+        if status == 'done': return result
+        if status == 'failed':
+            e = error or {}; raise HTTPException(int(e.get('status') or 500), e.get('detail') or 'GPU worker task failed')
     with _session() as db:
-        while time.monotonic() < deadline:
-            time.sleep(.4); db.expire_all(); t = db.get(WorkerTask, tid)
-            if t.status == 'done': return t.result
-            if t.status == 'failed':
-                e = t.error or {}; raise HTTPException(int(e.get('status') or 500), e.get('detail') or 'GPU worker task failed')
         t = db.get(WorkerTask, tid)
         if t.status in ('queued', 'running'): t.status, t.error = 'failed', {'status': 504, 'detail': 'timed out waiting for the GPU worker'}; db.commit()
     raise HTTPException(504, 'The GPU worker did not answer in time')

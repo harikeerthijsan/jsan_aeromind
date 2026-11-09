@@ -562,12 +562,15 @@ def convert_pointcloud(file_id:int,background:BackgroundTasks,db:Session=Depends
     if colmap_state()=='worker_offline' and gpu.REMOTE:raise HTTPException(503,'The GPU worker is offline: start backend/run-worker.ps1 on the GPU machine')
     queue_copc(background,db,x);return _pc_dict(x)
 @app.get('/api/v1/copc/{file_id}/{exp}/{sig}/{name}')
-def copc_file(file_id:int,exp:int,sig:str,name:str,request:Request,db:Session=Depends(get_db)):
-    """The COPC by byte range (public route: the signature in the link is the permission)."""
+def copc_file(file_id:int,exp:int,sig:str,name:str,request:Request):
+    """The COPC by byte range (public route: the signature in the link is the permission). Potree sends dozens of range
+    requests at once: the database is only asked for the file's key, and the connection is back in the pool before the
+    bytes stream (holding one per stream used up the pool and stalled the whole app)."""
     if exp<time.time() or not hmac.compare_digest(sig,_copc_sig(file_id,exp)):raise HTTPException(403,'This point cloud link has expired: reload the page')
-    x=db.get(PointCloudFile,file_id)
-    if not x or not x.copc_key:raise HTTPException(404,'Point cloud not found')
-    path=ROOT/x.copc_key;cache={'Cache-Control':'private, max-age=3600'}
+    with SessionLocal() as db:
+        x=db.get(PointCloudFile,file_id);key=x.copc_key if x else None
+    if not key:raise HTTPException(404,'Point cloud not found')
+    path=ROOT/key;cache={'Cache-Control':'private, max-age=3600'}
     if path.is_file():return FileResponse(path,media_type='application/octet-stream',headers=cache)
     found=storage.stream(path,request.headers.get('range'))
     if not found:raise HTTPException(404,'Point cloud file not found in storage')
@@ -1103,10 +1106,13 @@ def _photo_model(db,model_id):
     photos=sorted([x for x in items if x.content_type.startswith('image/') and (not built or x.id in built)],key=lambda x:(x.filename.lower(),x.id))  # the build's naming order
     work=reconstruct.RECON_DIR/(q.get('source_model_dir') or f'{m.inspection_id}_{m.job_id}')
     dense=reconstruct.RECON_DIR/f'{m.inspection_id}_{m.job_id}'/((q.get('files') or {}).get('dense_ply') or 'dense/fused.ply')
+    from types import SimpleNamespace
+    photos=[SimpleNamespace(id=x.id,filename=x.filename,storage_key=x.storage_key) for x in photos];q=dict(q)
+    m=SimpleNamespace(id=m.id,inspection_id=m.inspection_id);db.close()  # the connection goes back to the pool before the slow part
     try:
         if model_id not in photoview._models:
             storage.fetch_tree(work/'sparse');storage.fetch(dense)  # built on the GPU worker: the camera model and the cloud
-        return m,photoview.load(model_id,work,dense,q,photos)
+        return m,photoview.load(model_id,work,dense,q,photos)  # q, photos: plain copies (the session is closed)
     except photoview.Unavailable as e:raise HTTPException(409,str(e))
 @app.get('/api/v1/models/{model_id}/photos')
 def model_photos(model_id:int,db:Session=Depends(get_db)):
