@@ -316,20 +316,49 @@ def sites_overview(db:Session=Depends(get_db)):
             'models':models.get(i,0),'dense_models':dense.get(i,0),'boxes_3d':boxes.get(i,0),'jobs_running':running.get(i,0)}})
     return out
 THUMB_DIR=ROOT/'.thumbs'  # small cached JPEGs for cards (drone originals are ~15 MB); regenerated on demand, never pushed to the bucket
+THUMB_SIZES=(200,480,1280)  # what the pages ask for (film strips, cards, photo viewers): made together from one download
+_thumb_gate:'asyncio.Semaphore|None'=None  # a few builds at a time; waiting requests hold no thread and no database connection
+_thumb_building:dict[int,'asyncio.Future']={}  # photo -> the build in progress: it makes every size, other requests wait for it
+def _make_thumbs(media_id:int,src:Path,w:int):
+    """The requested size and the standard ones still missing, from one decode. JPEG draft mode decodes straight at
+    1/2, 1/4 or 1/8 scale, several times faster than decoding a 20-megapixel photo in full."""
+    from PIL import Image,ImageOps
+    want=sorted({w,*(s for s in THUMB_SIZES if not (THUMB_DIR/f'{media_id}_{s}.jpg').is_file())},reverse=True)
+    THUMB_DIR.mkdir(parents=True,exist_ok=True)
+    with Image.open(src) as im:
+        big=max(im.size);im.draft('RGB',(math.ceil(im.size[0]*want[0]/big),math.ceil(im.size[1]*want[0]/big)))
+        im=ImageOps.exif_transpose(im).convert('RGB')
+        for s in want:  # largest first, each from the one before
+            im.thumbnail((s,s));out=THUMB_DIR/f'{media_id}_{s}.jpg';tmp=out.with_suffix(f'.{uuid.uuid4().hex}.part')
+            im.save(tmp,'JPEG',quality=82,optimize=True);os.replace(tmp,out)
 @app.get('/api/v1/media/{media_id}/thumb')
-def media_thumb(media_id:int,w:int=Query(480,ge=120,le=1280),db:Session=Depends(get_db)):
-    m=db.get(Media,media_id)
-    if not m or not m.content_type.startswith('image/'):raise HTTPException(404,'Image not found')
+async def media_thumb(media_id:int,w:int=Query(480,ge=120,le=1280)):
+    """A small JPEG of a photo. A thumbnail already made is served without the database; a new one reads the file's
+    key, gives the connection back, then downloads and resizes (holding a connection through that used up the pool
+    when a page asked for many photos at once, and every other request then failed)."""
+    import asyncio
+    global _thumb_gate
     out=THUMB_DIR/f'{media_id}_{w}.jpg'
-    if not out.is_file():
-        src=storage.fetch(ROOT/m.storage_key)
-        if not src.is_file():raise HTTPException(404,'Image file not found')
-        from PIL import Image,ImageOps
-        THUMB_DIR.mkdir(parents=True,exist_ok=True);tmp=out.with_suffix(f'.{uuid.uuid4().hex}.part')
-        with Image.open(src) as im:
-            im=ImageOps.exif_transpose(im);im.thumbnail((w,w));im.convert('RGB').save(tmp,'JPEG',quality=82,optimize=True)
-        os.replace(tmp,out)
-    return FileResponse(out,media_type='image/jpeg',headers={'Cache-Control':'public, max-age=86400'})
+    if out.is_file():return FileResponse(out,media_type='image/jpeg',headers={'Cache-Control':'private, max-age=86400'})
+    def key_of():
+        with SessionLocal() as db:
+            m=db.get(Media,media_id);return m.storage_key if m and m.content_type.startswith('image/') else None
+    key=await run_in_threadpool(key_of)
+    if not key:raise HTTPException(404,'Image not found')
+    while not out.is_file():
+        running=_thumb_building.get(media_id)
+        if running:
+            await asyncio.shield(running);continue  # the build in progress makes this size too (or failed: try again below)
+        fut=_thumb_building[media_id]=asyncio.get_running_loop().create_future()
+        try:
+            _thumb_gate=_thumb_gate or asyncio.Semaphore(int(os.getenv('THUMB_WORKERS','4')))
+            async with _thumb_gate:
+                src=await run_in_threadpool(storage.fetch,ROOT/key)
+                if not src.is_file():raise HTTPException(404,'Image file not found')
+                await run_in_threadpool(_make_thumbs,media_id,src,w)
+        finally:
+            _thumb_building.pop(media_id,None);fut.set_result(None)
+    return FileResponse(out,media_type='image/jpeg',headers={'Cache-Control':'private, max-age=86400'})
 def _cover(db,inspection_id):
     """First photo of an inspection in capture order: the picture shown on its cards."""
     return db.scalar(select(Media.id).where(Media.inspection_id==inspection_id,Media.parent_media_id.is_(None),Media.content_type.like('image/%')).order_by(func.lower(Media.filename),Media.id).limit(1))
