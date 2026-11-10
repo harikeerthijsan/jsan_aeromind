@@ -669,7 +669,7 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
     for c in out: c.pop('_centre', None); c.pop('_score', None)
     # voting needs many photos agreeing on many points, so it places the big things (antennas, cabinets); everything
     # else that was detected (bolts, clamps, brackets, cables, ladders, ...) is placed from the detections themselves
-    fill = _fill_in(V, out, shots, by_media, poses, cameras, to_view, s, axis_near, progress)
+    fill = _fill_in(V, out, shots, by_media, poses, cameras, to_view, s, axis_near, progress, snap=(votes, ratio, cid))
     # a voted box holding two or more separate objects of its class (a mast's whole antenna head) gives way to them
     def holds(b, c):
         d = np.asarray(c['position'], float) - np.asarray(b['position'], float); yw = b.get('yaw') or 0.0
@@ -757,6 +757,47 @@ def _group_fill(rs):
     for i, g in enumerate(groups): merged[root(i)] += g
     return list(merged.values())
 
+GROUND_CLASSES = {'cabinets', 'Foundation', 'Security Fence'}  # stand on the ground: placed on it
+TRI_MAX_RESIDUAL_M = .6   # a group whose detections' viewing rays miss their meeting point by more than this keeps its anchors
+
+def _ray(pose, cam, u, v):
+    """Camera centre and unit viewing direction (model frame) through pixel (u, v), lens distortion removed."""
+    import numpy as np
+    model, p = cam[0], cam[1]
+    if model in ('SIMPLE_PINHOLE', 'SIMPLE_RADIAL', 'RADIAL', 'SIMPLE_RADIAL_FISHEYE', 'RADIAL_FISHEYE'):
+        fx = fy = p[0]; cx, cy = p[1], p[2]; k1 = p[3] if len(p) > 3 else 0.0; k2 = p[4] if len(p) > 4 else 0.0; p1 = p2 = 0.0
+    elif model == 'PINHOLE': fx, fy, cx, cy = p[:4]; k1 = k2 = p1 = p2 = 0.0
+    else: fx, fy, cx, cy = p[:4]; k1, k2, p1, p2 = (list(p[4:8]) + [0.0] * 4)[:4]
+    xd, yd = (u - cx) / fx, (v - cy) / fy; x, y = xd, yd
+    for _ in range(10):
+        r2 = x * x + y * y; rad = 1 + k1 * r2 + k2 * r2 * r2
+        x = (xd - (2 * p1 * x * y + p2 * (r2 + 2 * x * x))) / rad; y = (yd - (p1 * (r2 + 2 * y * y) + 2 * p2 * x * y)) / rad
+    R = np.asarray(pose[4], float); d = R.T @ np.array([x, y, 1.0])
+    return np.asarray(pose[2], float), d / np.linalg.norm(d)
+
+def _triangulate(mem, poses, cameras):
+    """Where the viewing rays through a group's detection centres meet (least squares, outlying rays dropped):
+    (point, median miss in metres, rays used) or None. Unlike one photo's nearest surface, rays from several sides can
+    only meet at the object itself (a cabinet seen from above has the pole in front of it)."""
+    import numpy as np
+    rays = []
+    for r in mem:
+        pose = poses[r['name']]; cam = cameras[pose[3]]; x1, x2, y1, y2 = _box_px(r['det'], cam)
+        rays.append(_ray(pose, cam, (x1 + x2) / 2, (y1 + y2) / 2) + (r['confidence'],))
+    if len(rays) < 3: return None
+    C = np.array([c for c, _, _ in rays]); D = np.array([d for _, d, _ in rays]); w = np.array([x for _, _, x in rays])
+    use = np.ones(len(rays), bool); X = None
+    for _ in range(4):
+        if use.sum() < 3: return None
+        A = np.zeros((3, 3)); b = np.zeros(3)
+        for c, d, wi in zip(C[use], D[use], w[use]): P = np.eye(3) - np.outer(d, d); A += wi * P; b += wi * P @ c
+        if np.linalg.cond(A) > 1e6: return None  # rays nearly parallel: no depth from them
+        X = np.linalg.solve(A, b)
+        miss = np.linalg.norm(np.cross(X - C, D), axis=1); ahead = ((X - C) * D).sum(1) > 0
+        use = ahead & (miss <= max(2.5 * np.median(miss[ahead]) if ahead.any() else 0, .15))
+    miss = np.linalg.norm(np.cross(X - C[use], D[use]), axis=1)
+    return X, float(np.median(miss)), int(use.sum())
+
 def _anchor_gpu(V, shots, by_media, poses, cameras, progress=None):
     """_anchor_detections for the voting path, on the GPU when there is one: per detection, the nearest surface its box
     sees in its photo (model metres) and its size at that distance."""
@@ -780,14 +821,29 @@ def _anchor_gpu(V, shots, by_media, poses, cameras, progress=None):
             if int(inside.sum()) < 3: continue
             zz = zv[inside]; z_ref = float(torch.quantile(zz, .2)) if len(zz) < 16_000_000 else float(zz.median())
             w3, h3 = (x2 - x1) * z_ref / f, (y2 - y1) * z_ref / f  # pinhole: size = pixels x distance / focal
-            front = idx[inside][zz <= z_ref + .5 * min(w3, h3)]  # the nearest layer is the object, not the tower behind it
+            if d.class_name in GROUND_CLASSES:  # on the ground: the lowest layer in the box, not the pole passing in front of it
+                hz = Vt[idx[inside], 2]; front = idx[inside][hz <= hz.min() + min(h3, 3.0) + .3]
+            else: front = idx[inside][zz <= z_ref + .5 * min(w3, h3)]  # the nearest layer is the object, not the tower behind it
             if len(front) < 3: continue
             rows[d.class_name].append({'anchor': Vt[front].median(0).values.cpu().numpy().astype(float), 'media_id': m.id, 'name': name, 'det': d,
                                        'confidence': _confidence(d), 'w': w3, 'h': h3, 'points': int(len(front))})
         if progress and n % 100 == 0: progress(f'Placing every detection: photo {n + 1}/{len(shots)}')
     return rows
 
-def _fill_in(V, voted, shots, by_media, poses, cameras, to_view, s, axis_near, progress=None):
+SNAP_MIN_POINTS = 8       # cloud points the photos agree are the class, near the meeting point, to move the object onto them
+
+def _snap(X, V, tree, c, votes, ratio, reach):
+    """The cloud points within reach (metres) of X that the photos agree are class c (voting), or None: placed from
+    the photos, a small part (an RRU next to its neighbours) lands a pose error away; the cloud has where it really is."""
+    import numpy as np
+    k = np.asarray(tree.query_ball_point(X, reach), int)
+    if len(k) < SNAP_MIN_POINTS: return None
+    good = k[(votes[c, k] >= VOTE_MIN) & (ratio[c, k] >= VOTE_RATIO)]
+    if len(good) < SNAP_MIN_POINTS: return None
+    d = np.linalg.norm(V[good] - X, axis=1); good = good[d <= np.percentile(d, 60)]  # the nearest of them: one object, not its neighbours
+    return np.median(V[good], 0) if len(good) >= SNAP_MIN_POINTS else None
+
+def _fill_in(V, voted, shots, by_media, poses, cameras, to_view, s, axis_near, progress=None, snap=None):
     """Objects of every detected class that voting did not place (see above): candidate dicts in viewer coordinates."""
     import numpy as np
     try: rows = _anchor_gpu(V, shots, by_media, poses, cameras, progress)
@@ -800,6 +856,8 @@ def _fill_in(V, voted, shots, by_media, poses, cameras, to_view, s, axis_near, p
             if abs(across) <= b['size_w'] / 2 + m and abs(d[1]) <= b['size_h'] / 2 + m and abs(depth) <= b['size_d'] / 2 + m: return True
         return False
     out = []
+    from scipy.spatial import cKDTree
+    tree = cKDTree(V) if snap is not None else None
     for cls, rs in rows.items():
         groups = []
         for members in _group_fill(rs):
@@ -818,9 +876,23 @@ def _fill_in(V, voted, shots, by_media, poses, cameras, to_view, s, axis_near, p
         n = 0
         for photos, mem, split in good:
             if n >= FILL_MAX_PER_CLASS: break
-            A = np.array([r['anchor'] for r in mem]); centre = np.median(A, 0); pos = to_view(centre)[0]
+            A = np.array([r['anchor'] for r in mem]); centre = np.median(A, 0)
+            tri = _triangulate(mem, poses, cameras); wm, hm = float(np.median([r['w'] for r in mem])), float(np.median([r['h'] for r in mem]))
+            if tri is not None and tri[1] <= TRI_MAX_RESIDUAL_M and np.linalg.norm(tri[0][:2] - centre[:2]) <= 3.0:
+                centre = tri[0]; dist = []; wl = []; hl = []
+                for r in mem:  # size from the detections at the meeting point's distance
+                    pose = poses[r['name']]; cam = cameras[pose[3]]; x1, x2, y1, y2 = _box_px(r['det'], cam); z = float(np.linalg.norm(centre - pose[2]))
+                    wl.append((x2 - x1) * z / cam[1][0]); hl.append((y2 - y1) * z / cam[1][0])
+                wm, hm = float(np.median(wl)), float(np.median(hl))
+            if snap is not None and cls in snap[2]:  # onto the cloud points the photos agree are this class
+                p = _snap(centre, V, tree, snap[2][cls], snap[0], snap[1], max(.5 * max(wm, hm), .35))
+                if p is not None: centre = p if cls not in GROUND_CLASSES else np.r_[p[:2], centre[2]]
+            if cls in GROUND_CLASSES:  # standing on the ground around it
+                near = np.linalg.norm(V[:, :2] - centre[:2], axis=1) <= max(1.5, .6 * wm)
+                if near.sum() >= 20: centre = np.r_[centre[:2], np.percentile(V[near, 2], 3) + hm / 2]
+            pos = to_view(centre)[0]
             if not split and placed(cls, pos): continue
-            w, h = float(np.median([r['w'] for r in mem])) * s, float(np.median([r['h'] for r in mem])) * s
+            w, h = wm * s, hm * s
             ax = axis_near(pos[None]); dx, dz = pos[0] - ax[0], pos[2] - ax[1]
             out.append({'class_name': cls, 'position': pos, 'size_w': max(w, 1e-3), 'size_h': max(h, 1e-3), 'size_d': max(min(w, h) * rule_for(cls)['depth'], 1e-3),
                         'yaw': float(math.atan2(dx, dz)) if math.hypot(dx, dz) > 1e-9 else 0.0, 'box_method': 'photo', 'box_points': None,

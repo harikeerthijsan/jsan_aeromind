@@ -1479,3 +1479,22 @@ def test_equipment_around_a_mast_head_is_split_by_direction():
     lab = reg._split_azimuth(P, c, s); assert lab.max() == 2 and (lab >= 0).mean() > .9
     for k in range(3): assert len(set(lab[k * 120:(k + 1) * 120][lab[k * 120:(k + 1) * 120] >= 0])) == 1  # one label per sector
     one = P[:120]; assert reg._split_azimuth(one, c, s).max() < 1   # a single direction: no split
+
+def test_objects_are_placed_where_their_detections_rays_meet():
+    """A cabinet seen from above has the pole in front of it: the rays through its detection centres from several
+    photos still meet at the cabinet, with the lens distortion removed."""
+    np = pytest.importorskip('numpy')
+    from types import SimpleNamespace as NS
+    from app import registration as reg
+    target = np.array([2.0, -1.0, 0.6]); cam = ('OPENCV', [3700.0, 3700.0, 2640.0, 1978.0, -.11, .015, 0.0, 0.0], 5280, 3956)
+    poses, mem = {}, []
+    for k, a in enumerate(np.linspace(0, 2 * np.pi, 8, endpoint=False)):
+        C = target + np.r_[12 * np.cos(a), 12 * np.sin(a), 15.0]; f = target - C; f /= np.linalg.norm(f)
+        r = np.cross(f, [0, 0, 1.0]); r /= np.linalg.norm(r); d = np.cross(f, r); R = np.vstack([r, d, f]); t = -R @ C
+        poses[f'p{k}'] = (None, None, C, 1, R, t)
+        uv, _ = reg.project(target[None], R, t, cam); u, v = uv[0]
+        mem.append({'name': f'p{k}', 'confidence': .8, 'det': NS(x1=u - 40, x2=u + 40, y1=v - 30, y2=v + 30, image_width=5280, image_height=3956)})
+    X, miss, used = reg._triangulate(mem, poses, {1: cam})
+    assert np.linalg.norm(X - target) < .01 and miss < .01 and used == 8
+    mem[0]['det'] = NS(x1=100, x2=180, y1=100, y2=160, image_width=5280, image_height=3956)  # one wrong detection is left out
+    X, miss, used = reg._triangulate(mem, poses, {1: cam}); assert np.linalg.norm(X - target) < .05 and used == 7
