@@ -110,18 +110,21 @@ class _Pool:
 
 def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None, focus=None):
     """Points in metres (float64, (N,3)) from all clouds, thinned evenly to about max_points; roi = (xmin, xmax, ymin,
-    ymax) in metres of the CRS keeps only that area. focus = (x, y, radius): points that close to the structure are
-    kept at up to FOCUS_POINTS on their own, so the structure keeps its full detail while the surroundings are thinned.
+    ymax) in metres of the CRS keeps only that area. focus = (x, y, radius), or a list of them (a site with several
+    masts): points that close to a structure are kept at up to FOCUS_POINTS each on their own, so the structures keep
+    their full detail while the surroundings are thinned.
     Returns {'points', 'colors' (uint8 or None), 'focus' (bool per point), 'crs', 'total', 'kept', 'units'}."""
     import numpy as np
     rng = np.random.default_rng(0); total = 0
     crs = None; units = 'metre'; intensity = False
-    rest, near = _Pool(max_points, rng), _Pool(FOCUS_POINTS, rng)
+    circles = [focus] if focus is not None and np.isscalar(focus[0]) else list(focus or [])
+    rest, near = _Pool(max_points, rng), _Pool(int(FOCUS_POINTS * min(max(len(circles), 1), 3)), rng)
     def add(P, C):
         if roi is not None:
             m = (P[:, 0] >= roi[0]) & (P[:, 0] <= roi[1]) & (P[:, 1] >= roi[2]) & (P[:, 1] <= roi[3]); P, C = P[m], (C[m] if C is not None else None)
-        if focus is None: rest.add(P, C); return
-        m = (P[:, 0] - focus[0]) ** 2 + (P[:, 1] - focus[1]) ** 2 <= focus[2] ** 2
+        if not circles: rest.add(P, C); return
+        m = np.zeros(len(P), bool)
+        for fx, fy, fr in circles: m |= (P[:, 0] - fx) ** 2 + (P[:, 1] - fy) ** 2 <= fr ** 2
         near.add(P[m], C[m] if C is not None else None); rest.add(P[~m], C[~m] if C is not None else None)
     clouds = [s for s in map(_source, paths) if Path(s[0]).suffix.lower() in CLOUD_EXT]
     if not clouds: raise CloudError('no point cloud file (.las, .laz, .ply, .xyz, .pts, .txt, .csv)')
@@ -184,13 +187,24 @@ def read_clouds(paths, max_points=MODEL_POINTS, roi=None, progress=None, focus=N
 
 GREEN = 25  # excess green (2G - R - B) above this: vegetation (steel, antennas and cables are grey, white or black)
 
-def split_structure(points, colors, focus):
+def split_structure(points, colors, focus, centres=None, radius=None):
     """Which points are the structure (tower) and which its surroundings (trees, grass, buildings), for the viewer: trees
     around a tower hide its lower half from almost every angle. Surveys often leave points unclassified, so this uses
     colour (vegetation is green) and the structure's own reach: the horizontal distance from its axis that the
-    equipment at the top extends to. points: local metres (z up); focus: points near the structure.
+    equipment at the top extends to. points: local metres (z up); focus: points near the structure. centres / radius:
+    a site with several structures (local x, y of each): each is found in its own circle, and the result is all of them.
     Returns (bool mask of structure points, info)."""
     import numpy as np
+    if centres is not None and len(centres) > 1:
+        S = np.zeros(len(points), bool); parts = []
+        for c in centres:
+            near = focus & (np.linalg.norm(points[:, :2] - np.asarray(c)[:2], axis=1) <= radius)
+            if near.sum() < 1000: continue
+            s, i = split_structure(points, colors, near); S |= s; parts.append(i)
+        if parts:
+            axes = np.array([p['axis'] for p in parts])
+            return S, {'axis': [round(float(v), 3) for v in axes.mean(0)], 'axes': [p['axis'] for p in parts], 'reach_m': max(p['reach_m'] for p in parts),
+                       'structure_points': int(S.sum()), 'structures': len(parts)}
     P = points[focus]; z0, top = np.percentile(P[:, 2], 1), P[:, 2].max()
     axis = np.median(P[P[:, 2] >= np.percentile(P[:, 2], 97)][:, :2], 0)  # the middle of the highest points
     green = (2 * colors[:, 1].astype(int) - colors[:, 0] - colors[:, 2]) > GREEN if colors is not None else np.zeros(len(points), bool)
@@ -210,7 +224,8 @@ def clear_view(points, structure, info, M, distance=None):
     from . import reconstruct
     S, O = points[structure], points[~structure]
     axis = np.asarray(info['axis']); z0, top = np.percentile(S[:, 2], 1), S[:, 2].max(); mid = z0 + .45 * (top - z0)
-    d = distance or max(30.0, 2.3 * (top - z0))
+    spread = max((np.linalg.norm(np.asarray(a) - axis) for a in info.get('axes') or [axis]), default=0.0)  # several structures: frame them all
+    d = distance or max(30.0, 2.3 * (top - z0)) + 2 * spread
     tree = cKDTree(O[np.random.default_rng(0).choice(len(O), min(len(O), 400_000), replace=False)]) if len(O) else None
     best, score = 0.0, None
     for a in np.radians(np.arange(0, 360, 30)):

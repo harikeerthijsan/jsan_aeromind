@@ -651,8 +651,14 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
             lab = _split(V[pts], n_obj); parts += [(name, pts[lab == i]) for i in range(lab.max() + 1) if (lab == i).sum() >= VOTE_MIN_OBJECT]
     parts = _merge_by_detections(parts, V, shots, by_media, poses, cameras)
     out = []
+    from scipy.spatial import cKDTree as _Tree
+    LV = to_view(V[labelled])[:, [0, 2]] if labelled.any() else np.zeros((0, 2)); ltree = _Tree(LV) if len(LV) else None
+    def axis_near(P):  # several masts on a site: the boxes face away from their own mast
+        if ltree is None: return axis
+        k = ltree.query_ball_point(np.median(P[:, [0, 2]], 0), 6.0 * s)
+        return np.median(LV[k], 0) if len(k) >= 50 else axis
     for name, pts in parts:
-        c = cid[name]; box = fit_box(to_view(V[pts]), axis)
+        c = cid[name]; Pv = to_view(V[pts]); box = fit_box(Pv, axis_near(Pv))
         if box is None: continue
         out.append({'class_name': name, **box, 'box_method': 'dense', 'box_points': int(len(pts)), 'point_count': int(len(pts)),
                     'media_count': int(votes[c, pts].max()), 'spread': float(np.median(np.linalg.norm(to_view(V[pts]) - box['position'], axis=1))),

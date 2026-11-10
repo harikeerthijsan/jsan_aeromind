@@ -1446,3 +1446,22 @@ def test_detections_are_placed_in_3d_automatically(monkeypatch):
         assert client.post(f'/api/v1/models/{mid}/register-assets?background=true').status_code == 202
         with SessionLocal() as db: assert sum(1 for t in db.scalars(select(WorkerTask).where(WorkerTask.kind == 'register_assets')) if t.payload == {'model_id': mid}) == 1  # still one
         assert client.get(f'/api/v1/inspections/{iid}/detection-classes').json() == [{'class_name': 'rru', 'detections': 3, 'photos': 2}, {'class_name': 'ladder', 'detections': 1, 'photos': 1}]
+
+def test_sites_with_several_masts_keep_every_structure():
+    """A flight around three masts finds all three (each from its own orbit of photos), and each becomes structure."""
+    np = pytest.importorskip('numpy')
+    from app import photo_pose as pp, pointcloud as pc
+    masts = np.array([[0.0, 0.0], [15.6, 6.0], [-20.0, 25.0]]); cams = []
+    for k, m in enumerate(masts):
+        for a in np.linspace(0, 2 * np.pi, 120 + 40 * k, endpoint=False):  # an orbit of each mast, looking at it
+            C = np.r_[m + 9 * np.r_[np.cos(a), np.sin(a)], 12.0]; d = np.r_[m, 8.0] - C; d /= np.linalg.norm(d)
+            cams.append({'C': C, 'R': np.vstack([np.zeros(3), np.zeros(3), d])})
+    t = pp.targets(cams)
+    assert len(t) == 3 and all(abs(a - b) <= 15 for a, b in zip(sorted(x['photos'] for x in t), [120, 160, 200]))  # a few lines pass two masts
+    for m in masts: assert min(np.linalg.norm(x['T'][:2] - m) for x in t) < .2
+    one = pp.targets(cams[:120]); assert len(one) == 1 and np.linalg.norm(one[0]['T'][:2]) < .2   # a single tower: as before
+    rng = np.random.default_rng(0)  # three poles in a cloud: all three are structure
+    P = np.vstack([np.c_[m + rng.normal(0, .15, (3000, 2)), rng.uniform(0, 16, 3000)] for m in masts] + [np.c_[rng.uniform(-40, 40, (6000, 2)), np.zeros(6000)]])
+    focus = np.ones(len(P), bool); grey = np.full((len(P), 3), 128, np.uint8)
+    S, info = pc.split_structure(P, grey, focus, [m for m in masts], 12.0)
+    assert info['structures'] == 3 and all(S[i * 3000:(i + 1) * 3000].mean() > .9 for i in range(3))

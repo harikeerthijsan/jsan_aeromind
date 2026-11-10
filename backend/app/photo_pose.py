@@ -157,6 +157,44 @@ def project(cam, X):
     xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x); yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
     return np.stack([m['fx'] * xd + m['cx'], m['fy'] * yd + m['cy']], 1), z
 
+def targets(cams, min_share=.08, most=4, miss_m=4.0):
+    """Every structure the photos were taken around: a site often has several masts, each flown around in turn. The
+    vertical lines that the cameras' viewing directions pass within miss_m metres of, each seen by at least min_share
+    of the photos, most-photographed first: [{'T': (x, y, z), 'photos': n}]. Photos looking straight down say nothing
+    about this; with fewer than 10 photos looking sideways the single meeting point (target) is returned."""
+    import numpy as np
+    C = np.array([c['C'] for c in cams], float); D = np.array([c['R'][2] for c in cams], float)
+    h = D[:, :2]; n = np.linalg.norm(h, axis=1); side = np.flatnonzero(n > .25)
+    if len(side) < 10: return [{'T': target(cams), 'photos': len(cams)}]
+    u = h / np.maximum(n, 1e-9)[:, None]; c2 = C[:, :2]; rng = np.random.default_rng(0)
+    def miss(T, idx):  # horizontal distance at which each view line passes the vertical line through T (behind: never)
+        d = T - c2[idx]; t = (d * u[idx]).sum(1); off = np.linalg.norm(d - t[:, None] * u[idx], axis=1)
+        return np.where(t > 0, off, np.inf)
+    def solve(idx):
+        A = np.zeros((2, 2)); b = np.zeros(2)
+        for i in idx: Pm = np.eye(2) - np.outer(u[i], u[i]); A += Pm; b += Pm @ c2[i]
+        return np.linalg.solve(A, b) if np.linalg.cond(A) < 1e8 else None
+    left, out, need = side.copy(), [], max(min_share * len(side), 10)
+    while len(out) < most and len(left) >= need:
+        best, inl = None, np.zeros(0, int)
+        for _ in range(400):  # candidates where two view lines cross; the one most lines pass close to wins
+            i, j = rng.choice(left, 2, replace=False); M = np.c_[u[i], -u[j]]
+            if abs(np.linalg.det(M)) < .1: continue
+            t = np.linalg.solve(M, c2[j] - c2[i])
+            if (t <= 0).any(): continue
+            T = c2[i] + t[0] * u[i]; k = left[miss(T, left) <= miss_m]
+            if len(k) > len(inl): best, inl = T, k
+        if best is None or len(inl) < need: break
+        for _ in range(3):  # refine on its own photos
+            T = solve(inl)
+            if T is None: break
+            best = T; inl = left[miss(best, left) <= miss_m]
+        if any(np.linalg.norm(best - o['T'][:2]) < miss_m for o in out): left = np.setdiff1d(left, inl); continue
+        s = ((best - c2[inl]) * u[inl]).sum(1) / n[inl]  # along each view line to where it passes the structure
+        z = float(np.median(C[inl, 2] + s * D[inl, 2]))
+        out.append({'T': np.r_[best, z], 'photos': int(len(inl))}); left = np.setdiff1d(left, inl)
+    return out or [{'T': target(cams), 'photos': len(cams)}]
+
 def target(cams):
     """The point the cameras look at (least squares meeting point of their viewing rays; rays far off it, e.g. photos
     of the horizon, are dropped and it is solved again). Inspection orbits converge on the structure."""

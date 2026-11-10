@@ -187,11 +187,13 @@ def _pointcloud_model(payload, progress, work):
         cams, roi, pinfo, r = [], None, {}, 0.0
         if use_photos:
             cams, pinfo = pp.poses([m for _, m in posed], crs, np.zeros(3))
-            T = pp.target(cams); C = np.array([c['C'] for c in cams])
-            r = float(np.percentile(np.linalg.norm(C[:, :2] - T[:2], axis=1), 95)) + pc.ROI_MARGIN_M / 4  # the structure and its surroundings
+            targets = pp.targets(cams)  # a site may have several masts, each flown around: every one keeps its full detail
+            pinfo['structures'] = [{'x': round(float(t['T'][0]), 2), 'y': round(float(t['T'][1]), 2), 'photos': t['photos']} for t in targets]
+            T = np.mean([t['T'] for t in targets], 0); C = np.array([c['C'] for c in cams])
+            r = float(np.percentile(np.linalg.norm(C[:, :2] - T[:2], axis=1), 95)) + pc.ROI_MARGIN_M / 4  # the structures and their surroundings
             roi = (T[0] - r, T[0] + r, T[1] - r, T[1] + r)
         progress('reading_cloud', 5, 'Reading the point cloud')
-        focus = (T[0], T[1], FOCUS_RADIUS_M) if use_photos else None  # the structure keeps its full detail; surroundings are thinned
+        focus = [(t['T'][0], t['T'][1], FOCUS_RADIUS_M) for t in targets] if use_photos else None  # the structures keep their full detail; surroundings are thinned
         cloud = pc.read_clouds(sources, SURROUNDING_POINTS if focus else pc.MODEL_POINTS, roi, progress=lambda msg: progress('reading_cloud', 10, msg), focus=focus)
         origin = np.median(cloud['points'], 0); L = cloud['points'] - origin  # local metres (float precision)
         info = {'files': [Path(k).name for k in payload['clouds']], 'points_total': cloud['total'], 'points_used': cloud['kept'],
@@ -214,7 +216,7 @@ def _pointcloud_model(payload, progress, work):
             on_cloud = pp.check(cams, L)
             progress('exporting', 92, 'Preparing the model for the viewer')
             # viewer: the structure in web/points.ply, trees and the rest in web/context.ply (drawn faint, so they do not hide it)
-            S, sinfo = pc.split_structure(L, cloud['colors'], F); info['structure'] = sinfo
+            S, sinfo = pc.split_structure(L, cloud['colors'], F, [t['T'][:2] - origin[:2] for t in targets], FOCUS_RADIUS_M); info['structure'] = sinfo
             rng = np.random.default_rng(0); idx_s, idx_c = np.flatnonzero(S), np.flatnonzero(~S)
             web = rng.choice(idx_s, min(len(idx_s), WEB_FOCUS_POINTS), replace=False); ctx = rng.choice(idx_c, min(len(idx_c), WEB_CONTEXT_POINTS), replace=False)
             web_files, n_web = reconstruct.export_web(work, M, {'points': L[web], 'colors': cloud['colors'][web]}, None,
