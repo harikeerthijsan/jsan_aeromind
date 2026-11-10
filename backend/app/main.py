@@ -680,7 +680,8 @@ def _pc_prepare(db,job_id,model_id):
     job,m3=db.get(Job,job_id),db.get(Model3D,model_id);job.status=m3.status='running';db.commit()
     files=db.scalars(select(PointCloudFile).where(PointCloudFile.inspection_id==job.inspection_id).order_by(PointCloudFile.id)).all()
     items=db.scalars(select(Media).where(Media.id.in_(job.media_ids or []))).all()
-    return {'work':f'{job.inspection_id}_{job.id}','clouds':[f.storage_key for f in files],'photos':_photo_keys(items)}
+    photos=sorted([m for m in items if m.content_type.startswith('image/') and m.parent_media_id is None],key=lambda m:(m.filename.lower(),m.id))
+    return {'work':f'{job.inspection_id}_{job.id}','clouds':[f.storage_key for f in files],'photos':[m.storage_key for m in photos],'photo_ids':[m.id for m in photos]}
 def _pc_apply(db,r,job_id,model_id):
     job,m3=db.get(Job,job_id),db.get(Model3D,model_id)
     m3.quality=r;m3.status='completed';m3.url=f'/recon/{job.inspection_id}_{job.id}/'+r['files']['web_points']

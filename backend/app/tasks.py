@@ -167,6 +167,21 @@ def pointcloud_model(payload, progress):
     finally:
         if storage.bucket_only(): shutil.rmtree(work, ignore_errors=True)  # stored in the bucket (or failed): nothing kept locally
 
+def even_sample(idx, P, n, rng, cell=1.0):
+    """Up to n of the points idx, as evenly spread over the ground as the cloud allows: the areas round the masts are
+    kept in full detail and the rest thinned, so a plain random sample showed denser circles in the viewer."""
+    import numpy as np
+    if len(idx) <= n: return idx
+    idx = idx[rng.permutation(len(idx))]; _, key, cnt = np.unique(np.floor(P[idx, :2] / cell).astype(np.int64), axis=0, return_inverse=True, return_counts=True)
+    lo, hi = 1, int(cnt.max())
+    while lo < hi:  # the largest per-cell cap that keeps the total within n
+        k = (lo + hi + 1) // 2
+        if np.minimum(cnt, k).sum() <= n: lo = k
+        else: hi = k - 1
+    key = key.ravel(); order = np.argsort(key, kind='stable'); start = np.r_[0, np.cumsum(cnt)[:-1]]
+    rank = np.empty(len(idx), np.int64); rank[order] = np.arange(len(idx)) - start[key[order]]
+    return idx[rank < lo]
+
 def _pointcloud_model(payload, progress, work):
     import json, time
     import numpy as np
@@ -212,13 +227,25 @@ def _pointcloud_model(payload, progress, work):
             if takeoff is not None and (not pp.has_vertical(crs) or abs(takeoff) > 15):  # unknown or wrong height system
                 for c in cams: c['C'][2] -= takeoff
                 pinfo['height_corrected_m'] = round(-takeoff, 2); takeoff = 0.0
+            # the photos' directions against the masts in the cloud (positions are RTK; gimbal / compass angles are off ~1-2 deg)
+            S, sinfo = pc.split_structure(L, cloud['colors'], F, [t['T'][:2] - origin[:2] for t in targets], FOCUS_RADIUS_M); info['structure'] = sinfo
+            ids = payload.get('photo_ids') or []
+            if len(ids) == len(photos):
+                pid = [i for i, m in zip(ids, metas) if m]
+                def small_copy(i):
+                    for k in (f'.thumbs/{pid[i]}_480.jpg', None):
+                        try:
+                            if k: return storage.read_bytes(ROOT / k)
+                        except Exception: continue
+                    return None
+                progress('cameras', 85, 'Correcting photo directions against the point cloud')
+                pinfo['directions'] = pp.refine_directions(cams, L[S], small_copy, lambda msg: progress('cameras', 85, msg))
             pp.write_text_model(work / 'sparse' / '0', cams, [n for n, _ in posed])
             on_cloud = pp.check(cams, L)
             progress('exporting', 92, 'Preparing the model for the viewer')
             # viewer: the structure in web/points.ply, trees and the rest in web/context.ply (drawn faint, so they do not hide it)
-            S, sinfo = pc.split_structure(L, cloud['colors'], F, [t['T'][:2] - origin[:2] for t in targets], FOCUS_RADIUS_M); info['structure'] = sinfo
             rng = np.random.default_rng(0); idx_s, idx_c = np.flatnonzero(S), np.flatnonzero(~S)
-            web = rng.choice(idx_s, min(len(idx_s), WEB_FOCUS_POINTS), replace=False); ctx = rng.choice(idx_c, min(len(idx_c), WEB_CONTEXT_POINTS), replace=False)
+            web = rng.choice(idx_s, min(len(idx_s), WEB_FOCUS_POINTS), replace=False); ctx = even_sample(idx_c, L, WEB_CONTEXT_POINTS, rng)
             web_files, n_web = reconstruct.export_web(work, M, {'points': L[web], 'colors': cloud['colors'][web]}, None,
                                                       [{'name': n, 'center': c['C'].tolist(), 'dir': c['R'][2].tolist()} for (n, _), c in zip(posed, cams)], max_points=len(web))
             reconstruct.write_ply(work / 'web' / 'context.ply', reconstruct._apply(M, L[ctx]).astype(np.float32), cloud['colors'][ctx]); web_files['web_context'] = 'web/context.ply'

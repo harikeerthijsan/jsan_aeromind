@@ -54,17 +54,54 @@ function photoScreen(st:Station,dist:number){
 
 type Look={yaw:number;pitch:number;zoom:number};
 /** Overlay colours: by height (stands out on any photo), the cloud's own colours, or one bright colour. */
-type Tint='elevation'|'rgb'|'highlight';
-const TINTS:[Tint,string][]=[['elevation','Height'],['rgb','RGB'],['highlight','Highlight']];
+type Tint='photo'|'elevation'|'rgb'|'highlight';
+const TINTS:[Tint,string][]=[['photo','Photo'],['elevation','Height'],['rgb','RGB'],['highlight','Highlight']];
+// Points coloured from the photos ("Photo"): each point takes its colour from the photo shown or, outside it, from the
+// neighbouring photos that see it (projected through each photo's pose and lens), so the scene carries on past the
+// photo's edges and between steps instead of ending in black. Inside the photo shown the points stay a light overlay.
+const SLOTS=5;  // the photo shown + 4 neighbours
+const PT_VERT=`uniform float size;uniform float opacity;uniform int mode;uniform int nPhotos;
+${Array.from({length:SLOTS},(_,i)=>`uniform sampler2D map${i};uniform vec3 C${i};uniform mat3 R${i};uniform vec4 K${i};uniform vec2 D${i};uniform vec2 S${i};`).join('')}
+varying vec4 vCol;
+vec4 seen(sampler2D map,vec3 C,mat3 R,vec4 K,vec2 D,vec2 S,vec3 p){vec3 q=R*(p-C);if(q.z<.05)return vec4(0.);vec2 xy=q.xy/q.z;float r2=dot(xy,xy);float rad=1.+D.x*r2+D.y*r2*r2;
+ vec2 uv=vec2((K.x*xy.x*rad+K.z)/S.x,(K.y*xy.y*rad+K.w)/S.y);if(uv.x<0.||uv.x>1.||uv.y<0.||uv.y>1.)return vec4(0.);return vec4(texture2D(map,vec2(uv.x,1.-uv.y)).rgb,1.);}
+#include <color_pars_vertex>
+void main(){vec4 mv=modelViewMatrix*vec4(position,1.);gl_Position=projectionMatrix*mv;gl_PointSize=size;
+ vec3 own=vec3(1.);
+ #ifdef USE_COLOR
+ own=color.rgb;
+ #endif
+ vCol=vec4(own,opacity);if(mode==1)vCol.rgb=vec3(.18,.9,1.);
+ if(mode==2&&nPhotos>0){vec4 c=seen(map0,C0,R0,K0,D0,S0,position);
+  if(c.a>0.)vCol=vec4(c.rgb,opacity);
+  else{gl_PointSize=max(size,2.5);vCol.a=1.;
+${Array.from({length:SLOTS-1},(_,j)=>`   if(c.a==0.&&nPhotos>${j+1}){c=seen(map${j+1},C${j+1},R${j+1},K${j+1},D${j+1},S${j+1},position);if(c.a>0.)vCol.rgb=c.rgb;}`).join('\n')}
+  }}
+}`;
+const PT_FRAG=`varying vec4 vCol;void main(){gl_FragColor=vCol;
+#include <colorspace_fragment>
+}`;
+function pointMaterial(g:THREE.BufferGeometry){
+ const u:Record<string,THREE.IUniform>={size:{value:1},opacity:{value:.35},mode:{value:0},nPhotos:{value:0}};
+ for(let i=0;i<SLOTS;i++)Object.assign(u,{[`map${i}`]:{value:null},[`C${i}`]:{value:new THREE.Vector3()},[`R${i}`]:{value:new THREE.Matrix3()},[`K${i}`]:{value:new THREE.Vector4(1,1,0,0)},[`D${i}`]:{value:new THREE.Vector2()},[`S${i}`]:{value:new THREE.Vector2(1,1)}});
+ return new THREE.ShaderMaterial({vertexShader:PT_VERT,fragmentShader:PT_FRAG,uniforms:u,transparent:true,vertexColors:!!g.getAttribute('color')});
+}
+/** A station's photo into a point material's slot i (pose rows: right, down, forward; viewer frame). */
+function setSlot(m:THREE.ShaderMaterial,i:number,st:Station){const p=st.photo.pose!,u=m.uniforms;u[`map${i}`].value=st.tex;u[`C${i}`].value.set(...(p.centre as [number,number,number]));
+ const r=v3(p.right).normalize(),d=v3(p.down).normalize(),f=v3(p.forward).normalize();(u[`R${i}`].value as THREE.Matrix3).set(r.x,r.y,r.z,d.x,d.y,d.z,f.x,f.y,f.z);
+ u[`K${i}`].value.set(p.lens[0],p.lens[1],p.lens[2],p.lens[3]);u[`D${i}`].value.set(p.lens[4],p.lens[5]);u[`S${i}`].value.set(st.photo.width,st.photo.height)}
 function Walker({stations,cur,photoOpacity,lidar,surroundings,pointOpacity,pointSize,tint,look,onMoving,toPixel,marks,pendingAt,geo,ctxGeo}:{stations:Station[];cur:number;photoOpacity:number;lidar:boolean;surroundings:boolean;pointOpacity:number;pointSize:number;tint:Tint;look:React.MutableRefObject<Look>;onMoving:(b:boolean)=>void;toPixel:React.MutableRefObject<((nx:number,ny:number)=>[number,number]|null)|null>;marks:WalkMark[];pendingAt?:number[];geo:THREE.BufferGeometry|null;ctxGeo:THREE.BufferGeometry|null}){
  const {camera,size}=useThree(),cam=camera as THREE.PerspectiveCamera;
  const radius=useMemo(()=>{if(!geo)return 50;geo.computeBoundingSphere();return geo.boundingSphere!.radius},[geo]);
- const pts=useMemo(()=>[geo,ctxGeo].map(g=>{if(!g)return null;const o=new THREE.Points(g,new THREE.PointsMaterial({size:pointSize,sizeAttenuation:false,vertexColors:!!g.getAttribute('color'),color:g.getAttribute('color')?'#ffffff':'#9fd0ff',transparent:true}));
-  o.renderOrder=5;o.frustumCulled=false;return o}),[geo,ctxGeo]);
+ const pts=useMemo(()=>[geo,ctxGeo].map(g=>{if(!g)return null;const o=new THREE.Points(g,pointMaterial(g));o.renderOrder=5;o.frustumCulled=false;return o}),[geo,ctxGeo]);
  useEffect(()=>{const r=tint==='elevation'&&geo?heightRange(geo):null;  // one height range for the structure and its surroundings
-  pts.forEach(o=>{if(!o)return;const m=o.material as THREE.PointsMaterial,g=o.geometry,rgb=!!g.getAttribute('color');
-   if(rgb)recolour(g,tint==='elevation'?'elevation':'rgb',r);m.vertexColors=rgb&&tint!=='highlight';m.color.set(m.vertexColors?'#ffffff':'#2ee6ff');m.needsUpdate=true})},[pts,tint]);
- useEffect(()=>{pts.forEach((o,i)=>{if(!o)return;const m=o.material as THREE.PointsMaterial;m.size=pointSize;m.opacity=pointOpacity;o.visible=lidar&&(i===0||surroundings)})},[pts,pointSize,pointOpacity,lidar,surroundings]);
+  pts.forEach(o=>{if(!o)return;const g=o.geometry;if(g.getAttribute('color'))recolour(g,tint==='elevation'?'elevation':'rgb',r);
+   (o.material as THREE.ShaderMaterial).uniforms.mode.value=tint==='highlight'?1:tint==='photo'?2:0})},[pts,tint]);
+ useEffect(()=>{pts.forEach((o,i)=>{if(!o)return;const u=(o.material as THREE.ShaderMaterial).uniforms;u.size.value=pointSize;u.opacity.value=pointOpacity;
+  o.visible=lidar&&(i===0||surroundings||tint==='photo')})},[pts,pointSize,pointOpacity,lidar,surroundings,tint]);
+ // the photos the points take their colours from: the one shown, then its neighbours (those already loaded)
+ useEffect(()=>{const near=[cur,cur-1,cur+1,cur-2,cur+2].map(i=>stations[i]).filter(st=>st&&st.tex&&st.photo.pose).slice(0,SLOTS) as Station[];
+  pts.forEach(o=>{if(!o)return;const m=o.material as THREE.ShaderMaterial;near.forEach((st,i)=>setSlot(m,i,st));m.uniforms.nPhotos.value=stations[cur]?.tex?near.length:0})},[pts,cur,stations]);
  // flight between two poses: position and orientation glide, the old photo fades out and the new one in
  const fly=useRef<{from:THREE.Vector3;fromQ:THREE.Quaternion;to:number;t0:number;prev:THREE.Mesh|null}|null>(null),screen=useRef<THREE.Mesh|null>(null),at=useRef<number>(-1);
  const group=useRef<THREE.Group>(null!);
@@ -116,12 +153,12 @@ export default function WalkView({photos,idx,setIdx,pointsUrl,contextUrl,tool,on
  tool:WalkTool;onTool:(t:WalkTool)=>void;marks?:WalkMark[];pendingAt?:number[];onPick?:(u:number,v:number)=>void;busy?:boolean;note?:string;result?:string}){
  const toPixel=useRef<((nx:number,ny:number)=>[number,number]|null)|null>(null);
  const {geo,err}=usePly(pointsUrl),ctx=usePly(contextUrl);
- const [texOf,setTexOf]=useState<Record<number,THREE.Texture>>({}),[photoOpacity,setPhotoOpacity]=useState(1),[lidar,setLidar]=useState(true),[pointSize,setPointSize]=useState(1),[pointOpacity,setPointOpacity]=useState(.35),[surroundings,setSurroundings]=useState(false),[tint,setTint]=useState<Tint>('elevation'),[flying,setFlying]=useState(false);
+ const [texOf,setTexOf]=useState<Record<number,THREE.Texture>>({}),[photoOpacity,setPhotoOpacity]=useState(1),[lidar,setLidar]=useState(true),[pointSize,setPointSize]=useState(1),[pointOpacity,setPointOpacity]=useState(.35),[surroundings,setSurroundings]=useState(false),[tint,setTint]=useState<Tint>('photo'),[flying,setFlying]=useState(false);
  const look=useRef<Look>({yaw:0,pitch:0,zoom:1});
  const stations=useMemo(()=>photos.map(p=>p.pose?{photo:p,pos:v3(p.pose.centre),quat:poseQuat(p.pose),tex:texOf[p.media_id]||null}:null),[photos,texOf]);
  const ok=stations.filter(Boolean) as Station[],cur=stations[idx]?ok.indexOf(stations[idx]!):-1;
  // the photo shown, then its neighbours in the background so the next step is instant
- useEffect(()=>{let live=true;const want=[idx,idx+1,idx-1,idx+2].map(i=>photos[i]).filter(Boolean);
+ useEffect(()=>{let live=true;const want=[idx,idx+1,idx-1,idx+2,idx-2].map(i=>photos[i]).filter(Boolean);
   for(const p of want)photoTexture(p.media_id).then(t=>{if(live)setTexOf(m=>m[p.media_id]===t?m:{...m,[p.media_id]:t})}).catch(()=>{});
   return()=>{live=false}},[idx,photos]);
  useEffect(()=>{look.current={yaw:0,pitch:0,zoom:1}},[idx]);

@@ -677,7 +677,14 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
         return abs(across) <= b['size_w'] / 2 + .15 * s and abs(d[1]) <= b['size_h'] / 2 + .15 * s and abs(depth) <= b['size_d'] / 2 + .15 * s
     out = [b for b in out if sum(1 for c in fill if c['class_name'] == b['class_name'] and holds(b, c)) < 2]
     fill = [c for c in fill if not any(b['class_name'] == c['class_name'] and holds(b, c) for b in out)]  # the same object twice
-    return out + fill
+    def same(b, c):  # two boxes of one object: centres within 30 % of the box's size of each other (side-by-side antennas are not)
+        d = np.asarray(c['position'], float) - np.asarray(b['position'], float); yw = b.get('yaw') or 0.0
+        across, depth = d[0] * math.cos(yw) - d[2] * math.sin(yw), d[0] * math.sin(yw) + d[2] * math.cos(yw)
+        return abs(across) <= .3 * b['size_w'] and abs(d[1]) <= .3 * b['size_h'] and abs(depth) <= .3 * max(b['size_d'], b['size_w'])
+    kept = []  # fill-in duplicates of one object: the best supported stays
+    for c in sorted(fill, key=lambda c: (-c['media_count'], -c['confidence'])):
+        if not any(k['class_name'] == c['class_name'] and (same(k, c) or same(c, k)) for k in kept): kept.append(c)
+    return out + kept
 
 # ---------- fill-in: every detected class in 3D ----------
 # Each detection is anchored on the nearest surface its box sees in its photo (z-buffered cloud), same-class anchors

@@ -1498,3 +1498,15 @@ def test_objects_are_placed_where_their_detections_rays_meet():
     assert np.linalg.norm(X - target) < .01 and miss < .01 and used == 8
     mem[0]['det'] = NS(x1=100, x2=180, y1=100, y2=160, image_width=5280, image_height=3956)  # one wrong detection is left out
     X, miss, used = reg._triangulate(mem, poses, {1: cam}); assert np.linalg.norm(X - target) < .05 and used == 7
+
+def test_viewer_surroundings_are_sampled_evenly():
+    """The areas round the masts are kept in full detail and the rest thinned; the viewer's surroundings layer must not
+    show that as denser circles."""
+    np = pytest.importorskip('numpy')
+    from app.tasks import even_sample
+    rng = np.random.default_rng(0)
+    P = np.r_[rng.uniform(-50, 50, (100_000, 2)), rng.normal(0, 4, (400_000, 2))]; P = np.c_[P, np.zeros(len(P))]
+    k = even_sample(np.arange(len(P)), P, 80_000, rng); r = np.hypot(P[k, 0], P[k, 1])
+    inner = (r < 5).sum() / (np.pi * 25); outer = ((r > 20) & (np.abs(P[k, :2]).max(1) < 50)).sum() / (1e4 - np.pi * 400)
+    assert len(k) <= 80_000 and .8 < inner / outer < 1.25
+    assert len(even_sample(np.arange(10), P, 100, rng)) == 10

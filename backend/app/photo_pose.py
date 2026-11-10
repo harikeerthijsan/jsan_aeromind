@@ -157,6 +157,70 @@ def project(cam, X):
     xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x); yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
     return np.stack([m['fx'] * xd + m['cx'], m['fy'] * yd + m['cy']], 1), z
 
+REFINE_SPAN_DEG = 3.0     # drone gimbal / compass direction errors are a degree or two; corrections beyond this are not trusted
+REFINE_MIN_GAIN = .85     # accepted only when the structure's outline lies this much closer to the photo's edges
+
+def _small_rotations(angles):
+    """(n, 3) yaw, pitch, roll in degrees (about the camera's down, right and view axes) -> (n, 3, 3)."""
+    import numpy as np
+    y, p, r = np.radians(np.asarray(angles, float)).T; o, z = np.ones_like(y), np.zeros_like(y)
+    Ry = np.stack([np.stack([np.cos(y), z, np.sin(y)], -1), np.stack([z, o, z], -1), np.stack([-np.sin(y), z, np.cos(y)], -1)], 1)
+    Rx = np.stack([np.stack([o, z, z], -1), np.stack([z, np.cos(p), -np.sin(p)], -1), np.stack([z, np.sin(p), np.cos(p)], -1)], 1)
+    Rz = np.stack([np.stack([np.cos(r), -np.sin(r), z], -1), np.stack([np.sin(r), np.cos(r), z], -1), np.stack([z, z, o], -1)], 1)
+    return Rz @ Rx @ Ry
+
+def refine_direction(cam, structure, jpeg):
+    """Correct one photo's direction (small yaw / pitch / roll) so the structure's outline in the cloud lies on the
+    photo's edges. Positions (RTK) are kept: the gimbal and compass angles are what is off, by a degree or two, which
+    puts a mast a few decimetres beside itself. cam: {'R', 'C', 'meta'} (cloud frame); structure: (N,3) points of the
+    masts in the same frame; jpeg: a small copy of the photo (bytes). Returns (yaw, pitch, roll, gain) or None."""
+    import io, numpy as np, cv2
+    from PIL import Image
+    img = np.asarray(Image.open(io.BytesIO(jpeg)).convert('L')); H, W = img.shape; m = cam['meta']; sc = W / m['w']
+    Xc = (structure - cam['C']) @ cam['R'].T
+    def pix(X):  # (..., k, 3) camera-frame points -> pixels at the copy's scale, and in-view mask
+        z = X[..., 2]; zs = np.where(z > .05, z, 1.0); x, y = X[..., 0] / zs, X[..., 1] / zs; k1, k2, p1, p2 = m['k']; r2 = x * x + y * y; rad = 1 + k1 * r2 + k2 * r2 * r2
+        u = (m['fx'] * (x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)) + m['cx']) * sc; v = (m['fy'] * (y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y) + m['cy']) * sc
+        return u, v, (z > .05) & (u >= 0) & (u < W - 1) & (v >= 0) & (v < H - 1)
+    u, v, ok = pix(Xc)
+    if ok.sum() < 2000: return None  # the structure is hardly in this photo
+    ui, vi = u[ok].astype(int), v[ok].astype(int); mask = np.zeros((H, W), np.uint8); mask[vi, ui] = 255
+    mask = cv2.morphologyEx(cv2.dilate(mask, np.ones((3, 3), np.uint8)), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    edge = mask ^ cv2.erode(mask, np.ones((3, 3), np.uint8))
+    on = cv2.dilate(edge, np.ones((5, 5), np.uint8))[vi, ui] > 0; Q = Xc[ok][on]  # the structure points on (within 2 px of) its outline
+    if len(Q) < 300: return None
+    if len(Q) > 4000: Q = Q[np.random.default_rng(0).choice(len(Q), 4000, replace=False)]
+    dt = np.minimum(cv2.distanceTransform(255 - cv2.Canny(cv2.GaussianBlur(img, (3, 3), 0), 50, 150), cv2.DIST_L2, 3), 8.0)
+    def score(angles):
+        R = _small_rotations(angles); u, v, ok = pix(np.einsum('nij,kj->nki', R, Q))
+        d = dt[np.clip(v, 0, H - 1).astype(int), np.clip(u, 0, W - 1).astype(int)]; return np.where(ok, d, 8.0).mean(1)
+    s0 = float(score([[0, 0, 0]])[0])
+    g = np.arange(-REFINE_SPAN_DEG, REFINE_SPAN_DEG + 1e-9, .25); A = np.array([[a, b, 0] for a in g for b in g]); sc_ = score(A); best = A[sc_.argmin()]
+    f = np.arange(-.3, .3001, .05); A = np.array([[best[0] + a, best[1] + b, r] for a in f for b in f for r in np.arange(-.75, .7501, .25)]); sc_ = score(A)
+    best, s1 = A[sc_.argmin()], float(sc_.min())
+    if s1 > REFINE_MIN_GAIN * s0 or np.abs(best).max() > REFINE_SPAN_DEG + .3: return None
+    return float(best[0]), float(best[1]), float(best[2]), round(s1 / max(s0, 1e-9), 3)
+
+def refine_directions(cams, structure, photo, progress=None):
+    """refine_direction for every photo (photo(i) -> small copy bytes or None), applied to cams in place.
+    Returns {'refined', 'looked_at', 'median_deg'}."""
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    P = np.asarray(structure, float)
+    if len(P) > 200_000: P = P[np.random.default_rng(0).choice(len(P), 200_000, replace=False)]
+    done, seen, size = 0, 0, []
+    def one(i):
+        try:
+            b = photo(i)
+            return refine_direction(cams[i], P, b) if b else None
+        except Exception: return None
+    with ThreadPoolExecutor(8) as pool:
+        for i, r in enumerate(pool.map(one, range(len(cams)))):
+            if progress and i % 100 == 0: progress(f'Correcting photo directions against the point cloud: {i}/{len(cams)}')
+            if r is None: continue
+            seen += 1; cams[i]['R'] = _small_rotations([r[:3]])[0] @ cams[i]['R']; done += 1; size.append(float(np.linalg.norm(r[:3])))
+    return {'refined': done, 'photos': len(cams), 'median_deg': round(float(np.median(size)), 2) if size else 0.0}
+
 def targets(cams, min_share=.08, most=4, miss_m=4.0):
     """Every structure the photos were taken around: a site often has several masts, each flown around in turn. The
     vertical lines that the cameras' viewing directions pass within miss_m metres of, each seen by at least min_share
