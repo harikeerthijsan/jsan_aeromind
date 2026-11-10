@@ -1465,3 +1465,17 @@ def test_sites_with_several_masts_keep_every_structure():
     focus = np.ones(len(P), bool); grey = np.full((len(P), 3), 128, np.uint8)
     S, info = pc.split_structure(P, grey, focus, [m for m in masts], 12.0)
     assert info['structures'] == 3 and all(S[i * 3000:(i + 1) * 3000].mean() > .9 for i in range(3))
+
+def test_equipment_around_a_mast_head_is_split_by_direction():
+    """Antennas mounted in three sectors around a pole are closer together than drone-metadata poses can resolve by
+    position, but each photo sees the side facing it: the ring of anchors gives the axis, the directions the sectors."""
+    np = pytest.importorskip('numpy')
+    from app import registration as reg
+    rng = np.random.default_rng(2); s = .2  # viewer units per metre
+    az = np.concatenate([rng.normal(a, 12, 120) for a in (30, 150, 270)]); r = rng.normal(.45, .08, len(az))
+    ax = np.array([3.0, -1.0])
+    P = np.c_[ax[0] + s * r * np.cos(np.radians(az)), rng.normal(2.5, .05, len(az)), ax[1] + s * r * np.sin(np.radians(az))]
+    c = reg._ring_centre(P[:, [0, 2]], s); assert c is not None and np.linalg.norm(c - ax) < .05 * s
+    lab = reg._split_azimuth(P, c, s); assert lab.max() == 2 and (lab >= 0).mean() > .9
+    for k in range(3): assert len(set(lab[k * 120:(k + 1) * 120][lab[k * 120:(k + 1) * 120] >= 0])) == 1  # one label per sector
+    one = P[:120]; assert reg._split_azimuth(one, c, s).max() < 1   # a single direction: no split

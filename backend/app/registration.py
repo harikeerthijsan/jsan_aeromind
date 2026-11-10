@@ -667,6 +667,196 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
     _attach_detections(out, shots, by_media, poses, cameras)
     out = _drop_fragments(out, s)
     for c in out: c.pop('_centre', None); c.pop('_score', None)
+    # voting needs many photos agreeing on many points, so it places the big things (antennas, cabinets); everything
+    # else that was detected (bolts, clamps, brackets, cables, ladders, ...) is placed from the detections themselves
+    fill = _fill_in(V, out, shots, by_media, poses, cameras, to_view, s, axis_near, progress)
+    # a voted box holding two or more separate objects of its class (a mast's whole antenna head) gives way to them
+    def holds(b, c):
+        d = np.asarray(c['position'], float) - np.asarray(b['position'], float); yw = b.get('yaw') or 0.0
+        across, depth = d[0] * math.cos(yw) - d[2] * math.sin(yw), d[0] * math.sin(yw) + d[2] * math.cos(yw)
+        return abs(across) <= b['size_w'] / 2 + .15 * s and abs(d[1]) <= b['size_h'] / 2 + .15 * s and abs(depth) <= b['size_d'] / 2 + .15 * s
+    out = [b for b in out if sum(1 for c in fill if c['class_name'] == b['class_name'] and holds(b, c)) < 2]
+    fill = [c for c in fill if not any(b['class_name'] == c['class_name'] and holds(b, c) for b in out)]  # the same object twice
+    return out + fill
+
+# ---------- fill-in: every detected class in 3D ----------
+# Each detection is anchored on the nearest surface its box sees in its photo (z-buffered cloud), same-class anchors
+# are grouped (at most one detection per photo), and a group seen in FILL_MIN_PHOTOS photos is an object, its box sized
+# from the detections at that distance. Groups inside a box voting already placed for the class are that box.
+FILL_MIN_PHOTOS = 3       # photos that must agree on an object
+FILL_SHARE = .2           # ... and at least this share of the photos of the best-supported object of its class
+FILL_RADIUS_M = .25       # grouping reach floor (metres): camera poses from drone metadata are good to a few decimetres
+FILL_MAX_PER_CLASS = 150  # the best-supported objects per class (bolts: hundreds of small groups)
+
+SPLIT_CLASSES = {'sector_antenna', 'microwave_dish', 'rru', 'mounting_brackets'}  # mounted in sectors around a mast
+SPLIT_REACH_M = 2.5       # anchors this close to a mast's axis can be split by direction
+SPLIT_MIN_SHARE = .12     # a direction needs this share of the group's anchors
+SPLIT_GAP_DEG = 45        # directions closer than this are one sector
+
+def _split_azimuth(P, ax, s):
+    """Anchors (viewer coordinates) around a mast axis (x, z) -> a label per anchor, one per direction the equipment
+    faces (sectors are ~120 degrees apart); -1 for anchors too far from the axis or between directions. Equipment
+    mounted around a mast head is closer together than the camera poses can tell apart by position, but each photo
+    sees the side facing it, so the directions separate them."""
+    import numpy as np
+    d = P[:, [0, 2]] - ax; r = np.linalg.norm(d, axis=1); near = r <= SPLIT_REACH_M * s; lab = np.full(len(P), -1)
+    if near.sum() < 10: return lab
+    az = (np.degrees(np.arctan2(d[:, 1], d[:, 0])) + 360) % 360
+    h = np.histogram(az[near], bins=36, range=(0, 360))[0].astype(float); h = (np.roll(h, 1) + 2 * h + np.roll(h, -1)) / 4  # smoothed, circular
+    peaks = [i for i in np.argsort(-h) if h[i] >= max(3, SPLIT_MIN_SHARE * near.sum() / 6) and h[i] >= h[(i - 1) % 36] and h[i] >= h[(i + 1) % 36]]
+    keep = []
+    for i in peaks:
+        if all(min(abs(i - j) * 10, 360 - abs(i - j) * 10) >= SPLIT_GAP_DEG for j in keep): keep.append(i)
+    if len(keep) < 2: return lab
+    centres = np.array(keep) * 10 + 5
+    gap = np.abs((az[:, None] - centres[None, :] + 180) % 360 - 180); best = gap.argmin(1)
+    lab[near & (gap.min(1) <= SPLIT_GAP_DEG)] = best[near & (gap.min(1) <= SPLIT_GAP_DEG)]
+    return lab
+
+def _ring_centre(H, s):
+    """Equipment around a mast head lies on a ring around its axis: the centre of the circle fitted to the anchors'
+    horizontal positions (viewer x, z), or None when they do not form one (0.1-2.5 m radius)."""
+    import numpy as np
+    if len(H) < 10: return None
+    A = np.c_[H, np.ones(len(H))]; b = -(H ** 2).sum(1)
+    try: D, E, F = np.linalg.lstsq(A, b, rcond=None)[0]
+    except np.linalg.LinAlgError: return None
+    c = np.array([-D / 2, -E / 2]); r2 = c @ c - F
+    return c if r2 > 0 and .1 * s <= np.sqrt(r2) <= SPLIT_REACH_M * s else None
+
+def _group_fill(rs):
+    """Same-class anchors -> objects. An object reaches as far as it is big: half its detected width across and half its
+    height up and down (a 2 m antenna seen from below and from above anchors at different heights), at most one detection
+    per photo; then objects whose centres fall inside each other's box are one. Returns lists of row indices."""
+    import numpy as np
+    A = np.asarray([r['anchor'] for r in rs]); media = np.asarray([r['media_id'] for r in rs])
+    Wd = np.maximum(.5 * np.asarray([r['w'] for r in rs]), FILL_RADIUS_M); Hd = np.maximum(.5 * np.asarray([r['h'] for r in rs]), FILL_RADIUS_M)
+    order = sorted(range(len(rs)), key=lambda i: -rs[i]['confidence'] * min(1, math.log2(rs[i]['points'] + 1) / 6))
+    free = np.ones(len(rs), bool); groups = []
+    for seed in order:
+        if not free[seed]: continue
+        centre, rh, rv, members = A[seed], Wd[seed], Hd[seed], np.array([seed])
+        for _ in range(3):
+            idx = np.flatnonzero(free); dh = np.linalg.norm(A[idx, :2] - centre[:2], axis=1) / rh; dv = np.abs(A[idx, 2] - centre[2]) / rv
+            ok = (dh <= 1) & (dv <= 1); idx, dist = idx[ok], np.maximum(dh, dv)[ok]
+            idx = idx[np.lexsort((dist, media[idx]))]; idx = idx[np.r_[True, media[idx][1:] != media[idx][:-1]]] if len(idx) else idx  # closest per photo
+            members = np.union1d(idx[media[idx] != media[seed]], [seed]); centre = np.median(A[members], 0)
+            rh, rv = float(np.median(Wd[members])), float(np.median(Hd[members]))
+        free[members] = False; groups.append(members.tolist())
+    # pieces of one object: a centre inside another group's box
+    info = [(np.median(A[g], 0), float(np.median(Wd[g])), float(np.median(Hd[g]))) for g in groups]
+    parent = list(range(len(groups)))
+    def root(i):
+        while parent[i] != i: parent[i] = parent[parent[i]]; i = parent[i]
+        return i
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            (ci, wi, hi), (cj, wj, hj) = info[i], info[j]
+            if np.linalg.norm(ci[:2] - cj[:2]) <= max(wi, wj) and abs(ci[2] - cj[2]) <= max(hi, hj): parent[root(j)] = root(i)
+    merged = defaultdict(list)
+    for i, g in enumerate(groups): merged[root(i)] += g
+    return list(merged.values())
+
+def _anchor_gpu(V, shots, by_media, poses, cameras, progress=None):
+    """_anchor_detections for the voting path, on the GPU when there is one: per detection, the nearest surface its box
+    sees in its photo (model metres) and its size at that distance."""
+    import numpy as np
+    import torch
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    Vt = torch.as_tensor(V, dtype=torch.float32, device=dev); rows = defaultdict(list)
+    for n, (m, name) in enumerate(shots):
+        pose = poses[name]; cam = cameras[pose[3]]; W, H = cam[2], cam[3]; f = cam[1][0]
+        R = torch.as_tensor(pose[4], dtype=torch.float32, device=dev); t = torch.as_tensor(pose[5], dtype=torch.float32, device=dev)
+        uv, z = _project_torch(Vt, R, t, cam)
+        idx = torch.nonzero((z > .5) & (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)).squeeze(1)
+        if not len(idx): continue
+        cols, rws = int(math.ceil(W / VOTE_CELL_PX)), int(math.ceil(H / VOTE_CELL_PX))
+        cell = (uv[idx, 1] // VOTE_CELL_PX).long() * cols + (uv[idx, 0] // VOTE_CELL_PX).long(); zi = z[idx]
+        zmin = torch.full((rws * cols,), float('inf'), device=dev).scatter_reduce_(0, cell, zi, 'amin')
+        vis = zi <= zmin[cell] + VOTE_VISIBLE_M; idx, zv = idx[vis], zi[vis]; u, v = uv[idx, 0], uv[idx, 1]
+        for d in by_media[m.id]:
+            x1, x2, y1, y2 = _box_px(d, cam); mx, my = .15 * (x2 - x1), .15 * (y2 - y1)  # inner box: less background
+            inside = (u >= x1 + mx) & (u <= x2 - mx) & (v >= y1 + my) & (v <= y2 - my)
+            if int(inside.sum()) < 3: continue
+            zz = zv[inside]; z_ref = float(torch.quantile(zz, .2)) if len(zz) < 16_000_000 else float(zz.median())
+            w3, h3 = (x2 - x1) * z_ref / f, (y2 - y1) * z_ref / f  # pinhole: size = pixels x distance / focal
+            front = idx[inside][zz <= z_ref + .5 * min(w3, h3)]  # the nearest layer is the object, not the tower behind it
+            if len(front) < 3: continue
+            rows[d.class_name].append({'anchor': Vt[front].median(0).values.cpu().numpy().astype(float), 'media_id': m.id, 'name': name, 'det': d,
+                                       'confidence': _confidence(d), 'w': w3, 'h': h3, 'points': int(len(front))})
+        if progress and n % 100 == 0: progress(f'Placing every detection: photo {n + 1}/{len(shots)}')
+    return rows
+
+def _fill_in(V, voted, shots, by_media, poses, cameras, to_view, s, axis_near, progress=None):
+    """Objects of every detected class that voting did not place (see above): candidate dicts in viewer coordinates."""
+    import numpy as np
+    try: rows = _anchor_gpu(V, shots, by_media, poses, cameras, progress)
+    except ImportError: rows = _anchor_detections(V, VOTE_VISIBLE_M, [m for m, _ in shots], {m.id: n for m, n in shots}, by_media, poses, cameras)
+    def placed(cls, p):  # inside a box voting placed for the class (oriented box, 15 cm margin): the same object
+        for b in voted:
+            if b['class_name'] != cls: continue
+            d = np.asarray(p, float) - np.asarray(b['position'], float); yw = b.get('yaw') or 0.0; m = .15 * s
+            across, depth = d[0] * math.cos(yw) - d[2] * math.sin(yw), d[0] * math.sin(yw) + d[2] * math.cos(yw)
+            if abs(across) <= b['size_w'] / 2 + m and abs(d[1]) <= b['size_h'] / 2 + m and abs(depth) <= b['size_d'] / 2 + m: return True
+        return False
+    out = []
+    for cls, rs in rows.items():
+        groups = []
+        for members in _group_fill(rs):
+            mem = [rs[i] for i in members]; parts = [mem]
+            if cls in SPLIT_CLASSES and len(mem) >= 10:
+                Pv = to_view(np.array([r['anchor'] for r in mem])); ax = _ring_centre(Pv[:, [0, 2]], s)
+                lab = _split_azimuth(Pv, ax, s) if ax is not None else np.full(len(Pv), -1)
+                if lab.max() >= 1: parts = [[r for r, l in zip(mem, lab) if l == k] for k in range(lab.max() + 1)]
+            for part in parts:
+                if part: groups.append((len({r['media_id'] for r in part}), part, len(parts) > 1))
+        groups.sort(key=lambda g: (-g[0], -sum(r['confidence'] for r in g[1])))
+        if not groups: continue
+        split_any = any(g[2] for g in groups)
+        need = max(FILL_MIN_PHOTOS, FILL_SHARE * groups[0][0])
+        good = [g for g in groups if g[0] >= need] or groups[:1]  # every detected class: at least its best-supported object
+        n = 0
+        for photos, mem, split in good:
+            if n >= FILL_MAX_PER_CLASS: break
+            A = np.array([r['anchor'] for r in mem]); centre = np.median(A, 0); pos = to_view(centre)[0]
+            if not split and placed(cls, pos): continue
+            w, h = float(np.median([r['w'] for r in mem])) * s, float(np.median([r['h'] for r in mem])) * s
+            ax = axis_near(pos[None]); dx, dz = pos[0] - ax[0], pos[2] - ax[1]
+            out.append({'class_name': cls, 'position': pos, 'size_w': max(w, 1e-3), 'size_h': max(h, 1e-3), 'size_d': max(min(w, h) * rule_for(cls)['depth'], 1e-3),
+                        'yaw': float(math.atan2(dx, dz)) if math.hypot(dx, dz) > 1e-9 else 0.0, 'box_method': 'photo', 'box_points': None,
+                        'point_count': int(sum(r['points'] for r in mem)), 'media_count': int(photos), 'evidence_count': len(mem),
+                        'spread': float(np.median(np.linalg.norm(A - centre, axis=1)) * s), 'detection_ids': [int(r['det'].id) for r in mem],
+                        'confidence': float(min(.99, np.mean([r['confidence'] for r in mem]))), 'fit_iou': None, '_m': centre})
+            n += 1
+    return _detected_enough(out, shots, by_media, poses, cameras)
+
+FILL_KEEP_SHARE = .5      # an object's detection rate must be at least this share of the best of its class
+
+def _detected_enough(cands, shots, by_media, poses, cameras):
+    """A real object is detected in a good share of the photos that have it in view; a phantom made of stray anchors
+    (a tiny bolt box that missed the mast and hit the grass behind it) is in view in hundreds of photos but boxed in a
+    few. Keeps candidates boxed in at least FILL_KEEP_SHARE of their class's best rate (and FILL_MIN_PHOTOS photos)."""
+    import numpy as np
+    if not cands: return cands
+    X = np.array([c['_m'] for c in cands]); cls = [c['class_name'] for c in cands]
+    inview, held = np.zeros(len(cands), int), np.zeros(len(cands), int)
+    for m, name in shots:
+        pose = poses[name]; cam = cameras[pose[3]]; uv, z = project(X, pose[4], pose[5], cam)
+        vis = (z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < cam[2]) & (uv[:, 1] >= 0) & (uv[:, 1] < cam[3]); inview += vis
+        hit = np.zeros(len(cands), bool)
+        for d in by_media[m.id]:
+            x1, x2, y1, y2 = _box_px(d, cam); mx, my = .1 * (x2 - x1), .1 * (y2 - y1)
+            k = vis & (uv[:, 0] >= x1 - mx) & (uv[:, 0] <= x2 + mx) & (uv[:, 1] >= y1 - my) & (uv[:, 1] <= y2 + my)
+            for i in np.flatnonzero(k):
+                if cls[i] == d.class_name: hit[i] = True
+        held += hit
+    rate = held / np.maximum(inview, 1)
+    best = {c: max(rate[i] for i in range(len(cands)) if cls[i] == c) for c in set(cls)}
+    out = []
+    for i, c in enumerate(cands):
+        keep = held[i] >= FILL_MIN_PHOTOS and rate[i] >= FILL_KEEP_SHARE * best[cls[i]]
+        if keep or not any(cls[j] == cls[i] and held[j] >= FILL_MIN_PHOTOS and rate[j] >= FILL_KEEP_SHARE * best[cls[j]] for j in range(len(cands))) and rate[i] == best[cls[i]]:
+            c.pop('_m', None); out.append(c)  # every detected class keeps at least its best-detected object
     return out
 
 def _merge_by_detections(parts, V, shots, by_media, poses, cameras):
