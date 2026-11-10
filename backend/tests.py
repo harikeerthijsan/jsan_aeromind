@@ -1409,7 +1409,7 @@ def test_photo_previews_made_at_upload_and_kept_in_the_bucket(monkeypatch):
         r = client.get(f"/api/v1/media/{m['id']}/thumb?w=200")
         assert r.status_code == 200 and Image.open(io.BytesIO(r.content)).size == (200, 133)  # ... the preview comes back from the bucket
         m2 = client.post(f"/api/v1/inspections/{ins['id']}/media", files={'file': ('q.jpg', jpg, 'image/jpeg')}).json()
-        assert wait(lambda: f"uploads/.thumbs/{m2['id']}_1280.jpg" in fake.o)
+        assert wait(lambda: all(f"uploads/.thumbs/{m2['id']}_{s}.jpg" in fake.o for s in THUMB_SIZES))
         for s in THUMB_SIZES: fake.o.pop(f"uploads/.thumbs/{m2['id']}_{s}.jpg"); (THUMB_DIR / f"{m2['id']}_{s}.jpg").unlink()  # uploaded before previews existed
         from app import auth
         app.dependency_overrides[auth.require_admin] = lambda: None  # sign-in is off in these tests; the endpoint is admin-only
@@ -1418,3 +1418,31 @@ def test_photo_previews_made_at_upload_and_kept_in_the_bucket(monkeypatch):
         assert wait(lambda: all(f"uploads/.thumbs/{m2['id']}_{s}.jpg" in fake.o for s in THUMB_SIZES))
         assert client.post(f"/api/v1/inspections/{ins['id']}/media/delete", json={'media_ids': [m2['id']]}).status_code == 200
         assert not any(f"{m2['id']}_" in k for k in fake.o if '.thumbs' in k)           # deleted with the photo
+
+def test_detections_are_placed_in_3d_automatically(monkeypatch):
+    """Once an inspection has both detections and a completed 3D model, the 3D box placement is queued on the GPU worker
+    (once), its state is reported, and the twin can list every class detected in the photos."""
+    from app import gpu, main
+    from app.database import SessionLocal
+    from sqlalchemy import select
+    from app.models import Inspection, Media, Detection, Model3D, Job, WorkerTask
+    monkeypatch.setattr(gpu, 'REMOTE', True)
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            ins = Inspection(site_id=1, label='auto boxes'); db.add(ins); db.flush()
+            m1 = Media(inspection_id=ins.id, filename='a.jpg', storage_key='a.jpg', content_type='image/jpeg', sha256='x', size_bytes=1); m2 = Media(inspection_id=ins.id, filename='b.jpg', storage_key='b.jpg', content_type='image/jpeg', sha256='y', size_bytes=1)
+            db.add_all([m1, m2]); db.flush()
+            dj = Job(inspection_id=ins.id, kind='detection', status='completed', stage='detection', media_ids=[m1.id, m2.id]); db.add(dj); db.flush()
+            for m, c in ((m1, 'rru'), (m1, 'rru'), (m2, 'rru'), (m2, 'ladder')):
+                db.add(Detection(job_id=dj.id, inspection_id=ins.id, media_id=m.id, frame_index=0, class_id=0, class_name=c, confidence=.9, x1=0, y1=0, x2=10, y2=10, image_width=100, image_height=100, model_name='yolo'))
+            rj = Job(inspection_id=ins.id, kind='reconstruction', status='completed', stage='done', media_ids=[m1.id, m2.id]); db.add(rj); db.flush()
+            model = Model3D(inspection_id=ins.id, job_id=rj.id, dense=True, status='completed', quality={'transform': [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}); db.add(model)
+            no_boxes = Model3D(inspection_id=ins.id, job_id=rj.id, dense=True, status='completed', quality={'transform': [[1, 0, 0, 0]] * 4, 'boxes_available': False}); db.add(no_boxes); db.commit()
+            assert main.auto_boxes(db, model) is True and main.auto_boxes(db, model) is False   # queued once, not twice
+            assert main.auto_boxes(db, no_boxes) is False                                      # a model that cannot hold boxes
+            mid, iid = model.id, ins.id
+            assert sum(1 for t in db.scalars(select(WorkerTask).where(WorkerTask.kind == 'register_assets')) if t.payload == {'model_id': mid}) == 1
+        assert client.get(f'/api/v1/models/{mid}/registrations/status').json()['state'] == 'queued'
+        assert client.post(f'/api/v1/models/{mid}/register-assets?background=true').status_code == 202
+        with SessionLocal() as db: assert sum(1 for t in db.scalars(select(WorkerTask).where(WorkerTask.kind == 'register_assets')) if t.payload == {'model_id': mid}) == 1  # still one
+        assert client.get(f'/api/v1/inspections/{iid}/detection-classes').json() == [{'class_name': 'rru', 'detections': 3, 'photos': 2}, {'class_name': 'ladder', 'detections': 1, 'photos': 1}]

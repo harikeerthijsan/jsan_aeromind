@@ -688,7 +688,7 @@ def _pc_apply(db,r,job_id,model_id):
     job.detail=(f"3D model from point cloud: {info.get('points_total',0):,} points ({info.get('points_used',0):,} used)"
                 +(f" · {r['registered_images']}/{r['images_total']} photos aligned (ICP {al['icp_rms_m']} m, {al['inliers_pct']}% on the cloud)" if al else f" · {r.get('boxes_note','')}")
                 +(f" · {r['warning']}" if r.get('warning') else '')+f" · {r['seconds']}s")[:2000]
-    db.commit();return {'model_id':m3.id,'status':m3.status}
+    db.commit();auto_boxes(db,m3);return {'model_id':m3.id,'status':m3.status}
 def _pc_fail(db,error,job_id,model_id):_recon_fail(db,error,job_id,model_id,True)
 gpu.register('run_pointcloud_model',prepare=_pc_prepare,apply=_pc_apply,fail=_pc_fail,progress=lambda *a,**k:_job_progress(*a,**k))  # defined further down
 @app.delete('/api/v1/media/{media_id}',status_code=204)
@@ -808,7 +808,11 @@ def _detection_apply(db,result,job_id):
     top=', '.join(f'{k} {v}' for k,v in counts.most_common(5))
     job.media_ids=ok_ids;job.status='completed';job.progress=100;job.stage='detection'  # failed files stay "not processed", so only_new retries them
     job.detail=f'{counts.total()} detections in {len(ok_ids)} file(s)'+(f' incl. {nframes} video frames' if nframes else '')+f' · {name}'+(f' · {top}' if top else '')+(f' · FAILED {len(failed)}: '+'; '.join(failed) if failed else '')
-    db.commit();return {'job_id':job.id,'status':job.status}
+    db.commit()
+    if counts:
+        m=db.scalar(select(Model3D).where(Model3D.inspection_id==job.inspection_id,Model3D.status=='completed').order_by(Model3D.id.desc()).limit(1))
+        if m:auto_boxes(db,m)
+    return {'job_id':job.id,'status':job.status}
 def _detection_fail(db,error,job_id):
     db.rollback();job=db.get(Job,job_id);job.status='failed';job.detail=f"Detection failed: {error['detail']}"[:2000];db.commit()
 gpu.register('run_detection',prepare=_detection_prepare,apply=_detection_apply,fail=_detection_fail,progress=_job_progress)
@@ -1204,10 +1208,47 @@ def locate_on_photo(model_id:int,media_id:int,data:LocateIn,db:Session=Depends(g
     m,pm=_photo_model(db,model_id)
     try:return {'scaled':pm['mpu'] is not None,'points':photoview.locate(model_id,pm,media_id,[p[:2] for p in data.points])}
     except photoview.Unavailable as e:raise HTTPException(409,str(e))
+AUTO_3D_BOXES=os.getenv('AUTO_3D_BOXES','true').lower()=='true'
+def _boxes_task(db,model_id:int):
+    """The latest 3D box placement queued or run for a model (worker tasks; none when the server computes locally)."""
+    from .models import WorkerTask
+    return next((t for t in db.scalars(select(WorkerTask).where(WorkerTask.kind=='register_assets').order_by(WorkerTask.id.desc()).limit(200)) if (t.payload or {}).get('model_id')==model_id),None)
+def auto_boxes(db,model)->bool:
+    """Place the inspection's detections in 3D once both exist (after detection, or after a 3D model is built), so the
+    Digital Twin shows every detected class without anyone having to find a button. Queued on the GPU worker."""
+    try:
+        q=model.quality or {}
+        if not AUTO_3D_BOXES or not gpu.REMOTE or model.status!='completed' or q.get('boxes_available') is False or not q.get('transform') or q.get('photos_removed'):return False
+        if not db.scalar(select(func.count()).select_from(Detection).where(Detection.inspection_id==model.inspection_id,Detection.review_status!='rejected')):return False
+        t=_boxes_task(db,model.id)
+        if t and t.status in ('queued','running'):return False
+        gpu.submit('register_assets',{'model_id':model.id});return True
+    except Exception as e:
+        print(f'3D boxes for model {getattr(model,"id",None)} not queued: {e}',flush=True);return False
 @app.post('/api/v1/models/{model_id}/register-assets')
-def register_assets(model_id:int):
-    """Create conservative, review-only 3D candidates from high-confidence 2D boxes and COLMAP feature tracks."""
+def register_assets(model_id:int,background:bool=False):
+    """Create conservative, review-only 3D candidates from high-confidence 2D boxes and COLMAP feature tracks.
+    background=true queues it on the GPU worker and returns at once (large inspections take minutes): poll .../registrations/status."""
+    if background and gpu.REMOTE:
+        with SessionLocal() as db:
+            m=db.get(Model3D,model_id)
+            if not m or m.status!='completed':raise HTTPException(404,'Completed 3D model not found')
+            t=_boxes_task(db,model_id)
+            if not (t and t.status in ('queued','running')):gpu.submit('register_assets',{'model_id':model_id})
+        return JSONResponse({'model_id':model_id,'status':'queued'},202)
     return gpu.call('register_assets',model_id=model_id)
+@app.get('/api/v1/models/{model_id}/registrations/status')
+def registrations_status(model_id:int,db:Session=Depends(get_db)):
+    """Is a 3D box placement queued or running for this model, and how did the last one end."""
+    t=_boxes_task(db,model_id)
+    return {'model_id':model_id,'state':t.status if t else 'none','error':((t.error or {}).get('detail') if t and t.status=='failed' else None),
+            'finished_at':t.finished_at if t else None,'boxes':db.scalar(select(func.count()).select_from(RegistrationCandidate).where(RegistrationCandidate.model_id==model_id)) or 0}
+@app.get('/api/v1/inspections/{inspection_id}/detection-classes')
+def detection_classes(inspection_id:int,db:Session=Depends(get_db)):
+    """Every unique class detected in the inspection's photos: detections and photos per class (rejected ones left out)."""
+    rows=db.execute(select(Detection.class_name,func.count(),func.count(func.distinct(Detection.media_id))).where(Detection.inspection_id==inspection_id,Detection.review_status!='rejected')
+                    .group_by(Detection.class_name).order_by(func.count().desc())).all()
+    return [{'class_name':c,'detections':n,'photos':p} for c,n,p in rows]
 def _register_prepare(db,model_id):
     model=db.get(Model3D,model_id)
     if not model or model.status!='completed' or model.job_id is None:raise HTTPException(404,'Completed 3D model not found')
@@ -1281,7 +1322,7 @@ def _recon_apply(db,r,job_id,model_id,dense,source_model_id=None):
     job.status='completed';job.progress=100;job.stage='done'
     job.detail=(f"3D model{' (dense from model #'+str(source_model_id)+')' if source_model_id else ''}: {r['registered_images']}/{r['images_total']} images placed · {r['sparse_points']:,} sparse points"
                 +(f" · {r.get('dense_points',0):,} dense points · {r.get('mesh_faces',0):,} mesh faces" if r.get('dense') else '')+f" · {r['seconds']}s")
-    db.commit();return {'model_id':m3.id,'status':m3.status}
+    db.commit();auto_boxes(db,m3);return {'model_id':m3.id,'status':m3.status}
 def _recon_fail(db,error,job_id,model_id,dense,source_model_id=None):
     db.rollback();job,m3=db.get(Job,job_id),db.get(Model3D,model_id);job.status=m3.status='failed'
     m3.quality={'error':str(error['detail'])[:500],'files':{'log':'colmap.log'},**({'source_model':source_model_id} if source_model_id else {})}

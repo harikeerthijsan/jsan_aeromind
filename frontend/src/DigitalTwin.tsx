@@ -3,6 +3,7 @@ import {AlertTriangle,Box,Camera,CheckCircle2,ChevronDown,Eye,EyeOff,Layers,Move
 import {Asset,Inspection,RegistrationCandidate,request,json,Site} from './api';
 import Tower3D from './Tower3D';
 import './measure-scale.css';
+import './twin-classes.css';
 import {MeasurementMode,MeasurementPoint,Model3D,ModelScale,ModelView,classColor} from './Reconstruction';
 
 const insCode=(id:number)=>'INS-'+String(id).padStart(4,'0');
@@ -76,13 +77,29 @@ export default function DigitalTwin({site,inspections,assets,selected,onPick,onO
  const candidate=registrations.find(r=>r.id===selectedRegistration)||null;
  // show/hide classes; the list is grouped by class
  const [hiddenClasses,setHiddenClasses]=useState<Set<string>>(new Set());
+ // every unique class detected in the photos, with how many of each are placed in 3D (a class can be found in photos and not placed yet)
+ const [detClasses,setDetClasses]=useState<{class_name:string;detections:number;photos:number}[]>([]);
+ const [boxState,setBoxState]=useState<{state:string;error:string|null;boxes:number}|null>(null);
+ useEffect(()=>{let live=true;setDetClasses([]);if(!model)return;request<{class_name:string;detections:number;photos:number}[]>(`/api/v1/inspections/${model.inspection_id}/detection-classes`).then(d=>live&&setDetClasses(d)).catch(()=>{});return()=>{live=false}},[model?.id]);
+ const [pollKick,setPollKick]=useState(0);  // the button restarts the polling
+ useEffect(()=>{setBoxState(null)},[model?.id]);
+ useEffect(()=>{let live=true,timer=0,was='';if(!model)return;
+  const look=()=>request<{state:string;error:string|null;boxes:number}>(`/api/v1/models/${model.id}/registrations/status`).then(s=>{if(!live)return;setBoxState(s);
+   if(['queued','running'].includes(s.state)){was=s.state;timer=window.setTimeout(look,8000)}
+   else if(was&&s.state==='done')request<RegistrationCandidate[]>(`/api/v1/models/${model.id}/registrations`).then(r=>live&&setRegistrations(r)).catch(()=>{})}).catch(()=>{});
+  look();return()=>{live=false;clearTimeout(timer)}},[model?.id,pollKick]);
+ const placing=registering||['queued','running'].includes(boxState?.state||'');
  const classCounts=useMemo(()=>{const c=new Map<string,number>();registrations.forEach(r=>c.set(r.class_name,(c.get(r.class_name)||0)+1));return [...c].sort((a,b)=>b[1]-a[1])},[registrations]);
+ const classRows=useMemo(()=>{const boxes=new Map(classCounts),rows=detClasses.map(d=>({name:d.class_name,boxes:boxes.get(d.class_name)||0,detections:d.detections,photos:d.photos}));
+  for(const [n,k] of classCounts)if(!detClasses.some(d=>d.class_name===n))rows.push({name:n,boxes:k,detections:0,photos:0});
+  return rows.sort((a,b)=>b.boxes-a.boxes||b.detections-a.detections)},[detClasses,classCounts]);
  const visibleRegs=registrations.filter(r=>!hiddenClasses.has(r.class_name));
  const visibleMarkers=visibleRegs.filter(r=>r.status!=='rejected'),reviewableVisible=visibleRegs.filter(r=>!['approved','rejected'].includes(r.status));
  const approvedCount=registrations.filter(r=>r.status==='approved').length;
  const toggleClass=(n:string)=>setHiddenClasses(h=>{const s=new Set(h);s.has(n)?s.delete(n):s.add(n);return s});
  const focusRegistration=(id:number)=>{if(editingRegistration!=null&&editingRegistration!==id)cancelAdjustment();setSelectedRegistration(id);setFocusRequest(v=>v+1)};
- async function register(){if(!model)return;setRegistering(true);setError('');try{const r=await request<{candidates:RegistrationCandidate[]}>(`/api/v1/models/${model.id}/register-assets`,{method:'POST'});setRegistrations(r.candidates);setSelectedRegistration(r.candidates[0]?.id??null)}catch(e){setError(String(e))}finally{setRegistering(false)}}
+ async function register(){if(!model)return;setRegistering(true);setError('');try{const r=await request<{candidates?:RegistrationCandidate[];status?:string}>(`/api/v1/models/${model.id}/register-assets?background=true`,{method:'POST'});
+  if(r.candidates){setRegistrations(r.candidates);setSelectedRegistration(r.candidates[0]?.id??null)}else{setBoxState(s=>({state:'queued',error:null,boxes:s?.boxes??0}));setPollKick(k=>k+1)}}catch(e){setError(String(e))}finally{setRegistering(false)}}
  async function review3d(candidateIds:number[],status:'approved'|'rejected'|'needs_adjustment'|'needs_review'){if(!model||!candidateIds.length)return false;setReviewing(true);setError('');try{const r=await request<{candidates:RegistrationCandidate[]}>(`/api/v1/models/${model.id}/registrations/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:candidateIds,status})});setRegistrations(r.candidates);if(status!=='needs_adjustment'&&editingRegistration!=null&&candidateIds.includes(editingRegistration)){setEditingRegistration(null);setEditOriginal(null)}return true}catch(e){setError(String(e));return false}finally{setReviewing(false)}}
  async function beginAdjustment(row:RegistrationCandidate){if(!await review3d([row.id],'needs_adjustment'))return;setMeasurementMode(null);setMeasurementPoints([]);setEditOriginal({x:row.x,y:row.y,z:row.z,yaw:row.yaw??0});setEditMode('translate');setEditingRegistration(row.id);setSelectedRegistration(row.id);setFocusRequest(v=>v+1)}
  function updateDraft(id:number,values:Partial<Pick<RegistrationCandidate,'x'|'y'|'z'|'yaw'>>){setRegistrations(rows=>rows.map(row=>row.id===id?{...row,...values}:row))}
@@ -127,7 +144,13 @@ export default function DigitalTwin({site,inspections,assets,selected,onPick,onO
     <summary><span>3D equipment</span><b>{visibleRegs.length}/{registrations.length}</b><ChevronDown size={14}/></summary>
     <div className="twin-section-body">
      <div className="twin-equipment-summary"><div><strong>{registrations.length}</strong><small>Detected</small></div><div><strong>{approvedCount}</strong><small>Approved</small></div><div><strong>{registrations.length-approvedCount}</strong><small>To review</small></div></div>
-     {classCounts.length>0&&<div className="twin-classes">{classCounts.map(([n,k])=><button key={n} className={'det-class '+(hiddenClasses.has(n)?'off':'')} title={hiddenClasses.has(n)?'Show class':'Hide class'} onClick={()=>toggleClass(n)}><i style={{background:classColor(n)}}/><span>{n.replaceAll('_',' ')}</span><b>{k}</b>{hiddenClasses.has(n)?<EyeOff size={12}/>:<Eye size={12}/>}</button>)}</div>}
+     {placing?<div className="twin-placing"><span className="twin-spinner"/>Placing the photo detections in 3D…<small>{detClasses.reduce((a,d)=>a+d.detections,0).toLocaleString()} detections · this takes a few minutes for a large flight</small></div>
+      :boxState?.state==='failed'?<div className="det-error">Placing in 3D failed: {boxState.error}</div>
+      :!registrations.length&&detClasses.length>0&&<div className="twin-placing idle">{detClasses.length} classes were detected in the photos and are not placed in 3D yet.</div>}
+     {!readOnly&&detClasses.length>0&&!placing&&<button className="btn primary wide" onClick={register}><Box size={14}/>{registrations.length?'Rebuild 3D boxes from the detections':'Show the detections in 3D'}</button>}
+     {classRows.length>0&&<><div className="twin-classes-head"><span>Detected classes · {classRows.length}</span>{registrations.length>0&&<button onClick={()=>setHiddenClasses(h=>h.size?new Set():new Set(classRows.map(r=>r.name)))}>{hiddenClasses.size?'Show all':'Hide all'}</button>}</div>
+      <div className="twin-classes">{classRows.map(r=><button key={r.name} className={'det-class '+(hiddenClasses.has(r.name)?'off':'')+(r.boxes?'':' unplaced')} disabled={!r.boxes} title={!r.boxes?'Found in the photos, not placed in 3D yet':hiddenClasses.has(r.name)?'Show class':'Hide class'} onClick={()=>toggleClass(r.name)}>
+       <i style={{background:classColor(r.name)}}/><span>{r.name.replaceAll('_',' ')}<small>{r.boxes?`${r.boxes} in 3D`:'not in 3D'}{r.detections?` · ${r.detections.toLocaleString()} in ${r.photos.toLocaleString()} photos`:''}</small></span><b>{r.boxes}</b>{r.boxes?(hiddenClasses.has(r.name)?<EyeOff size={12}/>:<Eye size={12}/>):null}</button>)}</div></>}
      {!readOnly&&reviewableVisible.length>0&&<button className="btn primary wide registration-approve-all" disabled={reviewing} onClick={()=>review3d(reviewableVisible.map(r=>r.id),'approved')}><CheckCircle2 size={14}/>{reviewing?'Saving…':`Approve visible (${reviewableVisible.length})`}</button>}
      {visibleRegs.length>0&&<details className="twin-box-browser"><summary><span>Review individual boxes</span><b>{visibleRegs.length}</b><ChevronDown size={13}/></summary><div className="twin-scroll-list">{[...visibleRegs].sort((a,b)=>a.class_name.localeCompare(b.class_name)||b.confidence-a.confidence).map(r=><button key={r.id} className={'tree-asset '+(candidate?.id===r.id?'chosen ':'')+(r.status==='rejected'?'rejected':'')} onClick={()=>focusRegistration(r.id)}><i className="registration-dot" style={{background:classColor(r.class_name)}}/><div><b>{r.class_name.replaceAll('_',' ')}</b><small>{r.media_count} images · {Math.round(r.confidence*100)}% · {reviewLabel(r.status)}</small></div></button>)}</div></details>}
     </div>

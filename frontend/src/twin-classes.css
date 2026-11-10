@@ -1,0 +1,11 @@
+/* Digital Twin: every class detected in the photos, and the 3D placement state */
+.twin-equipment-section .twin-classes-head{display:flex;align-items:center;justify-content:space-between;margin:12px 0 4px;color:#7b8d9b;font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.twin-equipment-section .twin-classes-head button{border:0;background:none;color:#1769aa;font-size:9.5px;font-weight:700;text-transform:none;letter-spacing:0;padding:0}
+.twin-equipment-section .det-class span small{display:block;color:#8c9daf;font-size:8.5px;text-transform:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.twin-equipment-section .det-class.unplaced{opacity:.62;cursor:default}.twin-equipment-section .det-class.unplaced:hover{border-color:transparent;background:transparent}
+.twin-equipment-section .det-class:disabled{opacity:.62}
+.twin-placing{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin:10px 0 2px;padding:9px 10px;border-radius:8px;background:#eef5fb;color:#1e5f91;font-size:10.5px;font-weight:700;line-height:1.4}
+.twin-placing small{flex-basis:100%;color:#6e8394;font-weight:500}
+.twin-placing.idle{background:#fff8ea;color:#966d28;font-weight:600}
+.twin-spinner{width:12px;height:12px;border:2px solid #b9d4ea;border-top-color:#1769aa;border-radius:50%;animation:twin-spin .8s linear infinite}
+@keyframes twin-spin{to{transform:rotate(360deg)}}
