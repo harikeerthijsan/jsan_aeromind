@@ -684,7 +684,63 @@ def vote_candidates(dense_model_pts, M, photos, photo_names, by_media, poses, ca
     kept = []  # fill-in duplicates of one object: the best supported stays
     for c in sorted(fill, key=lambda c: (-c['media_count'], -c['confidence'])):
         if not any(k['class_name'] == c['class_name'] and (same(k, c) or same(c, k)) for k in kept): kept.append(c)
-    return out + kept
+    return _fit_antenna_heads(out + kept, V, to_view, s)
+
+HEAD_CLASSES = {'sector_antenna'}  # mounted in sectors on a mast head: boxed on the cloud's own panels
+HEAD_REACH_M = 1.8        # a mast head's equipment lies within this distance of its pole
+HEAD_POLE_M = .2          # ... and outside the pole itself
+HEAD_MIN_SHARE = .08      # a sector needs this share of the head's points
+HEAD_GAP_DEG = 50         # sectors are further apart than this (usually 120 degrees)
+
+def _fit_antenna_heads(cands, V, to_view, s):
+    """Antennas on a mast head, boxed on the cloud: the head's points in the antennas' height band (the pole left out)
+    form one lobe per sector around the pole; each lobe gets a box fitted to its points, carrying the detections of
+    the antennas placed there. Placed from the photos alone, the boxes of one head piled up between the panels."""
+    import numpy as np
+    ants = [c for c in cands if c['class_name'] in HEAD_CLASSES]
+    if not ants: return cands
+    Pv = to_view(V); H = Pv[:, [0, 2]]
+    X = np.array([np.asarray(c['position'], float)[[0, 2]] for c in ants]); parent = list(range(len(ants)))
+    def root(i):
+        while parent[i] != i: parent[i] = parent[parent[i]]; i = parent[i]
+        return i
+    for i in range(len(ants)):  # antennas within 2.5 m of each other: one mast head
+        for j in range(i + 1, len(ants)):
+            if np.linalg.norm(X[i] - X[j]) <= 2.5 * s: parent[root(j)] = root(i)
+    heads = defaultdict(list)
+    for i, c in enumerate(ants): heads[root(i)].append(c)
+    out = [c for c in cands if c['class_name'] not in HEAD_CLASSES]
+    for group in heads.values():
+        y0 = min(c['position'][1] - c['size_h'] / 2 for c in group) - .2 * s; y1 = max(c['position'][1] + c['size_h'] / 2 for c in group) + .2 * s
+        centre = np.median([np.asarray(c['position'], float)[[0, 2]] for c in group], 0)
+        around = np.linalg.norm(H - centre, axis=1) <= (HEAD_REACH_M + 1.0) * s
+        pole = around & (Pv[:, 1] < y0) & (Pv[:, 1] >= y0 - 2.0 * s)  # the pole just below the head gives its axis
+        if pole.sum() < 50: out += group; continue  # no pole under them: not a mast head
+        axis = np.median(H[pole], 0)
+        r = np.linalg.norm(H - axis, axis=1); band = (Pv[:, 1] >= y0) & (Pv[:, 1] <= y1) & (r >= HEAD_POLE_M * s) & (r <= HEAD_REACH_M * s)
+        if band.sum() < 200: out += group; continue
+        d = H[band] - axis; az = (np.degrees(np.arctan2(d[:, 1], d[:, 0])) + 360) % 360
+        h = np.histogram(az, bins=36, range=(0, 360))[0].astype(float); h = (np.roll(h, 1) + 2 * h + np.roll(h, -1)) / 4
+        peaks = []
+        for i in np.argsort(-h):
+            if h[i] < HEAD_MIN_SHARE * band.sum() / 3 or h[i] < h[(i - 1) % 36] or h[i] < h[(i + 1) % 36]: continue
+            if all(min(abs(i - j) * 10, 360 - abs(i - j) * 10) >= HEAD_GAP_DEG for j in peaks): peaks.append(i)
+        if not peaks: out += group; continue
+        centres = np.array(peaks) * 10 + 5; gap = np.abs((az[:, None] - centres[None, :] + 180) % 360 - 180)
+        lab = np.where(gap.min(1) <= HEAD_GAP_DEG / 2 + 10, gap.argmin(1), -1); idx = np.flatnonzero(band)
+        boxes = []
+        for k in range(len(peaks)):
+            pts = Pv[idx[lab == k]]
+            if len(pts) < 50: continue
+            b = fit_box(pts, axis)
+            if b: boxes.append((b, len(pts)))
+        if not boxes: out += group; continue
+        ids = sorted({i for c in group for i in (c.get('detection_ids') or [])}); conf = float(np.mean([c['confidence'] for c in group]))
+        for b, n in boxes:
+            out.append({'class_name': group[0]['class_name'], **b, 'box_method': 'dense', 'box_points': int(n), 'point_count': int(n),
+                        'media_count': int(max(c['media_count'] for c in group)), 'evidence_count': int(sum(c.get('evidence_count') or 0 for c in group) // len(boxes)),
+                        'spread': float(np.median([c.get('spread') or 0 for c in group])), 'detection_ids': ids, 'confidence': conf, 'fit_iou': None})
+    return out
 
 # ---------- fill-in: every detected class in 3D ----------
 # Each detection is anchored on the nearest surface its box sees in its photo (z-buffered cloud), same-class anchors

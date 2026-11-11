@@ -1510,3 +1510,27 @@ def test_viewer_surroundings_are_sampled_evenly():
     inner = (r < 5).sum() / (np.pi * 25); outer = ((r > 20) & (np.abs(P[k, :2]).max(1) < 50)).sum() / (1e4 - np.pi * 400)
     assert len(k) <= 80_000 and .8 < inner / outer < 1.25
     assert len(even_sample(np.arange(10), P, 100, rng)) == 10
+
+def test_antennas_on_a_mast_head_are_boxed_on_their_panels():
+    """Antenna boxes placed from the photos piled up between the panels; with the cloud's head (a pole and three
+    sector lobes) each lobe gets its own box fitted to its points, carrying the detections."""
+    np = pytest.importorskip('numpy'); pytest.importorskip('scipy')
+    from app import registration as R
+    rng = np.random.default_rng(0); pole = np.c_[rng.normal(0, .08, (4000, 2)), rng.uniform(0, 14, 4000)]
+    lobes = []
+    for a in (30, 150, 270):  # a panel 0.5 m out, 0.35 x 0.15 m, 1.6 m tall, facing outward
+        u = np.array([np.cos(np.radians(a)), np.sin(np.radians(a))]); t = np.array([-u[1], u[0]])
+        n = 3000; p = .5 * u + np.outer(rng.uniform(-.175, .175, n), t) + np.outer(rng.uniform(-.075, .075, n), u)
+        lobes.append(np.c_[p, rng.uniform(12, 13.6, n)])
+    V = np.vstack([pole] + lobes); Mz = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1.0]]); s = 1.0
+    to_view = lambda X: (np.atleast_2d(X) @ Mz[:3, :3].T)
+    piled = [{'class_name': 'sector_antenna', 'position': np.array([dx, 12.8, 0.0]), 'size_w': .6, 'size_h': 1.6, 'size_d': .3, 'yaw': 0.0,
+              'media_count': 40, 'evidence_count': 40, 'confidence': .8, 'spread': .1, 'detection_ids': [k], 'box_method': 'photo'} for k, dx in enumerate((-.1, 0, .1, .05))]
+    out = R._fit_antenna_heads(piled + [{'class_name': 'rru', 'position': np.zeros(3), 'size_w': .3, 'size_h': .4, 'size_d': .2}], V, to_view, s)
+    ants = [c for c in out if c['class_name'] == 'sector_antenna']; assert len(ants) == 3 and any(c['class_name'] == 'rru' for c in out)
+    for a in (30, 150, 270):
+        want = .5 * np.array([np.cos(np.radians(a)), -np.sin(np.radians(a))])  # viewer x, z
+        assert min(np.linalg.norm(np.asarray(c['position'])[[0, 2]] - want) for c in ants) < .08
+    assert all(abs(c['size_h'] - 1.6) < .2 and c['box_method'] == 'dense' and c['detection_ids'] == [0, 1, 2, 3] for c in ants)
+    V2 = np.vstack(lobes)  # no pole under them: left as placed
+    assert len([c for c in R._fit_antenna_heads(piled, V2, to_view, s) if c['class_name'] == 'sector_antenna']) == 4
