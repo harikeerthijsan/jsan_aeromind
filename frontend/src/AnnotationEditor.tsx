@@ -43,7 +43,7 @@ export function useReviewData(inspectionId:number|undefined,refresh:unknown){
 export function useDirtyGuard(){const dirty=useRef(false);return {onDirty:(d:boolean)=>{dirty.current=d},guard:(fn:()=>void)=>{if(!dirty.current||confirm('Discard unsaved box changes on this image?')){dirty.current=false;fn()}}}}
 
 export default function AnnotationEditor({media,workflow,detections,jobId,classes,minConf,onMinConf,hidden,onToggleClass,shell,nav,onSaved,onDirty,notice,vendors,focusKey}:{focusKey?:string;vendors:VendorInfo|null;media:Media;workflow:Workflow;detections:Detection[];jobId:number|null;classes:ClassInfo[];minConf:number;onMinConf:(v:number)=>void;hidden:Set<string>;onToggleClass:(name:string)=>void;shell:React.RefObject<HTMLDivElement|null>;nav?:{position:string;prev?:()=>void;next?:()=>void};onSaved:(r:Review)=>void;onDirty:(dirty:boolean)=>void;notice?:React.ReactNode}){
- const [natural,setNatural]=useState<{w:number;h:number}|null>(null),[imageUrl,setImageUrl]=useState(''),[loaded,setLoaded]=useState<MediaAnnotations|null>(null),[error,setError]=useState(''),[saving,setSaving]=useState(false),[notes,setNotes]=useState('');
+ const [natural,setNatural]=useState<{w:number;h:number}|null>(null),[imageUrl,setImageUrl]=useState(''),[previewOnly,setPreviewOnly]=useState(false),[loaded,setLoaded]=useState<MediaAnnotations|null>(null),[error,setError]=useState(''),[saving,setSaving]=useState(false),[notes,setNotes]=useState('');
  const [hist,setHist]=useState<{past:Box[][];present:Box[];future:Box[][]}>({past:[],present:[],future:[]}),[baseline,setBaseline]=useState<Box[]>([]);
  const [view,setView]=useState<View>({x:0,y:0,w:1,h:1}),[size,setSize]=useState({w:1,h:1}),[full,setFull]=useState(false),[panning,setPanning]=useState(false);
  const [tool,setTool]=useState<'select'|'draw'>('select'),[selected,setSelected]=useState<string|null>(null),[hover,setHover]=useState<string|null>(null),[labels,setLabels]=useState(false),[cursor,setCursor]=useState<{x:number;y:number}|null>(null),[draft,setDraft]=useState<Box|null>(null),[drawClass,setDrawClass]=useState(''),[extra,setExtra]=useState<string[]>([]),[newClass,setNewClass]=useState('');
@@ -54,8 +54,19 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
  useEffect(()=>{let live=true,objectUrl='';const abort=new AbortController(),token=getAuthToken();
   // Protected media cannot rely on the session cookie when local development mixes localhost and 127.0.0.1.
   // Fetch it with the same bearer token as API requests, then let the SVG render the authenticated blob.
-  fetch(API+media.url,{credentials:'include',headers:token?{Authorization:`Bearer ${token}`}:{},signal:abort.signal}).then(async r=>{if(!r.ok)throw Error(`Could not load the image (${r.status}).`);return r.blob()}).then(blob=>{if(!live)return;objectUrl=URL.createObjectURL(blob);const img=new Image();img.onload=()=>{if(live){setNatural({w:img.naturalWidth,h:img.naturalHeight});setImageUrl(objectUrl)}};img.onerror=()=>live&&setError('Could not decode the image.');img.src=objectUrl}).catch(e=>{if(live&&e?.name!=='AbortError')setError(String(e?.message||e))});
-  request<MediaAnnotations>(`/api/v1/media/${media.id}/annotations`).then(r=>{if(!live)return;const init=r.review?r.annotations.map(fromAnn):detections.map(fromDet);jobRef.current=r.review?r.review.job_id:jobId;setLoaded(r);setHist({past:[],present:init,future:[]});setBaseline(init);setNotes(r.review?.notes||'')}).catch(e=>live&&setError(String(e)));return()=>{live=false;abort.abort();if(objectUrl)URL.revokeObjectURL(objectUrl)}},[]);
+  // the stored preview (1280 px, ~250 KB) first, then the 12-16 MB original for sharp zooming; a broken download of the
+  // original (net::ERR_FAILED on a slow line) is retried once, and the preview stays usable if it fails again
+  const urls:string[]=[];let full=false;
+  const get=(path:string)=>fetch(API+path,{credentials:'include',headers:token?{Authorization:`Bearer ${token}`}:{},signal:abort.signal}).then(async r=>{if(!r.ok)throw Error(`Could not load the image (${r.status}).`);return r.blob()});
+  const show=(blob:Blob,original:boolean)=>new Promise<{w:number;h:number}|null>(done=>{if(!live||(full&&!original))return done(null);const u=URL.createObjectURL(blob);urls.push(u);const img=new Image();
+   img.onload=()=>{if(live&&(original||!full)){if(original){full=true;setNatural({w:img.naturalWidth,h:img.naturalHeight});setPreviewOnly(false)}setImageUrl(u)}done({w:img.naturalWidth,h:img.naturalHeight})};img.onerror=()=>done(null);img.src=u});
+  let previewSize:{w:number;h:number}|null=null;
+  get(`/api/v1/media/${media.id}/thumb?w=1280`).then(b=>show(b,false)).then(s=>{previewSize=s}).catch(()=>{});
+  const original=(tries:number):Promise<unknown>=>get(media.url).then(b=>show(b,true)).catch(e=>{if(!live||e?.name==='AbortError')return;
+   if(tries<1)return new Promise(r=>setTimeout(r,1500)).then(()=>original(tries+1));
+   if(previewSize){setPreviewOnly(true);setNatural(n=>n||previewSize)}else setError(String(e?.message||e))});
+  original(0);objectUrl='';void objectUrl;
+  request<MediaAnnotations>(`/api/v1/media/${media.id}/annotations`).then(r=>{if(!live)return;const init=r.review?r.annotations.map(fromAnn):detections.map(fromDet);jobRef.current=r.review?r.review.job_id:jobId;setLoaded(r);setHist({past:[],present:init,future:[]});setBaseline(init);setNotes(r.review?.notes||'')}).catch(e=>live&&setError(String(e)));return()=>{live=false;abort.abort();urls.forEach(u=>URL.revokeObjectURL(u))}},[]);
  // boxes are in the detector's pixel space; fall back to the browser's decoded size for images without any
  const ref=detections[0]||loaded?.annotations[0];const space=ref?{w:ref.image_width,h:ref.image_height}:natural;
  useEffect(()=>{if(space)setView({x:0,y:0,w:space.w,h:space.h})},[space?.w,space?.h]);
@@ -186,6 +197,7 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
      <a className={dirty?'warn':''} title={`Download image with ${review?'approved':'AI'} boxes drawn, original metadata kept${dirty?' — unsaved edits are not included':''}`} aria-label="Download annotated image" href={`${API}/api/v1/media/${media.id}/annotated?source=${review?'approved':'model'}&min_conf=${review?0:minConf}`}><Download size={15}/></a>
      <T title={full?'Exit full screen (F)':'Full screen (F)'} on={full} onClick={toggleFull}>{full?<Minimize size={15}/>:<Maximize size={15}/>}</T></div></div>
    <div className="ann-stage" ref={stage}>
+    {previewOnly&&<div style={{position:'absolute',left:10,bottom:10,zIndex:3,padding:'5px 9px',borderRadius:7,background:'rgba(255,247,230,.95)',color:'#966506',fontSize:11.5,pointerEvents:'none'}}>Showing the preview: the full-size photo could not be loaded (boxes are unaffected)</div>}
     {!space||!imageUrl?<div className="det-empty"><ScanEye size={40}/><p>{error||'Loading image…'}</p></div>
     :<svg ref={svg} viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`} preserveAspectRatio="xMidYMid meet" style={{cursor:panning?'grabbing':tool==='draw'?'crosshair':'grab'}} onPointerDown={onStageDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onPointerLeave={()=>setCursor(null)} onDoubleClick={e=>{if(e.target===e.currentTarget||e.target instanceof SVGImageElement)fit()}}>
      <image href={imageUrl} width={space.w} height={space.h}/>
