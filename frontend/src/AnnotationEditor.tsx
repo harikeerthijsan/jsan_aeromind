@@ -62,7 +62,17 @@ export default function AnnotationEditor({media,workflow,detections,jobId,classe
    img.onload=()=>{if(live&&(original||!full)){if(original){full=true;setNatural({w:img.naturalWidth,h:img.naturalHeight});setPreviewOnly(false)}setImageUrl(u)}done({w:img.naturalWidth,h:img.naturalHeight})};img.onerror=()=>done(null);img.src=u});
   let previewSize:{w:number;h:number}|null=null;
   get(`/api/v1/media/${media.id}/thumb?w=1280`).then(b=>show(b,false)).then(s=>{previewSize=s}).catch(()=>{});
-  const original=(tries:number):Promise<unknown>=>get(media.url).then(b=>show(b,true)).catch(e=>{if(!live||e?.name==='AbortError')return;
+  // the original in 4 MB pieces, 4 at a time, each retried: a long single 16 MB transfer was being cut off before the
+  // end on some networks (browser extensions, virus scanners, proxies: net::ERR_FAILED 200), short ones get through
+  const PART=4*1024*1024;
+  const piece=(a:number,z:number,tries=0):Promise<ArrayBuffer>=>fetch(API+media.url,{credentials:'include',headers:{...(token?{Authorization:`Bearer ${token}`}:{}),Range:`bytes=${a}-${z}`},signal:abort.signal})
+   .then(async r=>{if(r.status!==206)throw Error(`Could not load the image (${r.status}).`);const b=await r.arrayBuffer();if(b.byteLength!==z-a+1)throw Error('Incomplete image piece');return b})
+   .catch(e=>{if(e?.name==='AbortError'||tries>=2)throw e;return new Promise(r=>setTimeout(r,800*(tries+1))).then(()=>piece(a,z,tries+1))});
+  const pieces=async()=>{const n=media.size_bytes||0;if(n<=1.5*PART)return get(media.url);
+   const parts:ArrayBuffer[]=new Array(Math.ceil(n/PART));let next=0;
+   const lane=async()=>{while(next<parts.length){const i=next++;parts[i]=await piece(i*PART,Math.min(n,(i+1)*PART)-1)}};
+   await Promise.all([lane(),lane(),lane(),lane()]);return new Blob(parts,{type:media.content_type||'image/jpeg'})};
+  const original=(tries:number):Promise<unknown>=>pieces().then(b=>show(b,true)).catch(e=>{if(!live||e?.name==='AbortError')return;
    if(tries<1)return new Promise(r=>setTimeout(r,1500)).then(()=>original(tries+1));
    if(previewSize){setPreviewOnly(true);setNatural(n=>n||previewSize)}else setError(String(e?.message||e))});
   original(0);objectUrl='';void objectUrl;
