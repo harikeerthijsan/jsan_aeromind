@@ -1,4 +1,4 @@
-import React,{useEffect,useMemo,useState} from 'react';import {useNavigate} from 'react-router-dom';
+import React,{useEffect,useMemo,useRef,useState} from 'react';import {useNavigate} from 'react-router-dom';
 import {Database,ShieldAlert,Image as ImageIcon,CheckCircle2,AlertTriangle,Download,ExternalLink,ChevronDown,ChevronRight,Factory,Layers,ClipboardCheck,RotateCcw} from 'lucide-react';
 import {API,request,Site,Inspection,Annotation} from './api';import {colorOf,fmtTime} from './AnnotationEditor';
 
@@ -21,15 +21,25 @@ function useInventory(siteId?:number,inspectionId?:number|null){
 export function GradeBadge({grade,score}:{grade:string|null;score?:number|null}){const g=grade||'Not assessed';return <span className={'inv-grade'+(g==='Not assessed'?' na':'')} style={{'--g':GRADE_COLOR[g]} as React.CSSProperties}>{g}{score!=null&&g!=='Unknown'?` · ${score}`:''}</span>}
 function GradeBar({grades,total}:{grades:Record<string,number>;total:number}){
  return <div className="inv-gradebar" title={GRADES.filter(g=>grades[g]).map(g=>`${g}: ${grades[g]}`).join(' · ')}>{GRADES.filter(g=>grades[g]).map(g=><div key={g} style={{width:`${grades[g]/Math.max(1,total)*100}%`,background:GRADE_COLOR[g]}}/>)}</div>}
-/** The equipment cut out of the photo with CSS, no extra request. */
+/** The photos' stored previews (1280 px, ~250 KB) instead of the 12-16 MB originals: a page of equipment asked for
+ * dozens of originals at once, and the browser gave up on some (net::ERR_FAILED). */
+const PREVIEW=1280;
+const preview=(img:InvImage)=>`${API}/api/v1/media/${img.media_id}/thumb?w=${PREVIEW}`;
+/** Loads only once on screen (a long list of items must not fetch every photo up front). */
+function useOnScreen<T extends Element>(){const ref=useRef<T>(null),[on,setOn]=useState(false);
+ useEffect(()=>{const el=ref.current;if(!el||on)return;const o=new IntersectionObserver(e=>{if(e.some(x=>x.isIntersecting)){setOn(true);o.disconnect()}},{rootMargin:'200px'});o.observe(el);return()=>o.disconnect()},[on]);
+ return [ref,on] as const}
+/** The equipment cut out of the photo with CSS: from the preview, or from the original for parts too small to be sharp in it. */
 function ItemThumb({img,item,size=64}:{img:InvImage;item:Annotation;size?:number}){
- const pad=0.12,w=item.x2-item.x1,h=item.y2-item.y1,cw=w*(1+2*pad),ch=h*(1+2*pad),k=size/Math.max(cw,ch),W=item.image_width,H=item.image_height;
- return <div className="inv-thumb" style={{width:size,height:size,backgroundImage:`url(${API+img.url})`,backgroundSize:`${W*k}px ${H*k}px`,backgroundPosition:`${-(item.x1-w*pad)*k+(size-cw*k)/2}px ${-(item.y1-h*pad)*k+(size-ch*k)/2}px`}}/>}
+ const pad=0.12,w=item.x2-item.x1,h=item.y2-item.y1,cw=w*(1+2*pad),ch=h*(1+2*pad),k=size/Math.max(cw,ch),W=item.image_width,H=item.image_height,[ref,on]=useOnScreen<HTMLDivElement>();
+ const src=W*k<=2*PREVIEW?preview(img):API+img.url;
+ return <div ref={ref} className="inv-thumb" style={{width:size,height:size,backgroundImage:on?`url(${src})`:undefined,backgroundSize:`${W*k}px ${H*k}px`,backgroundPosition:`${-(item.x1-w*pad)*k+(size-cw*k)/2}px ${-(item.y1-h*pad)*k+(size-ch*k)/2}px`}}/>}
 function ImageOverlay({img,hover,onHover}:{img:InvImage;hover:number|null;onHover:(id:number|null)=>void}){
- if(!img.image_width||!img.image_height)return <img className="inv-photo" src={API+img.url} alt={img.filename} loading="lazy"/>;
+ const [ref,on]=useOnScreen<SVGSVGElement>();
+ if(!img.image_width||!img.image_height)return <img className="inv-photo" src={preview(img)} alt={img.filename} loading="lazy"/>;
  const sw=Math.max(img.image_width,img.image_height)/400;
- return <svg className="inv-photo" viewBox={`0 0 ${img.image_width} ${img.image_height}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={`${img.filename} with ${img.items.length} approved boxes`}>
-  <image href={API+img.url} width={img.image_width} height={img.image_height}/>
+ return <svg ref={ref} className="inv-photo" viewBox={`0 0 ${img.image_width} ${img.image_height}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={`${img.filename} with ${img.items.length} approved boxes`}>
+  {on&&<image href={preview(img)} width={img.image_width} height={img.image_height}/>}
   {[...img.items].sort((a,b)=>(b.x2-b.x1)*(b.y2-b.y1)-(a.x2-a.x1)*(a.y2-a.y1)).map(a=>{const g=gradeOf(a),c=g==='Not assessed'?colorOf(a.class_id):GRADE_COLOR[g],on=hover===a.id;
    return <rect key={a.id} x={a.x1} y={a.y1} width={a.x2-a.x1} height={a.y2-a.y1} fill={on?c+'55':'transparent'} stroke={c} strokeWidth={(on?3:ISSUES.includes(g)?2.2:1.2)*sw} onMouseEnter={()=>onHover(a.id)} onMouseLeave={()=>onHover(null)}><title>{a.class_name}{a.manufacturer?` · ${a.manufacturer}`:''} · {g}</title></rect>})}
  </svg>}
