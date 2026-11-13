@@ -317,6 +317,8 @@ def scale_of(work, photo_keys):
     # the build named its photos photos/00000.jpg ... in this order (reconstruct.prepare_images)
     names = {f'photos/{i:05d}{Path(k).suffix.lower()}': k for i, k in enumerate(photo_keys[:reconstruct.MAX_IMAGES])}
     positions = {n: scale.read_position(storage.read_head(ROOT / k)) for n, k in names.items() if any(c['name'] == n for c in cams)}  # metadata only: no photo download
+    tele = storage.fetch(Path(work) / 'positions.json')  # video frames: positions from the video's telemetry (reconstruct.prepare_images)
+    if tele.is_file(): positions.update(json.loads(tele.read_text()))
     return scale.estimate(cams, positions)
 
 def model_scale(payload, progress=None):

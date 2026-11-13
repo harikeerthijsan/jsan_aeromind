@@ -54,7 +54,7 @@ def estimate(cameras, positions) -> dict:
     import numpy as np
     pairs = [(np.asarray(c['center'], float), positions[c['name']]) for c in cameras if positions.get(c['name'])]
     pairs = [(c, p) for c, p in pairs if p['alt'] is not None] or [(c, {**p, 'alt': 0.0}) for c, p in pairs]  # 2D fallback without heights
-    if len(pairs) < MIN_CAMERAS: raise ValueError(f'only {len(pairs)} photo(s) of this model have a GPS position; need {MIN_CAMERAS}')
+    if len(pairs) < MIN_CAMERAS: raise ValueError(f'only {len(pairs)} photo(s)/video frame(s) of this model have a GPS position; need {MIN_CAMERAS}')
     lat0, lon0 = pairs[0][1]['lat'], pairs[0][1]['lon']; k = math.cos(math.radians(lat0))
     E = np.array([[math.radians(p['lon'] - lon0) * EARTH_R * k, math.radians(p['lat'] - lat0) * EARTH_R, p['alt']] for _, p in pairs])  # local east/north/up, metres
     C = np.array([c for c, _ in pairs])

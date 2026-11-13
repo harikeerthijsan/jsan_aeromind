@@ -866,6 +866,49 @@ def test_scale_from_drone_positions(tmp_path):
     assert abs(p['lat'] + 33.86783) < 1e-4 and abs(p['lon'] - 151.20833) < 1e-4 and abs(p['alt'] - 41.5) < 1e-6 and not p['rtk']
     assert scale.read_position(tmp_path / 'missing.jpg') is None
 
+def test_video_telemetry_on_frames(tmp_path):
+    import json
+    from app import scale, video_meta
+    # `exiftool -j -n -ee3 -G3` record of a DJI video (djmd track): one Doc group per frame
+    doc = {'SourceFile': 'DJI_0318.MP4', 'Doc1:SampleTime': 0, 'Doc1:GPSLatitude': 17.46, 'Doc1:GPSLongitude': 78.64, 'Doc1:AbsoluteAltitude': 594.0,
+           'Doc1:RelativeAltitude': 28.0, 'Doc1:GimbalPitch': -27.0, 'Doc1:GimbalYaw': 170.0, 'Doc1:DroneYaw': -70.0,
+           'Doc2:SampleTime': 1.0, 'Doc2:GPSLatitude': 17.47, 'Doc2:GPSLongitude': 78.66, 'Doc2:AbsoluteAltitude': 596.0,
+           'Doc2:RelativeAltitude': 30.0, 'Doc2:GimbalPitch': -29.0, 'Doc2:GimbalYaw': -170.0, 'Doc2:DroneYaw': -60.0,
+           'Doc3:SampleTime': 2.0, 'Doc3:GPSLatitude': 0, 'Doc3:GPSLongitude': 0}  # no GPS fix yet: left out
+    s = video_meta.parse(doc)
+    assert [x['t'] for x in s] == [0, 1.0] and s[0]['rel_alt'] == 28.0 and s[0]['gimbal_roll'] is None
+    m = video_meta.at(s, .5)
+    assert abs(m['lat'] - 17.465) < 1e-9 and m['rel_alt'] == 29.0 and abs(abs(m['gimbal_yaw']) - 180) < 1e-9  # yaw interpolates across +-180
+    assert video_meta.at(s, 5) is None and video_meta.at([], 0) is None
+    assert video_meta.coverage(s)['samples'] == 2 and video_meta.coverage(s)['span_m'] > 1000
+    # the frame carries it as DJI photo XMP, read back like a photo's position
+    from PIL import Image
+    import io
+    b = io.BytesIO(); Image.new('RGB', (16, 8)).save(b, 'JPEG')
+    (tmp_path / 'f.jpg').write_bytes(video_meta.with_xmp(b.getvalue(), video_meta.xmp(m)))
+    assert scale.read_position(tmp_path / 'f.jpg') == {'lat': 17.465, 'lon': 78.65, 'alt': 29.0, 'rtk': False} == video_meta.position(m)
+    with Image.open(tmp_path / 'f.jpg') as im: assert im.size == (16, 8)  # still a valid JPEG
+    # build without photos: the video frames' positions (positions.json) scale the model
+    from app import tasks
+    cams, pos = _synthetic_flight()
+    cams = [{**c, 'name': f'DJI_0318/{i * 10:06d}.jpg'} for i, c in enumerate(cams)]
+    (tmp_path / 'web').mkdir(); (tmp_path / 'web' / 'cameras.json').write_text(json.dumps(cams))
+    (tmp_path / 'positions.json').write_text(json.dumps({c['name']: {**p, 'rtk': False} for c, p in zip(cams, pos)}))
+    r = tasks.scale_of(tmp_path, [])
+    assert abs(r['m_per_unit'] - 7.5) < .01 and r['cameras'] == 12 and r['method'] == 'gps'
+
+def test_sharpest_frame_per_window(tmp_path):
+    from app import frames
+    cv2 = pytest.importorskip('cv2'); np = pytest.importorskip('numpy')
+    v = tmp_path / 'clip.avi'; w = cv2.VideoWriter(str(v), cv2.VideoWriter_fourcc(*'MJPG'), 30, (128, 96))
+    sharp = np.zeros((96, 128, 3), np.uint8); sharp[::8] = 255; sharp[:, ::8] = 255  # a crisp grid
+    blurred = cv2.GaussianBlur(sharp, (0, 0), 6)
+    for i in range(40): w.write(sharp if i in (5, 27) else blurred)  # one crisp frame in each window of 20
+    w.release()
+    out = frames.extract(v, tmp_path / 'f', stride=20, candidates=20, telemetry=[])
+    assert [i for i, *_ in out] == [5, 27]
+    assert [i for i, *_ in frames.extract(v, tmp_path / 'g', stride=20, candidates=1, telemetry=[])] == [0, 20]  # 1 = old fixed spacing
+
 def test_model_scale_endpoints():
     import json, os
     from pathlib import Path

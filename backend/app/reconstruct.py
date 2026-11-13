@@ -31,7 +31,10 @@ def status():
     if not exe: return 'not_found'
     return 'ready' if Path(exe).is_file() or shutil.which(exe) else 'missing'  # missing = COLMAP_PATH points nowhere
 
-def info(): return {'status': status(), 'colmap': colmap_exe() or None, 'colmap_path_env': os.getenv('COLMAP_PATH') or None, 'video_stride': VIDEO_STRIDE, 'max_images': MAX_IMAGES, 'dense_max_size': DENSE_SIZE}
+def info():
+    from . import video_meta
+    return {'status': status(), 'colmap': colmap_exe() or None, 'colmap_path_env': os.getenv('COLMAP_PATH') or None, 'video_stride': VIDEO_STRIDE,
+            'max_images': MAX_IMAGES, 'dense_max_size': DENSE_SIZE, 'video_telemetry': video_meta.status()}
 
 # ---------- PLY (binary little-endian or ascii) ----------
 _T = {'char': 'i1', 'int8': 'i1', 'uchar': 'u1', 'uint8': 'u1', 'short': 'i2', 'int16': 'i2', 'ushort': 'u2', 'uint16': 'u2',
@@ -139,16 +142,25 @@ def _link_or_copy(src, dst):
     except OSError: shutil.copy2(src, dst)
 
 def prepare_images(work, photos, videos, log):
-    """images/photos/* and images/<video>/* - one camera per folder, so photos and each video get their own intrinsics."""
-    from . import frames
-    img = work / 'images'; n = 0
+    """images/photos/* and images/<video>/* - one camera per folder, so photos and each video get their own intrinsics.
+    The video frames' drone positions (from the video's telemetry) go to positions.json, keyed like the model's image
+    names, so the model is scaled from them as from photo GPS (tasks.scale_of)."""
+    from . import frames, video_meta
+    img = work / 'images'; n = 0; positions = {}
     if photos:
         (img / 'photos').mkdir(parents=True, exist_ok=True)
         for i, p in enumerate(photos[:MAX_IMAGES]): _link_or_copy(p, img / 'photos' / f'{i:05d}{Path(p).suffix.lower()}'); n += 1
     for v in videos:
         if n >= MAX_IMAGES: break
-        out = frames.extract(v, img / Path(v).stem, stride=VIDEO_STRIDE, max_frames=MAX_IMAGES - n); n += len(out)
-        with open(log, 'a') as lf: lf.write(f'{Path(v).name}: {len(out)} frames (every {VIDEO_STRIDE}th)\n')
+        tele = video_meta.read(v)
+        out = frames.extract(v, img / Path(v).stem, stride=VIDEO_STRIDE, max_frames=MAX_IMAGES - n, telemetry=tele); n += len(out)
+        for _, sec, p, _, _ in out:
+            if (pos := video_meta.position(video_meta.at(tele, sec))): positions[p.relative_to(img).as_posix()] = pos
+        c = video_meta.coverage(tele)
+        with open(log, 'a') as lf: lf.write(f'{Path(v).name}: {len(out)} frames (sharpest of every {VIDEO_STRIDE}); telemetry: '
+                                            + (f"{c['samples']} samples over {c['seconds']} s, flight spans {c['span_m']} m\n" if c['samples']
+                                               else f"none (ExifTool {video_meta.status().replace('_', ' ')})\n"))
+    if positions: (work / 'positions.json').write_text(json.dumps(positions))
     return img, n
 
 def analyse(model_dir, log):
